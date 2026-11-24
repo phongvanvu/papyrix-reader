@@ -20,7 +20,7 @@ ReaderNavigation::NavResult ReaderNavigation::next(ContentType type, const Posit
       result.position.flatPage = current.flatPage + 1;
       result.needsRender = true;
     }
-  } else if (type == ContentType::Epub) {
+  } else if (type == ContentType::Epub || type == ContentType::Fb2) {
     if (pageCount > 0 && current.sectionPage < pageCount - 1) {
       result.position.sectionPage = current.sectionPage + 1;
       result.needsRender = true;
@@ -28,8 +28,8 @@ ReaderNavigation::NavResult ReaderNavigation::next(ContentType type, const Posit
       // Cache is partial - increment page to trigger cache extension
       result.position.sectionPage = current.sectionPage + 1;
       result.needsRender = true;
-    } else if (pageCount > 0 && current.sectionPage >= pageCount - 1) {
-      // Cache is complete - move to next chapter
+    } else if (cache && !cache->isPartial() && (pageCount == 0 || current.sectionPage >= pageCount - 1)) {
+      // Cache is complete (including empty 0-page sections) - next chapter/section
       result.position.spineIndex = current.spineIndex + 1;
       result.position.sectionPage = 0;
       result.needsCacheReset = true;
@@ -59,7 +59,7 @@ ReaderNavigation::NavResult ReaderNavigation::prev(ContentType type, const Posit
       result.position.flatPage = current.flatPage - 1;
       result.needsRender = true;
     }
-  } else if (type == ContentType::Epub) {
+  } else if (type == ContentType::Epub || type == ContentType::Fb2) {
     if (current.sectionPage > 0) {
       result.position.sectionPage = current.sectionPage - 1;
       result.needsRender = true;
@@ -76,6 +76,26 @@ ReaderNavigation::NavResult ReaderNavigation::prev(ContentType type, const Posit
     }
   }
 
+  return result;
+}
+
+ReaderNavigation::NavResult ReaderNavigation::skipEmptySection(const Position& current, int spineCount,
+                                                               bool preferBack) {
+  NavResult result;
+  result.position = current;
+
+  if (preferBack) {
+    if (current.spineIndex <= 0) return result;
+    result.position.spineIndex = current.spineIndex - 1;
+    result.position.sectionPage = INT16_MAX;
+  } else {
+    if (current.spineIndex + 1 >= spineCount) return result;
+    result.position.spineIndex = current.spineIndex + 1;
+    result.position.sectionPage = 0;
+  }
+
+  result.needsRender = true;
+  result.needsCacheReset = true;
   return result;
 }
 

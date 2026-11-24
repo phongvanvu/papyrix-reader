@@ -2,12 +2,16 @@
 
 #include <cstdint>
 
+#include "../apps/MiniApp.h"
 #include "../ui/views/AppLauncherViews.h"
 #include "State.h"
 
 class GfxRenderer;
 
 namespace papyrix {
+namespace clock_app {
+struct ResumeRecord;
+}
 
 class AppLauncherState : public State {
  public:
@@ -19,22 +23,18 @@ class AppLauncherState : public State {
   StateTransition update(Core& core) override;
   void render(Core& core) override;
   StateId id() const override { return StateId::AppLauncher; }
+  void resumeClock(Core& core, const clock_app::ResumeRecord& record);
+  bool requestSleep(Core& core);
 
  private:
-  enum class Mode : uint8_t { Menu, App, Overlay };
-
   GfxRenderer& renderer_;
-  Mode mode_;
-  int8_t activeApp_;
-  bool needsRender_;
+  miniapps::Host<Core, Event> app_;
   bool goNetwork_;
 
   ui::AppMenuView menuView_;
 
-  void launchApp(Core& core);
-  void stopApp(Core& core);
-  void showOverlay();
-  void hideOverlay();
+  void activateMenuItem(Core& core);
+  void launchApp(Core& core, int8_t appId);
 };
 
 }  // namespace papyrix

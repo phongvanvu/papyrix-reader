@@ -1,11 +1,19 @@
 #include <Arduino.h>
-#include <EInkDisplay.h>
+#include <BoardProfiles.h>
+#include <BoardSelector.h>
+#include <BootHardware.h>
+#include <Display.h>
 #include <Epub.h>
 #include <GfxRenderer.h>
+#include <HardwareIdentity.h>
+#include <HardwareRecovery.h>
 #include <InputManager.h>
 #include <LittleFS.h>  // Must be before SdFat includes to avoid FILE_READ/FILE_WRITE redefinition
+#include <PowerPolicy.h>
 #include <SDCardManager.h>
+#include <SDPowerControl.h>
 #include <SPI.h>
+#include <TargetConfig.h>
 #include <builtinFonts/reader_2b.h>
 #include <builtinFonts/reader_bold_2b.h>
 #include <builtinFonts/reader_italic_2b.h>
@@ -13,8 +21,14 @@
 #include <builtinFonts/reader_xsmall_bold_2b.h>
 #include <builtinFonts/reader_xsmall_italic_2b.h>
 #include <builtinFonts/reader_xsmall_regular_2b.h>
-#include <driver/gpio.h>
+#include <esp_heap_caps.h>
 #include <esp_system.h>
+
+#include <algorithm>
+#include <memory>
+#include <new>
+
+#include "core/CrashDebug.h"
 // Medium font (16pt)
 #include <builtinFonts/reader_medium_2b.h>
 #include <builtinFonts/reader_medium_bold_2b.h>
@@ -28,21 +42,30 @@
 #include <builtinFonts/ui_12.h>
 #include <builtinFonts/ui_bold_12.h>
 
-#include "Battery.h"
 #include "FontManager.h"
 #include "MappedInputManager.h"
 #include "ThemeManager.h"
+#include "apps/ClockStandby.h"
+#include "apps/MiniApp.h"
 #include "config.h"
 #include "content/ContentTypes.h"
+#include "hal/Power.h"
+#include "hal/Recovery.h"
+#include "hal/UsbPolicy.h"
 #include "ui/Elements.h"
 
 #define TAG "MAIN"
 
 // New refactored core system
+#include <I18n.h>
+
+#include "I18nLoader.h"
 #include "core/BootMode.h"
 #include "core/Core.h"
+#include "core/EmergencyFirmwareUpdatePolicy.h"
+#include "core/FirmwareUpdater.h"
 #include "core/StateMachine.h"
-#include "images/PapyrixLogo.h"
+#include "diagnostics/X4ProCharacterization.h"
 #include "states/AppLauncherState.h"
 #include "states/CalibreSyncState.h"
 #include "states/ErrorState.h"
@@ -50,46 +73,30 @@
 #include "states/HomeState.h"
 #include "states/NetworkState.h"
 #include "states/ReaderState.h"
+#include "states/RecentState.h"
 #include "states/SettingsState.h"
 #include "states/SleepState.h"
 #include "states/StartupState.h"
 #include "ui/views/BootSleepViews.h"
 
-#define SPI_FQ 40000000
-// Display SPI pins (custom pins for XteinkX4, not hardware SPI defaults)
-#define EPD_SCLK 8   // SPI Clock
-#define EPD_MOSI 10  // SPI MOSI (Master Out Slave In)
-#define EPD_CS 21    // Chip Select
-#define EPD_DC 4     // Data/Command
-#define EPD_RST 5    // Reset
-#define EPD_BUSY 6   // Busy
+constexpr uint32_t kSerialBaudRate = 115200;
+constexpr uint32_t kSerialEnumerationDelayMs = 250;
+constexpr uint32_t kSerialTxTimeoutMs = 1;
 
-#define UART0_RXD 20  // Used for USB connection detection
-
-#define SD_SPI_MISO 7
-
-#define SERIAL_INIT_DELAY_MS 10
-#define SERIAL_READY_TIMEOUT_MS 3000
-
-EInkDisplay einkDisplay(EPD_SCLK, EPD_MOSI, EPD_CS, EPD_DC, EPD_RST, EPD_BUSY);
 InputManager inputManager;
 MappedInputManager mappedInputManager(inputManager);
-GfxRenderer renderer(einkDisplay);
 
-// Extern references for driver wrappers
-EInkDisplay& display = einkDisplay;
-MappedInputManager& mappedInput = mappedInputManager;
-
-// Core system
 namespace papyrix {
 Core core;
 }
+
+GfxRenderer renderer(papyrix::core.display);
 
 // State instances (pre-allocated, no heap per transition)
 static papyrix::StartupState startupState;
 static papyrix::HomeState homeState(renderer);
 static papyrix::FileListState fileListState(renderer);
-static papyrix::ReaderState readerState(renderer);
+static papyrix::RecentState recentState(renderer);
 static papyrix::SettingsState settingsState(renderer);
 static papyrix::NetworkState networkState(renderer);
 static papyrix::CalibreSyncState calibreSyncState(renderer);
@@ -132,25 +139,29 @@ static EpdFontFamily& readerFontFamilyLarge() {
   return f;
 }
 
-bool isUsbConnected() { return digitalRead(UART0_RXD) == HIGH; }
-
 struct WakeupInfo {
   esp_reset_reason_t resetReason;
   bool isPowerButton;
+  bool usbColdBoot;
 };
 
 WakeupInfo getWakeupInfo() {
-  const bool usbConnected = isUsbConnected();
+  const bool usbConnected = papyrix::core.usb.isConnected();
   const auto wakeupCause = esp_sleep_get_wakeup_cause();
   const auto resetReason = esp_reset_reason();
 
-  // Without USB: power button triggers a full power-on reset (not GPIO wakeup)
-  // With USB: power button wakes from deep sleep via GPIO
+  // Deep sleep uses the power-button wake mask on both targets.
   const bool isPowerButton =
       (!usbConnected && wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_POWERON) ||
-      (usbConnected && wakeupCause == ESP_SLEEP_WAKEUP_GPIO && resetReason == ESP_RST_DEEPSLEEP);
+      ((wakeupCause == ESP_SLEEP_WAKEUP_GPIO || wakeupCause == ESP_SLEEP_WAKEUP_EXT1) &&
+       resetReason == ESP_RST_DEEPSLEEP);
 
-  return {resetReason, isPowerButton};
+  // USB plugged into a powered-off device cold-boots the chip without a button press.
+  // Restricted to ESP_RST_POWERON so any other reset reason (UNKNOWN/USB/JTAG/SW/...) — including
+  // dev flashes — still boots normally.
+  const bool usbColdBoot = usbConnected && wakeupCause == ESP_SLEEP_WAKEUP_UNDEFINED && resetReason == ESP_RST_POWERON;
+
+  return {resetReason, isPowerButton, usbColdBoot};
 }
 
 // Verify long press on wake-up from deep sleep
@@ -169,10 +180,15 @@ void verifyWakeupLongPress(esp_reset_reason_t resetReason) {
     return;
   }
 
-  // Give the user up to 1000ms to start holding the power button, and must hold for the configured duration
+  // Give the user up to 1000ms to start holding the power button, and must hold for the configured duration.
   const auto start = millis();
   bool abort = false;
   const uint16_t requiredPressDuration = papyrix::core.settings.getPowerButtonDuration();
+
+  // Count boot time as part of the required hold time.
+  // X3 board and display detection make its boot slower than X4.
+  const uint16_t calibratedPressDuration =
+      (start < requiredPressDuration) ? static_cast<uint16_t>(requiredPressDuration - start) : 1;
 
   inputManager.update();
   // Verify the user has actually pressed
@@ -185,27 +201,38 @@ void verifyWakeupLongPress(esp_reset_reason_t resetReason) {
     do {
       delay(10);
       inputManager.update();
-    } while (inputManager.isPressed(InputManager::BTN_POWER) && inputManager.getHeldTime() < requiredPressDuration);
-    abort = inputManager.getHeldTime() < requiredPressDuration;
+    } while (inputManager.isPressed(InputManager::BTN_POWER) && inputManager.getHeldTime() < calibratedPressDuration);
+    abort = inputManager.getHeldTime() < calibratedPressDuration;
   } else {
     abort = true;
   }
 
   if (abort) {
-    // Button released too early. Returning to sleep.
-    // IMPORTANT: Re-arm the wakeup trigger before sleeping again
-    esp_deep_sleep_enable_gpio_wakeup(1ULL << InputManager::POWER_BUTTON_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
-    disableGpioPullsForSleep();
-    esp_deep_sleep_start();
+    if (!papyrix::core.battery.finishDesignCapacity()) {
+      LOG_ERR(TAG, "Fuel-gauge close-out failed; sleeping anyway");
+    }
+    papyrix::hal::enterDeepSleepWithHardwareShutdown(papyrix::core.usb.isConnected());
   }
 }
 
-void waitForPowerRelease() {
+static constexpr uint32_t POWER_RELEASE_TIMEOUT_MS = 5000;
+
+// A power press still held from setup is consumed by hal::Input until a
+// release is observed; see Input::suppressPowerUntilRelease().
+
+bool waitForPowerRelease() {
   inputManager.update();
+  const uint32_t startedMs = millis();
   while (inputManager.isPressed(InputManager::BTN_POWER)) {
+    if (millis() - startedMs >= POWER_RELEASE_TIMEOUT_MS) {
+      LOG_ERR(TAG, "Power button still held after %lu ms; continuing",
+              static_cast<unsigned long>(POWER_RELEASE_TIMEOUT_MS));
+      return true;
+    }
     delay(50);
     inputManager.update();
   }
+  return false;
 }
 
 // Register only the reader font for the active size (saves ~4.5KB in READER mode)
@@ -226,8 +253,34 @@ void setupReaderFontForSize(papyrix::Settings::FontSize fontSize) {
   }
 }
 
-void setupDisplayAndFonts(bool allReaderSizes = true) {
-  einkDisplay.begin();
+void initializeDisplayWithRecovery() {
+  auto& display = papyrix::core.display;
+  const auto& profile = papyrix::board::HardwareIdentity::instance().profile();
+  papyrix::hal::DisplayRecoveryPolicy policy;
+  auto result = display.begin();
+  while (result != papyrix::hal::Display::InitResult::Ok) {
+    const auto action = policy.recordFailure();
+    LOG_ERR(TAG, "Display initialization failed");
+    if (action == papyrix::hal::DisplayRecoveryAction::ResetAndRetry) {
+      result = display.recover();
+      continue;
+    }
+
+    SdMan.end();
+    papyrix::board::shutdownRecoveryRails(profile);
+    papyrix::board::waitForRecoveryRetry(profile);
+    papyrix::board::restoreRecoveryStorage(profile);
+    if (!SdMan.begin()) LOG_ERR(TAG, "SD card did not recover");
+    policy.recordSuccess();
+    if (!papyrix::board::HardwareIdentity::instance().panelResolved())
+      papyrix::board::selectPanel(papyrix::board::HardwareIdentity::instance());
+    result = display.recover();
+  }
+  policy.recordSuccess();
+}
+
+void setupDisplayAndFonts(bool allReaderSizes = true, bool initializeDisplay = true) {
+  if (initializeDisplay) initializeDisplayWithRecovery();
   renderer.begin();
   LOG_INF(TAG, "Display initialized");
   if (allReaderSizes) {
@@ -288,6 +341,8 @@ void applyThemeFonts() {
     if (customFontId != builtinFontId) {
       *targetFontId = customFontId;
       LOG_INF(TAG, "Reader font: %s (ID: %d)", fontFamilyName, customFontId);
+    } else {
+      LOG_ERR(TAG, "Theme requested custom font '%s' but it failed to load - using builtin", fontFamilyName);
     }
   }
 }
@@ -298,27 +353,57 @@ void showErrorScreen(const char* message) {
   renderer.displayBuffer();
 }
 
+bool showEmergencyUpdateNotice() {
+  auto& display = papyrix::core.display;
+  const auto initResult = display.begin();
+  const bool displayReady = initResult == papyrix::hal::Display::InitResult::Ok;
+  if (papyrix::emergency_update::noticeActionFor(displayReady) ==
+      papyrix::emergency_update::NoticeAction::ContinueHeadless) {
+    LOG_WRN(TAG, "Emergency update notice unavailable: display result=%u", static_cast<unsigned>(initResult));
+    return false;
+  }
+
+  renderer.begin();
+  renderer.insertFont(UI_FONT_ID, uiFontFamily);
+  renderer.excludeExternalFont(UI_FONT_ID);
+  renderer.clearScreen(papyrix::emergency_update::kNoticeBackground);
+  const int centerY = renderer.getScreenHeight() / 2;
+  renderer.drawCenteredText(UI_FONT_ID, centerY - 24, papyrix::emergency_update::kNoticeTitle,
+                            papyrix::emergency_update::kNoticeTextBlack, BOLD);
+  renderer.drawCenteredText(UI_FONT_ID, centerY + 24, papyrix::emergency_update::kNoticeWarning,
+                            papyrix::emergency_update::kNoticeTextBlack);
+  renderer.displayBuffer(papyrix::hal::Display::FULL_REFRESH, papyrix::emergency_update::kTurnOffDuringRefresh);
+  if (papyrix::emergency_update::kSleepAfterRender && !display.deepSleep()) return false;
+  LOG_INF(TAG, "Emergency update notice displayed");
+  return true;
+}
+
 // Track current boot mode for loop behavior
 static papyrix::BootMode currentBootMode = papyrix::BootMode::UI;
 
-// Early initialization - common to both boot modes
-// Returns false if critical initialization failed
+// Initialize the hardware for both boot modes.
 bool earlyInit() {
-  // Only start serial if USB connected
-  pinMode(UART0_RXD, INPUT);
-  if (isUsbConnected()) {
-    Serial.begin(115200);
-    delay(SERIAL_INIT_DELAY_MS);  // Allow USB CDC to initialize
-    unsigned long start = millis();
-    while (!Serial && (millis() - start) < SERIAL_READY_TIMEOUT_MS) {
-      delay(SERIAL_INIT_DELAY_MS);
-    }
+#if PAPYRIX_TARGET_XTEINK_C3
+  inputManager.begin();
+#endif
+
+  auto& identity = papyrix::board::HardwareIdentity::instance();
+  papyrix::board::selectBoard(identity, true);
+  papyrix::core.battery.init(true);
+  papyrix::core.usb.init(papyrix::core.battery);
+  const auto& profile = identity.profile();
+
+  const auto wakeup = getWakeupInfo();
+  if (wakeup.usbColdBoot) {
+    papyrix::hal::enterDeepSleepWithHardwareShutdown(true);
   }
 
-  inputManager.begin();
+  papyrix::board::preparePanelProbe(papyrix::board::HardwareIdentity::instance().profile());
+  papyrix::board::selectPanel(identity);
 
-  // Initialize SPI and SD card before wakeup verification so settings are available
-  SPI.begin(EPD_SCLK, SD_SPI_MISO, EPD_MOSI, EPD_CS);
+  if (profile.storage.transport == papyrix::board::StorageTransport::Spi) {
+    SPI.begin(profile.display.sclk, profile.storage.spiMiso, profile.display.mosi, profile.display.cs);
+  }
   if (!SdMan.begin()) {
     LOG_ERR(TAG, "SD card initialization failed");
     setupDisplayAndFonts();
@@ -326,20 +411,42 @@ bool earlyInit() {
     return false;
   }
 
+  // Emergency firmware flash from SD card (force_update.bin) — blocking, runs before any UI init
+  if (SdMan.exists(PAPYRIX_EMERGENCY_FW_FILE)) {
+    auto& fw = papyrix::FirmwareUpdater::instance();
+    fw.findFirmwareFile(PAPYRIX_EMERGENCY_FW_FILE);
+    if (fw.beginUpdate()) {
+      showEmergencyUpdateNotice();
+      while (fw.pump()) {
+        delay(1);
+      }
+    }
+    SdMan.remove(PAPYRIX_EMERGENCY_FW_FILE);
+    if (fw.progress().phase == papyrix::FirmwareUpdatePhase::Complete) {
+      delay(2000);
+      ESP.restart();
+    }
+  }
+
   // Load settings before wakeup verification - without this, a full power cycle
   // (no USB) resets RTC memory and the short power button setting is ignored
   papyrix::core.settings.loadFromFile();
+  i18n::loadLocaleFromSD();
   rtcPowerButtonDurationMs = papyrix::core.settings.getPowerButtonDuration();
 
-  const auto wakeup = getWakeupInfo();
   if (wakeup.isPowerButton) {
     verifyWakeupLongPress(wakeup.resetReason);
   }
 
-  LOG_INF(TAG, "Starting Papyrix version " PAPYRIX_VERSION);
+  LOG_INF(TAG, "Starting PapyriX version " PAPYRIX_VERSION);
+  papyrix::crashdebug::logBootInfo(wakeup.resetReason);
 
-  // Initialize battery ADC pin with proper attenuation for 0-3.3V range
-  analogSetPinAttenuation(BAT_GPIO0, ADC_11db);
+  if (papyrix::board::HardwareIdentity::instance().board() == papyrix::board::BoardId::X4) {
+    // Arduino 3.x requires the first read to attach the pin to the ADC bus
+    // before per-pin attenuation can be configured.
+    (void)analogRead(profile.battery.adcPin);
+    analogSetPinAttenuation(profile.battery.adcPin, ADC_11db);
+  }
 
   // Initialize internal flash filesystem for font storage
   if (!LittleFS.begin(false)) {
@@ -358,7 +465,10 @@ bool earlyInit() {
 }
 
 // Initialize UI mode - full state registration, all resources
-void initUIMode() {
+void initUIMode(const papyrix::clock_app::ResumeRecord* clockResume = nullptr,
+                papyrix::clock_app::StandbyResult wakeResult = papyrix::clock_app::StandbyResult::Interactive) {
+  currentBootMode = papyrix::BootMode::UI;
+  papyrix::core.bootMode = currentBootMode;
   LOG_INF(TAG, "Initializing UI mode");
   LOG_DBG(TAG, "[UI mode] Free heap: %lu, Max block: %lu", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
@@ -368,16 +478,20 @@ void initUIMode() {
   THEME_MANAGER.createDefaultThemeFiles();
   LOG_INF(TAG, "Theme loaded: %s", THEME_MANAGER.currentThemeName());
 
-  setupDisplayAndFonts();
+  if (clockResume && wakeResult != papyrix::clock_app::StandbyResult::DisplayError &&
+      papyrix::core.display.begin() != papyrix::hal::Display::InitResult::Ok &&
+      papyrix::core.display.recover() != papyrix::hal::Display::InitResult::Ok) {
+    wakeResult = papyrix::clock_app::StandbyResult::DisplayError;
+  }
+  setupDisplayAndFonts(true, clockResume == nullptr);
   applyThemeFonts();
 
   // Show boot splash only on cold boot (not mode transition)
   const auto& preInitTransition = papyrix::getTransition();
-  if (!preInitTransition.isValid()) {
+  if (!clockResume && !preInitTransition.isValid()) {
     ui::BootView bootView;
-    bootView.setLogo(PapyrixLogo, 128, 128);
-    bootView.setVersion(PAPYRIX_VERSION);
-    bootView.setStatus("BOOTING");
+    bootView.setStatus(tr(BOOTING));
+    bootView.setDarkMode(THEME.invertedMode);
     ui::render(renderer, THEME, bootView);
   }
 
@@ -385,7 +499,7 @@ void initUIMode() {
   stateMachine.registerState(&startupState);
   stateMachine.registerState(&homeState);
   stateMachine.registerState(&fileListState);
-  stateMachine.registerState(&readerState);
+  stateMachine.registerState(&recentState);
   stateMachine.registerState(&settingsState);
   stateMachine.registerState(&networkState);
   stateMachine.registerState(&calibreSyncState);
@@ -397,13 +511,36 @@ void initUIMode() {
   auto result = papyrix::core.init();
   if (!result.ok()) {
     LOG_ERR(TAG, "Init failed: %s", papyrix::errorToString(result.err));
-    showErrorScreen("Core init failed");
-    return;
+    if (!clockResume) {
+      showErrorScreen("Core init failed");
+      return;
+    }
+    if (wakeResult != papyrix::clock_app::StandbyResult::DisplayError)
+      wakeResult = papyrix::clock_app::StandbyResult::StorageError;
+    papyrix::core.input.init(papyrix::core.events);
   }
 
   LOG_INF(TAG, "State machine starting (UI mode)");
   mappedInputManager.setSettings(&papyrix::core.settings);
   ui::setFrontButtonLayout(papyrix::core.settings.frontButtonLayout);
+
+  if (clockResume) {
+    papyrix::core.input.suppressPowerUntilRelease();
+    if (wakeResult == papyrix::clock_app::StandbyResult::Interactive) {
+      stateMachine.init(papyrix::core, papyrix::StateId::AppLauncher);
+      appLauncherState.resumeClock(papyrix::core, *clockResume);
+    } else if (wakeResult == papyrix::clock_app::StandbyResult::TimeRequired) {
+      papyrix::core.pendingSync = papyrix::SyncMode::NtpSync;
+      papyrix::core.pendingAppId = papyrix::APP_CLOCK;
+      stateMachine.init(papyrix::core, papyrix::StateId::Network);
+    } else {
+      snprintf(papyrix::core.buf.text, sizeof(papyrix::core.buf.text), "%s",
+               papyrix::clock_app::standbyErrorMessage(wakeResult));
+      stateMachine.init(papyrix::core, papyrix::StateId::Error);
+    }
+    stateMachine.update(papyrix::core);
+    return;
+  }
 
   // Determine initial state - check for return from reader mode
   papyrix::StateId initialState = papyrix::StateId::Home;
@@ -412,6 +549,9 @@ void initUIMode() {
   if (transition.returnTo == papyrix::ReturnTo::FILE_MANAGER) {
     initialState = papyrix::StateId::FileList;
     LOG_INF(TAG, "Returning to FileList from Reader");
+  } else if (transition.returnTo == papyrix::ReturnTo::RECENT) {
+    initialState = papyrix::StateId::Recent;
+    LOG_INF(TAG, "Returning to Recent from Reader");
   } else {
     LOG_INF(TAG, "Starting at Home");
   }
@@ -429,10 +569,29 @@ void initUIMode() {
 void initReaderMode() {
   LOG_INF(TAG, "Initializing READER mode");
   LOG_DBG(TAG, "[READER mode] Free heap: %lu, Max block: %lu", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  const auto& transition = papyrix::getTransition();
+  if (transition.bookPath[0] == '\0') {
+    LOG_ERR(TAG, "No book path in transition, falling back to UI");
+    initUIMode();
+    return;
+  }
+
+  static std::unique_ptr<papyrix::ReaderState> readerState;
+  if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= sizeof(papyrix::ReaderState)) {
+    readerState.reset(new (std::nothrow) papyrix::ReaderState(renderer));
+  }
+  if (!readerState) {
+    LOG_ERR(TAG, "Reader state allocation failed");
+    initUIMode();
+    snprintf(papyrix::core.buf.text, sizeof(papyrix::core.buf.text), "%s",
+             papyrix::errorToString(papyrix::Error::OutOfMemory));
+    stateMachine.init(papyrix::core, papyrix::StateId::Error);
+    stateMachine.update(papyrix::core);
+    return;
+  }
 
   // Detect content type early to decide if we need custom fonts
   // XTC/XTCH files contain pre-rendered bitmaps and don't need fonts for page rendering
-  const auto& transition = papyrix::getTransition();
   papyrix::ContentType contentType = papyrix::detectContentType(transition.bookPath);
   bool needsCustomFonts = (contentType != papyrix::ContentType::Xtc);
 
@@ -442,7 +601,7 @@ void initReaderMode() {
   // Skip createDefaultThemeFiles() - not needed in reader mode
   LOG_INF(TAG, "Theme loaded: %s (reader mode)", THEME_MANAGER.currentThemeName());
 
-  setupDisplayAndFonts(false);  // Only active reader font size
+  setupDisplayAndFonts(false);
 
   if (needsCustomFonts) {
     applyThemeFonts();  // Custom fonts - skip for XTC/XTCH to save ~500KB+ RAM
@@ -451,7 +610,7 @@ void initReaderMode() {
   }
 
   // Register ONLY states needed for Reader mode
-  stateMachine.registerState(&readerState);
+  stateMachine.registerState(readerState.get());
   stateMachine.registerState(&sleepState);
   stateMachine.registerState(&errorState);
 
@@ -467,17 +626,9 @@ void initReaderMode() {
   mappedInputManager.setSettings(&papyrix::core.settings);
   ui::setFrontButtonLayout(papyrix::core.settings.frontButtonLayout);
 
-  if (transition.bookPath[0] != '\0') {
-    // Copy path to shared buffer for ReaderState to consume
-    strncpy(papyrix::core.buf.path, transition.bookPath, sizeof(papyrix::core.buf.path) - 1);
-    papyrix::core.buf.path[sizeof(papyrix::core.buf.path) - 1] = '\0';
-    LOG_INF(TAG, "Opening book: %s", papyrix::core.buf.path);
-  } else {
-    // No book path - fall back to UI mode to avoid boot loop
-    LOG_ERR(TAG, "No book path in transition, falling back to UI");
-    initUIMode();
-    return;
-  }
+  strncpy(papyrix::core.buf.path, transition.bookPath, sizeof(papyrix::core.buf.path) - 1);
+  papyrix::core.buf.path[sizeof(papyrix::core.buf.path) - 1] = '\0';
+  LOG_INF(TAG, "Opening book: %s", papyrix::core.buf.path);
 
   stateMachine.init(papyrix::core, papyrix::StateId::Reader);
 
@@ -488,7 +639,65 @@ void initReaderMode() {
   LOG_DBG(TAG, "[READER mode] After init - Free heap: %lu, Max block: %lu", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 }
 
+bool tryClockBoot() {
+  using namespace papyrix;
+  clock_app::ResumeRecord record;
+  const auto reset = esp_reset_reason();
+  if (reset != ESP_RST_DEEPSLEEP || !clock_app::readResume(record)) return false;
+  const auto route = clock_app::classifyWake(record, record.identity, reset, esp_sleep_get_wakeup_cause());
+  if (route == clock_app::WakeRoute::NormalBoot) return false;
+  auto& identity = board::HardwareIdentity::instance();
+  if (!board::selectBoard(identity, false) || identity.board() != record.identity.board ||
+      !board::restoreClockPanel(identity, record.identity.panel, record.identity.panelVariant))
+    return false;
+
+  board::earlyInit(identity.profile(), board::BootPurpose::ClockTimer);
+  board::releaseDeepSleepHolds();
+  auto result = clock_app::StandbyResult::Interactive;
+  if (route == clock_app::WakeRoute::Timer) result = clock_app::runTimerWake(core, record);
+  clock_app::clearResume();
+
+  board::earlyInit(identity.profile(), board::BootPurpose::Interactive);
+  inputManager.begin();
+  Serial.begin(kSerialBaudRate);
+#if defined(ENABLE_SERIAL_LOG) && ARDUINO_USB_CDC_ON_BOOT
+  logSerial.setTxTimeoutMs(kSerialTxTimeoutMs);
+#endif
+  board::restoreRecoveryStorage(identity.profile());
+  if (core.storage.init().ok()) {
+    core.settings.loadFromFile();
+    i18n::loadLocaleFromSD();
+    rtcPowerButtonDurationMs = core.settings.getPowerButtonDuration();
+  } else {
+    if (result != clock_app::StandbyResult::DisplayError) result = clock_app::StandbyResult::StorageError;
+  }
+  if (!LittleFS.begin(false) && result != clock_app::StandbyResult::DisplayError)
+    result = clock_app::StandbyResult::StorageError;
+  currentBootMode = BootMode::UI;
+  core.bootMode = currentBootMode;
+  initUIMode(&record, result);
+  return true;
+}
+
 void setup() {
+#if !PAPYRIX_X4PRO_CHARACTERIZE
+  if (tryClockBoot()) return;
+#endif
+  papyrix::clock_app::clearResume();
+  papyrix::board::earlyInit(papyrix::board::bootProfile(), papyrix::board::BootPurpose::Interactive);
+  papyrix::board::releaseDeepSleepHolds();
+  // Let USB Serial/JTAG and the host enumerate before recovery checks.
+  delay(kSerialEnumerationDelayMs);
+  Serial.begin(kSerialBaudRate);
+#if defined(ENABLE_SERIAL_LOG) && ARDUINO_USB_CDC_ON_BOOT
+  logSerial.setTxTimeoutMs(kSerialTxTimeoutMs);
+#endif
+
+#if PAPYRIX_X4PRO_CHARACTERIZE
+  papyrix::diagnostics::beginX4ProCharacterization();
+  return;
+#endif
+
   // Early initialization (common to both modes)
   if (!earlyInit()) {
     return;  // Critical failure
@@ -496,6 +705,7 @@ void setup() {
 
   // Detect boot mode from RTC memory or settings
   currentBootMode = papyrix::detectBootMode();
+  papyrix::core.bootMode = currentBootMode;
 
   if (currentBootMode == papyrix::BootMode::READER) {
     initReaderMode();
@@ -504,13 +714,34 @@ void setup() {
   }
 
   // Ensure we're not still holding the power button before leaving setup
-  waitForPowerRelease();
+  if (waitForPowerRelease()) {
+    papyrix::core.input.suppressPowerUntilRelease();
+  }
 }
 
 void loop() {
+#if PAPYRIX_X4PRO_CHARACTERIZE
+  papyrix::diagnostics::updateX4ProCharacterization();
+  return;
+#endif
+
   static unsigned long maxLoopDuration = 0;
   const unsigned long loopStartTime = millis();
   static unsigned long lastMemPrint = 0;
+
+  static papyrix::hal::usb_policy::StateTracker usbSupplyState;
+  if (papyrix::board::HardwareIdentity::instance().profile().usb.detectPin != papyrix::board::kPinUnused) {
+    const bool usbConnected = papyrix::core.usb.isConnected();
+    if (usbSupplyState.update(usbConnected)) {
+      LOG_INF(TAG, "USB supply state changed: %s", usbConnected ? "connected" : "disconnected");
+      if (stateMachine.isInState(papyrix::StateId::Home)) {
+        homeState.onUsbStateChanged(papyrix::core);
+      }
+    }
+  }
+
+  // One short fuel-gauge step per tick while the design-capacity load runs.
+  papyrix::core.battery.serviceDesignCapacity();
 
   inputManager.update();
 
@@ -522,17 +753,25 @@ void loop() {
 
   // Poll input and push events to queue
   papyrix::core.input.poll();
+  if (PAPYRIX_CAP_FRONTLIGHT) {
+    papyrix::core.frontLight.update(papyrix::core.input.userIdleTimeMs(),
+                                    papyrix::core.settings.getFrontLightTimeoutMs(),
+                                    papyrix::core.settings.smoothFrontLight != 0);
+  }
 
   // Auto-sleep after inactivity
   const auto autoSleepTimeout = papyrix::core.settings.getAutoSleepTimeoutMs();
-  const bool wifiActive = papyrix::core.network.isConnected() || papyrix::core.network.isAPMode();
+  const bool wifiActive = papyrix::core.wifi.isConnected() || papyrix::core.wifi.isAPMode();
   if (wifiActive) {
     papyrix::core.input.resetIdleTimer();
   }
   if (autoSleepTimeout > 0 && papyrix::core.input.idleTimeMs() >= autoSleepTimeout) {
+    papyrix::core.cpu.unthrottle();
     LOG_INF(TAG, "Auto-sleep after %lu ms idle", autoSleepTimeout);
-    stateMachine.init(papyrix::core, papyrix::StateId::Sleep);
-    return;
+    if (!stateMachine.isInState(papyrix::StateId::AppLauncher) || appLauncherState.requestSleep(papyrix::core)) {
+      stateMachine.init(papyrix::core, papyrix::StateId::Sleep);
+      return;
+    }
   }
 
   // Power button sleep check: track held time that excludes long rendering gaps
@@ -543,13 +782,19 @@ void loop() {
     const unsigned long loopGap = loopStartTime - prevPowerCheckMs;
     prevPowerCheckMs = loopStartTime;
 
-    if (inputManager.isPressed(InputManager::BTN_POWER)) {
+    if (papyrix::core.input.powerSuppressed()) {
+      // hal::Input clears the flag when it observes the release.
+      powerHeldSinceMs = 0;
+    } else if (inputManager.isPressed(InputManager::BTN_POWER)) {
       if (powerHeldSinceMs == 0 || loopGap > 100) {
         powerHeldSinceMs = loopStartTime;
       }
       if (loopStartTime - powerHeldSinceMs > papyrix::core.settings.getPowerButtonDuration()) {
-        stateMachine.init(papyrix::core, papyrix::StateId::Sleep);
-        return;
+        if (!stateMachine.isInState(papyrix::StateId::AppLauncher) || appLauncherState.requestSleep(papyrix::core)) {
+          stateMachine.init(papyrix::core, papyrix::StateId::Sleep);
+          return;
+        }
+        powerHeldSinceMs = 0;
       }
     } else {
       powerHeldSinceMs = 0;
@@ -585,5 +830,7 @@ void loop() {
   // Add delay at the end of the loop to prevent tight spinning
   // Increase delay after idle to save power (~4x less CPU load)
   // Idea: https://github.com/crosspoint-reader/crosspoint-reader/commit/0991782 by @ngxson (https://github.com/ngxson)
-  delay(papyrix::core.cpu.loopDelayMs());
+  const auto loopDelayMs = papyrix::core.cpu.loopDelayMs();
+  delay(inputManager.isSampling() ? loopDelayMs
+                                  : std::min<unsigned long>(loopDelayMs, InputManager::IDLE_SAMPLE_INTERVAL_MS));
 }

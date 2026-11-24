@@ -3,6 +3,7 @@
 #include <Epub.h>
 #include <RenderConfig.h>
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <utility>
@@ -26,6 +27,7 @@ class EpubChapterParser : public ContentParser {
   RenderConfig config_;
   std::string imageCachePath_;
   bool hasMore_ = true;
+  uint8_t* activeDict_ = nullptr;
 
   // Persistent parser state for incremental parsing (hot extend)
   std::unique_ptr<ChapterHtmlSlimParser> liveParser_;
@@ -39,12 +41,12 @@ class EpubChapterParser : public ContentParser {
   // The liveParser_'s completePageFn captures `this` and delegates to these members,
   // so the callback can be rewired between parsePages() calls without recreating the parser.
   std::function<void(std::unique_ptr<Page>)> onPageComplete_;
-  uint16_t maxPages_ = 0;
-  uint16_t pagesCreated_ = 0;
+  uint32_t maxPages_ = 0;
+  uint32_t pagesCreated_ = 0;
   bool hitMaxPages_ = false;
 
-  // Captured anchor map from parser (persisted after liveParser_ is destroyed)
-  std::vector<std::pair<std::string, uint16_t>> anchorMap_;
+  // Retain anchors after the live parser closes.
+  std::vector<std::pair<std::string, uint32_t>> anchorMap_;
 
   void cleanupTempFiles();
 
@@ -53,10 +55,10 @@ class EpubChapterParser : public ContentParser {
                     const std::string& imageCachePath = "");
   ~EpubChapterParser() override;
 
-  bool parsePages(const std::function<void(std::unique_ptr<Page>)>& onPageComplete, uint16_t maxPages = 0,
+  bool parsePages(const std::function<void(std::unique_ptr<Page>)>& onPageComplete, uint32_t maxPages = 0,
                   const AbortCallback& shouldAbort = nullptr) override;
   bool hasMoreContent() const override { return hasMore_; }
   bool canResume() const override { return initialized_ && liveParser_ != nullptr; }
   void reset() override;
-  const std::vector<std::pair<std::string, uint16_t>>& getAnchorMap() const override;
+  const std::vector<std::pair<std::string, uint32_t>>& getAnchorMap() const override;
 };

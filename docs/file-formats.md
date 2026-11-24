@@ -1,23 +1,44 @@
 # File Formats
 
-This document describes the binary cache formats used by Papyrix for EPUB, TXT, Markdown, FB2, and HTML files.
+PapyriX stores EPUB, TXT, Markdown, FB2, and HTML page caches in binary files.
+
+`<device-cache>` is the device-specific cache directory listed in [Device Specifications](device-specifications.md#storage).
+
+Cover conversion keeps the aspect ratio. It reduces covers to 528×792 on X3 or 480×800 on X4, X4 Pro, X4 v2 Classic, and Sticky. It does not enlarge smaller covers.
+
+## Reading History
+
+`/.papyrix/reading-stats.bin` stores up to 64 statistics records. `/.papyrix/recent.bin` stores up to ten recent books.
+
+If a history file is missing, PapyriX starts an empty history. A read, data, or memory error leaves the saved file unchanged. PapyriX retries the load before the next change. A failed reload keeps the last valid recent-books list in memory.
+
+The stores check temporary-file writes and synchronization before replacement. Replacement is not power-loss atomic.
+
+## Reading Progress
+
+`ProgressManager` saves `progress.bin` for all supported content types. Current records use 14 bytes with little-endian integers.
+
+| Offset | Size | Field |
+|---|---|---|
+| `0x00` | 4 bytes | Magic `0x47525050` (`PPRG`) |
+| `0x04` | 1 byte | Version `1` |
+| `0x05` | 1 byte | `ContentType` value |
+| `0x06` | 4 bytes | Signed spine or section index |
+| `0x0A` | 4 bytes | Unsigned page number |
+
+EPUB and FB2 use the index and a page within that section. XTC uses a flat page number. TXT, Markdown, and HTML use the page number without the index. The loader also accepts legacy 4-byte records. New saves use the current format.
 
 ## TXT Cache Files
 
-TXT files use a simple cache format stored in `.papyrix/txt_<hash>/`.
+TXT files use a simple cache format in `<device-cache>/txt_<hash>/`.
 
 ### `progress.bin`
 
-Stores the current reading position as a single 4-byte little-endian unsigned integer (page number).
-
-```
-Offset  Size  Description
-0x00    4     Current page number (uint32_t, little-endian)
-```
+Uses the shared [reading progress format](#reading-progress).
 
 ### `index.bin`
 
-Stores the page index - byte offsets where each page starts in the source file. The index is invalidated and rebuilt when file size, viewport width, or lines-per-page changes.
+Stores the page index. These are byte offsets where each page starts in the source file. The index is not valid and is built again when file size, viewport width, or lines-per-page changes.
 
 ```
 Offset  Size        Description
@@ -30,7 +51,7 @@ Offset  Size        Description
 
 ### `cover.bmp`
 
-Optional cover image, discovered by searching for (case-insensitive):
+Optional cover image. Found by a search for (case-insensitive):
 1. `<filename>.jpg`, `<filename>.jpeg`, `<filename>.png`, or `<filename>.bmp` (matching the TXT filename)
 2. `cover.jpg`, `cover.jpeg`, `cover.png`, or `cover.bmp` in the same directory
 
@@ -40,26 +61,21 @@ The image is converted to 1-bit dithered BMP format for display.
 
 ## Markdown Cache Files
 
-Markdown files (`.md`, `.markdown`) use a cache format stored in `.papyrix/md_<hash>/`.
+Markdown files (`.md`, `.markdown`) use a cache format in `<device-cache>/md_<hash>/`.
 
 ### `progress.bin`
 
-Stores the current reading position as a 2-byte little-endian unsigned integer (page number).
-
-```
-Offset  Size  Description
-0x00    2     Current page number (uint16_t, little-endian)
-```
+Uses the shared [reading progress format](#reading-progress).
 
 ### `section.bin`
 
-Stores the parsed and laid-out pages. The format is similar to EPUB section files but with a simpler header.
+Stores the parsed pages after layout. The format is almost the same as EPUB section files, but the header is simpler.
 
 #### Version 1
 
 ```
 Offset  Size        Description
-0x00    1           Version (uint8_t) - currently 1
+0x00    1           Version (uint8_t) - version 1
 0x01    4           Font ID (int32_t)
 0x05    4           Line compression (float)
 0x09    1           Indent level (uint8_t)
@@ -79,7 +95,7 @@ The page data uses the same `Page` structure as EPUB section files (see below).
 
 ### `cover.bmp`
 
-Optional cover image, discovered by searching for (case-insensitive):
+Optional cover image. Found by a search for (case-insensitive):
 1. `<filename>.jpg`, `<filename>.jpeg`, `<filename>.png`, or `<filename>.bmp` (matching the Markdown filename)
 2. `cover.jpg`, `cover.jpeg`, `cover.png`, or `cover.bmp` in the same directory
 
@@ -87,14 +103,14 @@ The image is converted to 1-bit dithered BMP format for display.
 
 ### Supported Markdown Features
 
-- **Headers** (`#`, `##`, etc.) - Rendered bold and centered
+- **Headers** (`#`, `##`, and more) - Shown bold and centered
 - **Bold** (`**text**`) - Bold font style
 - **Italic** (`*text*`) - Italic font style
 - **Lists** (`-`, `*`, `1.`) - Bulleted with `•` prefix
-- **Blockquotes** (`>`) - Rendered in italic
-- **Inline code** (`` `code` ``) - Rendered in italic
-- **Horizontal rules** (`---`) - Rendered as centered line
-- **Links** - Text displayed (URL not shown)
+- **Blockquotes** (`>`) - Shown in italic
+- **Inline code** (`` `code` ``) - Shown in italic
+- **Horizontal rules** (`---`) - Shown as a centered line
+- **Links** - Text shown (URL not shown)
 - **Images** - Placeholder `[Image]` shown
 - **Code blocks** - Placeholder `[Code: ...]` shown
 - **Tables** - Placeholder `[Table omitted]` shown
@@ -103,15 +119,15 @@ The image is converted to 1-bit dithered BMP format for display.
 
 ## FB2 Cache Files
 
-FB2 (FictionBook 2.0) files use a cache format stored in `.papyrix/fb2_<hash>/`.
+FB2 (FictionBook 2.0) files use a cache format in `<device-cache>/fb2_<hash>/`.
 
 ### `meta.bin`
 
-Caches parsed metadata (title, author, cover reference, TOC) to avoid re-parsing the full XML on subsequent loads. Invalidated by version changes.
+Caches parsed metadata (title, author, cover reference, TOC). This prevents a new parse of the full XML on later loads. Not valid after version changes.
 
 ```
 Offset  Size        Description
-0x00    1           Version (uint8_t) — currently 2
+0x00    1           Version (uint8_t) — version 2
 0x01    4+N         Title (length-prefixed UTF-8 string)
 ...     4+N         Author (length-prefixed UTF-8 string)
 ...     4+N         Cover path (length-prefixed UTF-8 string)
@@ -125,15 +141,15 @@ Offset  Size        Description
 
 ### `progress.bin`
 
-Stores the current reading position (same format as EPUB).
+Uses the shared [reading progress format](#reading-progress).
 
 ### `sections/`
 
-Cached chapter pages, same format as EPUB section files. Files named by section index (`0.bin`, `1.bin`, etc.).
+Cached chapter pages, same format as EPUB section files. Files named by section index (`0.bin`, `1.bin`, and more).
 
 ### `cover.bmp`
 
-Optional cover image, discovered by searching for (case-insensitive):
+Optional cover image. Found by a search for (case-insensitive):
 1. `<filename>.jpg`, `<filename>.jpeg`, `<filename>.png`, or `<filename>.bmp` (matching the FB2 filename)
 2. `cover.jpg`, `cover.jpeg`, `cover.png`, or `cover.bmp` in the same directory
 
@@ -142,15 +158,21 @@ The image is converted to 1-bit dithered BMP format for display.
 ### Supported FB2 Features
 
 - **Metadata** — Title from `<book-title>`, author from `<first-name>` + `<last-name>` (from `<title-info>` only)
-- **Sections** — `<section>` elements treated as chapters with page breaks between them
-- **Titles/Subtitles** — Rendered bold and centered
-- **Paragraphs** (`<p>`) — Standard paragraph layout with configurable alignment
+- **Sections** — `<section>` elements used as chapters with page breaks between them
+- **Titles/Subtitles** — Shown bold and centered
+- **Paragraphs** (`<p>`) — Standard paragraph layout with alignment that you can set
 - **Emphasis** (`<emphasis>`) — Italic font style
+- **Code** (`<code>`) — Italic font style (no monospace font is included; same as `<emphasis>`)
 - **Strong** (`<strong>`) — Bold font style
 - **Empty lines** (`<empty-line>`) — Vertical spacing
-- **TOC navigation** — Built from section titles, supports jumping to sections
-- **RTL detection** — Arabic text detected from first chunk, enables RTL layout
-- **Namespace handling** — Strips XML namespace prefixes for compatibility
+- **Poetry** (`<poem>`, `<stanza>`, `<v>`) — Verse lines shown left-aligned with spacing between stanzas
+- **Text attribution** (`<text-author>`) — Author attribution lines
+- **Quotations** (`<cite>`) — Block quotations with visual spacing
+- **Epigraphs** (`<epigraph>`) — Epigraph blocks with visual spacing
+- **Annotations** (`<annotation>`) — Annotation blocks with visual spacing
+- **TOC navigation** — Built from section titles. Supports jump to sections
+- **RTL detection** — Arabic text found from the first chunk. Enables RTL layout
+- **Namespace handling** — Removes XML namespace prefixes for compatibility
 - **Binary skip** — `<binary>` tags (embedded images) skipped to save memory
 - **Images** — Not supported (inline images are skipped)
 
@@ -158,19 +180,19 @@ The image is converted to 1-bit dithered BMP format for display.
 
 ## HTML Cache Files
 
-HTML files (`.html`, `.htm`) use a cache format stored in `.papyrix/html_<hash>/`. HTML is parsed using the same pipeline as EPUB chapters (HTML5 normalization → Expat XML → page layout).
+HTML files (`.html`, `.htm`) use a cache format in `<device-cache>/html_<hash>/`. HTML uses the same parse pipeline as EPUB chapters (HTML5 normalization → Expat XML → page layout).
 
 ### `progress.bin`
 
-Stores the current reading position (same format as TXT/Markdown — 4-byte little-endian, section page in lower 2 bytes).
+Uses the shared [reading progress format](#reading-progress).
 
 ### `pages_<fontId>.bin`
 
-Stores the parsed and laid-out pages (same section format as Markdown and FB2). The filename includes the font ID hash so the cache is invalidated when the font changes.
+Stores the parsed pages after layout (same section format as Markdown and FB2). The filename includes the font ID hash. The cache is not valid when the font changes.
 
 ### `cover.bmp`
 
-Optional cover image, discovered by searching for (case-insensitive):
+Optional cover image. Found by a search for (case-insensitive):
 1. `<filename>.jpg`, `<filename>.jpeg`, `<filename>.png`, or `<filename>.bmp` (matching the HTML filename)
 2. `cover.jpg`, `cover.jpeg`, `cover.png`, or `cover.bmp` in the same directory
 
@@ -178,12 +200,13 @@ The image is converted to 1-bit dithered BMP format for display.
 
 ### Supported HTML Features
 
-- **Title** — Extracted from `<title>` tag (falls back to filename)
-- **Headings** (`<h1>`–`<h6>`) — Rendered bold and centered
-- **Paragraphs** (`<p>`) — Standard paragraph layout with configurable alignment
+- **Title** — From the `<title>` tag (uses filename if there is no title)
+- **Headings** (`<h1>`–`<h6>`) — Shown bold and centered
+- **Paragraphs** (`<p>`) — Standard paragraph layout with alignment that you can set
 - **Bold** (`<b>`, `<strong>`) — Bold font style
-- **Italic** (`<i>`, `<em>`) — Italic font style
-- **List items** (`<li>`) — Rendered as block elements (list containers `<ul>`/`<ol>` are treated as inline)
+- **Italic** (`<i>`, `<em>`, `<code>`, `<tt>`, `<kbd>`, `<samp>`) — Italic font style (no monospace font is included; code-like inline tags show italic)
+- **Preformatted** (`<pre>`) — Block element, forced left-align. Line breaks stay. Tabs expand to 4 spaces. Runs of spaces stay through non-breaking spaces
+- **List items** (`<li>`) — Shown as block elements (list containers `<ul>`/`<ol>` are used as inline)
 - **Blockquotes** (`<blockquote>`) — Indented block style
 - **Divs** (`<div>`) — Block-level grouping
 - **Line breaks** (`<br>`) — Inline line breaks
@@ -194,17 +217,54 @@ The image is converted to 1-bit dithered BMP format for display.
 
 ## EPUB Cache Files
 
-EPUB files use a more complex cache format stored in `.papyrix/epub_<hash>/`.
+EPUB files use a more complex cache format in `<device-cache>/epub_<hash>/`. The metadata builder accepts up to 500 spine items. It rejects an extra item before TOC processing and does not publish a metadata cache for the unsupported book.
 
 ### Image Cache (`images/` subdirectory)
 
 Inline images are converted to BMP and cached:
 - `<hash>.bmp` — Converted image (FNV-1a hash of resolved image path)
-- `<hash>.failed` — Marker file for failed conversions (prevents re-attempts)
+- `<hash>.failed` — Marker file for failed conversions (prevents new tries)
+
+### Prepared Chapters (`chapters/` subdirectory)
+
+EPUB chapters larger than 64 KiB use complete normalized XHTML files on the SD card. The file name is `<sourceFingerprint>_<spineIndex>.xhtml`. The parser reads the file in blocks. It does not load the complete chapter into RAM. Preparation writes temporary files and checks all reads, writes, and synchronization before it publishes the result. Cancellation or a detected failure removes the temporary output.
+
+A zero source fingerprint disables reuse. Old virtual-section files and indexes are not used.
+
+## `styles.bin`
+
+### Version 1
+
+This EPUB cache stores parsed external CSS rules. PapyriX prepares it when a chapter first needs layout. A compatible page-cache read does not load CSS. Later layout work loads these rules instead of extracting and parsing the source stylesheets.
+
+All multi-byte fields use little-endian order. The header contains:
+
+| Offset | Size | Field |
+|---|---|---|
+| `0x00` | 4 bytes | Magic `0x53435850` (`PXCS`) |
+| `0x04` | 1 byte | Version `1` |
+| `0x05` | 4 bytes | Source fingerprint (`uint32_t`) |
+| `0x09` | 2 bytes | Rule count (`uint16_t`, at most 512) |
+| `0x0B` | Variable | Rule records |
+| End − 4 | 4 bytes | CRC32 of all preceding bytes |
+
+Each rule contains a `uint32_t` selector byte length, 1–256 selector bytes, and 47 style bytes. The style bytes contain a `uint16_t` property mask, five enum bytes, and eight length records. Each length record contains a 32-bit float and one unit byte.
+
+Mask bits 0–12 represent text alignment, font style, font weight, direction, four margins, four paddings, and display. Margins and paddings use top, bottom, left, right order. The five enum bytes represent text alignment, font style, font weight, direction, and display. Their values match `CssStyle.h`.
+
+Length units are `0` for pixels, `1` for `em`, `2` for `rem`, `3` for points, and `4` for percent. The cache keeps relative values and explicit zero properties. Font and viewport changes do not require source CSS parsing. CRC32 uses initial value `0xFFFFFFFF` and final XOR `0xFFFFFFFF`.
+
+A zero-rule cache is valid. A zero source fingerprint disables persistent rule reuse and publication. A missing, outdated, or corrupt cache requires source preparation. The loader rejects truncated records, invalid field values, duplicate selectors, extra bytes, and checksum errors. Each source CSS file remains limited to 64 KiB.
+
+Preparation writes `styles.bin.tmp`, checks each write, synchronizes and closes the file, then publishes only if every step succeeds. Failure before publication keeps the previous cache. Replacement removes the previous file before rename. A publication failure can leave no cache; the next preparation builds it again.
+
+A CSS preparation failure does not publish new pages with incomplete styles. Failure to save complete rules can leave those rules usable in memory. Reading progress and bookmarks use separate files and do not change.
 
 ## `book.bin`
 
-### Version 3
+### Version 8
+
+This version stores the original EPUB spine order. PapyriX rebuilds older metadata without a migration step. It keeps the source book, settings, progress, and bookmarks. Page numbers can change after the layout rebuild.
 
 ImHex Pattern:
 
@@ -214,7 +274,7 @@ import std.string;
 import std.core;
 
 // === Configuration ===
-#define EXPECTED_VERSION 3
+#define EXPECTED_VERSION 8
 #define MAX_STRING_LENGTH 65535
 
 // === String Structure ===
@@ -236,6 +296,7 @@ fn format_string(String s) {
 struct Metadata {
     String title [[comment("Book title")]];
     String author [[comment("Book author")]];
+    String language [[comment("Book language tag")]];
     String coverItemHref [[comment("Path to cover image")]];
     String textReferenceHref [[comment("Path to guided first text reference")]];
 } [[comment("Book metadata information")]];
@@ -303,9 +364,21 @@ if (parsedSize != fileSize) {
 }
 ```
 
+### Related Files
+
+- `toc.retry` — One-byte recovery state. Values from `0` to `3` record the number of recovery attempts. `0xFF` means no declared table of contents.
+- `book.bin.new` — Replacement metadata in the `book.bin` format.
+- `book.bin.bak` — Previous metadata in the `book.bin` format.
+
 ## `section.bin`
 
-### Version 15
+### Version 29
+
+PapyriX rebuilds section caches with an unsupported format version when it opens the book. This version rebuilds layouts that can lack external EPUB styles after a low-memory open. PapyriX keeps saved reading progress and bookmarks. Page numbers can change after layout.
+
+The page-count index (`metrics.bin`) uses version 10. Anchor maps (`.anchors`) use version 7. PapyriX rejects indexes with an unsupported version before it uses their page counts or anchor positions.
+
+It rebuilds a section cache if its anchor map is missing or has an invalid header. A valid empty anchor map does not cause a rebuild.
 
 ImHex Pattern:
 
@@ -315,7 +388,7 @@ import std.string;
 import std.core;
 
 // === Configuration ===
-#define EXPECTED_VERSION 15
+#define EXPECTED_VERSION 29
 #define MAX_STRING_LENGTH 65535
 
 // === String Structure ===
@@ -401,13 +474,20 @@ struct SectionBin {
     // Cache busting parameters
     s32 fontId;
     float lineCompression;
-    bool extraParagraphSpacing;
+    u8 indentLevel;
+    u8 spacingLevel;
     u8 paragraphAlignment;
     bool hyphenation;
+    bool showImages;
     u16 viewportWidth;
     u16 viewportHeight;
-    u16 pageCount;
+    u32 pageCount;
+    u8 isPartial;
     u32 lutOffset;
+    u32 bytesConsumed;
+    u32 totalBytes;
+    u32 sourceFingerprint;
+    u32 fontFingerprint;
 
     Page page[pageCount];
 
@@ -444,7 +524,7 @@ Stores saved bookmarks. Present in all cache directories (EPUB, FB2, HTML, TXT, 
 
 ```
 Offset  Size             Description
-0x00    1                Bookmark count (uint8_t, max 20)
+0x00    1                Bookmark count (uint8_t, firmware maximum 50)
 0x01    72 * count       Bookmark entries
 ```
 
@@ -453,11 +533,117 @@ Each bookmark entry (72 bytes):
 ```
 Offset  Size  Description
 0x00    2     Spine index (int16_t) — chapter index for EPUB/FB2, unused for other formats
-0x02    2     Section page (int16_t) — page within chapter/section
+0x02    2     Section page (int16_t) — page in the chapter/section
 0x04    4     Flat page (uint32_t) — absolute page number (used by TXT/Markdown/XTC formats)
 0x08    64    Label (char[64]) — null-terminated bookmark title
 ```
 
+Firmware that supports a maximum of 20 bookmarks loads only the first 20 entries. If this firmware saves the file, the save operation deletes the other entries.
+
 ### `bookmarks.txt`
 
-Human-readable companion file exported alongside `bookmarks.bin`. Contains one line per bookmark with the label and page position. This file is for user reference only and is not read back by the firmware.
+Human-readable companion file exported with `bookmarks.bin`. Contains one line for each bookmark with the label and page position. This file is for user reference only. The firmware does not read it again.
+
+## Go Game
+
+`/.papyrix/apps/go.bin` stores one 9 by 9 game and its full position history.
+All multi-byte integers use little-endian order.
+The file contains a 24-byte header and one 22-byte record per turn.
+
+| Offset | Bytes | Field |
+|---|---|---|
+| 0 | 4 | Magic: `PXGO` |
+| 4 | 1 | Format version: `1` |
+| 5 | 1 | Board side: `9` |
+| 6 | 1 | Rules: `1`, Tromp–Taylor with positional superko |
+| 7 | 1 | Komi in half-points: `15` |
+| 8 | 4 | Opponent seed |
+| 12 | 4 | Turn count |
+| 16 | 1 | Outcome: `0` playing, `1` scored, `2` Black resigns, `3` White resigns |
+| 17 | 3 | Reserved: zero |
+| 20 | 4 | CRC32 |
+
+Each turn record starts with a move byte.
+Values `0` through `80` identify intersections in row-major order.
+Value `81` identifies a pass.
+The next 21 bytes contain the resulting board key.
+Resignation changes the header outcome without adding a turn record.
+
+The key uses two bits per intersection.
+Intersection `i` occupies bits `2 * (i % 4)` in byte `i / 4`.
+Values are `0` empty, `1` Black, and `2` White.
+Value `3` is invalid.
+The unused upper six bits of the last byte are zero.
+
+CRC32 starts at `0xffffffff`.
+It covers header bytes 0 through 19, then every turn record.
+The stored value is the complement of the result.
+The CRC field does not participate in the calculation.
+
+Loading replays every turn and checks its stored key.
+It checks positional superko against the full history, including the initial empty board.
+File size must equal `24 + turn count * 22`.
+
+Writes use `go.bin.tmp` and `go.bin.bak` through `CheckedFile.h`.
+The temporary file must pass write, sync, and close checks before publication.
+A failed publication retains the previous complete game.
+Loading can recover a valid backup when the main file is invalid or absent.
+Replacement does not guarantee recovery from a physical power loss during SD writes.
+
+## Lights Out Game
+
+`/.papyrix/apps/lightsout.bin` stores one 5 by 5 game in 14 bytes.
+Multi-byte integers use little-endian order.
+
+| Offset | Bytes | Field |
+|---|---|---|
+| 0 | 4 | Magic: `PXLO` |
+| 4 | 1 | Format version: `1` |
+| 5 | 4 | Lights: bits 0 through 24 in row-major order; upper bits are zero |
+| 9 | 4 | Move count; stops at `0xffffffff` |
+| 13 | 1 | Cursor: cell 0 through 24 in row-major order |
+
+A set bit marks a light that is on. A zero board marks a solved game.
+Loading checks the size, magic, version, unused bits, and cursor.
+It retains solved games.
+Writes use `lightsout.bin.tmp` and `lightsout.bin.bak` through `CheckedFile.h`.
+Loading can recover a valid backup when the main file is invalid or absent.
+The app does not save each move. Exit and sleep save the current state.
+
+## Sokoban Game
+
+`/.papyrix/apps/sokoban.bin` stores one game in 410 bytes.
+Multi-byte integers use little-endian order.
+Level indices refer to the 12 built-in levels.
+Cell indices use the selected level width and row-major order.
+
+| Offset | Bytes | Field |
+|---|---|---|
+| 0 | 4 | Magic: `PXSK` |
+| 4 | 1 | Format version: `2` |
+| 5 | 1 | Level: `0` through `11` |
+| 6 | 1 | Player cell |
+| 7 | 1 | Box count: `1` through `8`; matches the selected level |
+| 8 | 8 | Box cells; the box count selects the active entries |
+| 16 | 4 | Move count; stops at `0xffffffff` |
+| 20 | 4 | Push count; stops at `0xffffffff` |
+| 24 | 1 | Undo count: `0` through `128` |
+| 25 | 1 | Next circular undo slot: `0` through `127` |
+| 26 | 384 | 128 undo entries; three bytes each |
+
+Each undo entry stores the previous player cell, the pushed box index, and flags.
+Box index `255` marks a move without a push.
+Flag bit 0 records an increase in the move count.
+Flag bit 1 records an increase in the push count.
+The remaining flag bits are zero.
+Undo decreases a counter only when the move increases it.
+
+Loading checks the record size, magic, version, positions, counters, and circular buffer bounds.
+It reverses every active undo entry to check the saved history.
+Failed loading leaves the caller's game unchanged.
+Writes use `sokoban.bin.tmp` and `sokoban.bin.bak` through `CheckedFile.h`.
+Loading can recover a valid backup when the main file is invalid or absent.
+Exit and sleep save the game.
+Ordinary moves do not write to the SD card.
+
+Version 2 identifies the Papwick level pack. Version 1 uses different levels and cannot load in this version. The app keeps old saves until the user confirms a replacement. Increase the format version when the built-in level maps change.

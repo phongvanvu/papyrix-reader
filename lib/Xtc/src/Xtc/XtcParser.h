@@ -39,13 +39,13 @@ class XtcParser {
   uint16_t getPageCount() const { return m_header.pageCount; }
   uint16_t getWidth() const { return m_defaultWidth; }
   uint16_t getHeight() const { return m_defaultHeight; }
-  uint8_t getBitDepth() const { return m_bitDepth; }  // 1 = XTC/XTG, 2 = XTCH/XTH
+  uint8_t getBitDepth() const { return m_bitDepth; }
 
   // Page information (reads from file on each call)
   bool getPageInfo(uint32_t pageIndex, PageInfo& info);
 
   /**
-   * Load page bitmap (raw 1-bit data, skipping XTG header)
+   * Load page bitmap data without the page header.
    *
    * @param pageIndex Page index (0-based)
    * @param buffer Output buffer (caller allocated)
@@ -63,16 +63,25 @@ class XtcParser {
    * @param chunkSize Chunk size (default: 1024 bytes)
    * @return Error code
    */
-  XtcError loadPageStreaming(uint32_t pageIndex,
-                             std::function<void(const uint8_t* data, size_t size, size_t offset)> callback,
-                             size_t chunkSize = 1024);
+  using PageChunkCallback = std::function<bool(const uint8_t* data, size_t size, size_t offset)>;
+  XtcError loadPageStreaming(uint32_t pageIndex, PageChunkCallback callback, size_t chunkSize = 1024,
+                             const std::function<bool()>& shouldAbort = nullptr);
+
+  using PagePlaneChunkCallback =
+      std::function<bool(const uint8_t* plane1, const uint8_t* plane2, size_t size, size_t planeOffset)>;
+  XtcError loadPagePlanePairs(uint32_t pageIndex, PagePlaneChunkCallback callback, size_t chunkSize = 4096,
+                              const std::function<bool()>& shouldAbort = nullptr);
 
   // Get title/author from metadata
   std::string getTitle() const { return m_title; }
   std::string getAuthor() const { return m_author; }
 
-  bool hasChapters() const { return m_hasChapters; }
-  const std::vector<ChapterInfo>& getChapters() const { return m_chapters; }
+  bool hasChapters() const;
+  const std::vector<ChapterInfo>& getChapters() const;
+
+#ifdef TEST_BUILD
+  size_t getLoadedChapterCountForTest() const { return m_chapters.size(); }
+#endif
 
   // Validation
   static bool isValidXtcFile(const char* filepath);
@@ -81,16 +90,17 @@ class XtcParser {
   XtcError getLastError() const { return m_lastError; }
 
  private:
-  FsFile m_file;
+  mutable FsFile m_file;
   bool m_isOpen;
   XtcHeader m_header;
-  std::vector<ChapterInfo> m_chapters;
+  mutable std::vector<ChapterInfo> m_chapters;
   std::string m_title;
   std::string m_author;
   uint16_t m_defaultWidth;
   uint16_t m_defaultHeight;
-  uint8_t m_bitDepth;  // 1 = XTC/XTG (1-bit), 2 = XTCH/XTH (2-bit)
-  bool m_hasChapters;
+  uint8_t m_bitDepth;  // 0 = unknown, 1 = XTG, 2 = XTH
+  mutable bool m_hasChapters;
+  mutable bool m_chaptersLoaded;
   XtcError m_lastError;
 
   // Internal helper functions
@@ -98,8 +108,10 @@ class XtcParser {
   XtcError readPageTable();
   XtcError readTitle();
   XtcError readAuthor();
-  XtcError readChapters();
+  XtcError readChapters() const;
+  void ensureChaptersLoaded() const;
   bool readPageEntry(uint32_t pageIndex, PageInfo& info);
+  bool readValidatedPage(uint32_t pageIndex, PageInfo& page, XtgPageHeader& pageHeader, size_t& bitmapSize);
 };
 
 }  // namespace xtc

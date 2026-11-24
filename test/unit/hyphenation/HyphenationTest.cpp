@@ -69,6 +69,10 @@ int main() {
   runner.expectEq(static_cast<uint32_t>(0x0430), toLowerCyrillic(0x0410), "toLowerCyrillic: А -> а");
   runner.expectEq(static_cast<uint32_t>(0x044F), toLowerCyrillic(0x042F), "toLowerCyrillic: Я -> я");
   runner.expectEq(static_cast<uint32_t>(0x0451), toLowerCyrillic(0x0401), "toLowerCyrillic: Ё -> ё");
+  runner.expectEq(uint32_t(0x0454), toLowerCyrillic(0x0404), "toLowerCyrillic: Є -> є");
+  runner.expectEq(uint32_t(0x0456), toLowerCyrillic(0x0406), "toLowerCyrillic: І -> і");
+  runner.expectEq(uint32_t(0x0457), toLowerCyrillic(0x0407), "toLowerCyrillic: Ї -> ї");
+  runner.expectEq(uint32_t(0x0491), toLowerCyrillic(0x0490), "toLowerCyrillic: Ґ -> ґ");
 
   // ============================================
   // HyphenationCommon: isPunctuation / isExplicitHyphen / isSoftHyphen
@@ -294,6 +298,34 @@ int main() {
     runner.expectTrue(!breaks.empty(), "ru: long Russian word has breaks");
   }
 
+  {
+    const struct {
+      const char* language;
+      const char* word;
+      std::vector<size_t> offsets;
+    } cases[] = {
+        {"uk", "україна", {8, 10}},
+        {"uk", "УКРАЇНА", {8, 10}},
+        {"uk", "поєднання", {4, 8, 12, 14}},
+        {"uk", "ПОЄДНАННЯ", {4, 8, 12, 14}},
+        {"uk", "єдність", {4}},
+        {"uk", "ЄДНІСТЬ", {4}},
+        {"uk", "обґрунтування", {4, 12, 16, 20, 22}},
+        {"uk", "ОБҐРУНТУВАННЯ", {4, 12, 16, 20, 22}},
+        {"uk", "ПоЄдНаНнЯ", {4, 8, 12, 14}},
+        {"uk", "УКРАЇНА\xC2\xAD" "ПОЄДНАННЯ", {8, 10, 16, 20, 24, 28, 30}},
+        {"uk", "aУКРАЇНА", {}},
+        {"fr", "élégance", {5}},
+        {"fr", "ÉLÉGANCE", {5}},
+        {"it", "perché", {3}},
+        {"it", "PERCHÉ", {3}},
+    };
+    for (const auto& entry : cases) {
+      Hyphenation::setLanguage(entry.language);
+      runner.expectTrue(breakByteOffsets(entry.word) == entry.offsets, entry.word);
+    }
+  }
+
   // Empty language tag resets to no hyphenator
   {
     Hyphenation::setLanguage("");
@@ -391,6 +423,35 @@ int main() {
       }
     }
     runner.expectTrue(hasPatternBreak, "de: has pattern-based breaks within Satellitensystem");
+  }
+
+  // ============================================
+  // LiangHyphenation: fixed-buffer overflow (silent skip)
+  // ============================================
+  // The Liang hyphenator stores augmented-word data in fixed stack buffers
+  // (MAX_WORD_BYTES=160, MAX_WORD_CHARS=70). Words exceeding either cap must
+  // return an empty break list rather than crash or write past the buffer.
+
+  {
+    Hyphenation::setLanguage("de");
+    // 80 ASCII letters — exceeds MAX_WORD_CHARS (70) including the two '.' sentinels
+    std::string longAscii(80, 'a');
+    auto breaks = Hyphenation::breakOffsets(longAscii, false);
+    runner.expectTrue(breaks.empty(), "de: 80-char word overflows char cap, returns no breaks");
+  }
+
+
+  {
+    Hyphenation::setLanguage("de");
+    // 75 ä codepoints (UTF-8 0xC3 0xA4 each = 150 bytes). Char count exceeds
+    // MAX_WORD_CHARS (70) before byte count would exceed MAX_WORD_BYTES (160).
+    std::string longUmlaut;
+    longUmlaut.reserve(150);
+    for (int i = 0; i < 75; ++i) {
+      longUmlaut.append("\xC3\xA4");
+    }
+    auto breaks = Hyphenation::breakOffsets(longUmlaut, false);
+    runner.expectTrue(breaks.empty(), "de: 75-char multi-byte word overflows char cap, returns no breaks");
   }
 
   // Reset to English for consistent state

@@ -7,23 +7,26 @@
 #include <cstdio>
 #include <cstring>
 
-#include "../core/Core.h"
+#include "../hal/Storage.h"
 
 #define TAG "BOOKMARK"
 
 namespace papyrix {
 
-bool BookmarkManager::save(Core& core, const char* cacheDir, ContentType type, const Bookmark* bookmarks, int count) {
+bool BookmarkManager::save(hal::Storage& storage, const char* cacheDir, ContentType type, const Bookmark* bookmarks,
+                           int count) {
   if (!cacheDir || cacheDir[0] == '\0') return false;
   if (count < 0 || count > MAX_BOOKMARKS) return false;
 
   char path[280];
   snprintf(path, sizeof(path), "%s/bookmarks.bin", cacheDir);
+  char tmpPath[288];
+  snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", path);
 
   FsFile file;
-  auto result = core.storage.openWrite(path, file);
+  auto result = storage.openWrite(tmpPath, file);
   if (!result.ok()) {
-    LOG_ERR(TAG, "Failed to save bookmarks to %s", path);
+    LOG_ERR(TAG, "Failed to open tmp bookmarks %s", tmpPath);
     return false;
   }
 
@@ -32,11 +35,26 @@ bool BookmarkManager::save(Core& core, const char* cacheDir, ContentType type, c
   if (count > 0) {
     file.write(reinterpret_cast<const uint8_t*>(bookmarks), static_cast<size_t>(count) * sizeof(Bookmark));
   }
+  file.sync();
+  const uint32_t expectedBytes = sizeof(uint8_t) + static_cast<uint32_t>(count) * sizeof(Bookmark);
+  const uint32_t actualBytes = file.size();
   file.close();
+  if (actualBytes != expectedBytes) {
+    LOG_ERR(TAG, "Short bookmarks write %u/%u; discarding tmp", static_cast<unsigned>(actualBytes),
+            static_cast<unsigned>(expectedBytes));
+    storage.remove(tmpPath);
+    return false;
+  }
+  if (!storage.commitFile(tmpPath, path).ok()) {
+    LOG_ERR(TAG, "Failed to commit bookmarks file %s", path);
+    storage.remove(tmpPath);
+    return false;
+  }
   LOG_DBG(TAG, "Saved %d bookmarks", count);
 
+  // Human-readable export is non-critical; direct write is acceptable.
   snprintf(path, sizeof(path), "%s/bookmarks.txt", cacheDir);
-  result = core.storage.openWrite(path, file);
+  result = storage.openWrite(path, file);
   if (!result.ok()) {
     LOG_ERR(TAG, "Failed to export bookmarks.txt");
     return true;
@@ -46,7 +64,7 @@ bool BookmarkManager::save(Core& core, const char* cacheDir, ContentType type, c
   for (int i = 0; i < count; i++) {
     const Bookmark& b = bookmarks[i];
     int len = 0;
-    if (type == ContentType::Epub) {
+    if (type == ContentType::Epub || type == ContentType::Fb2) {
       len = snprintf(line, sizeof(line), "Ch %d, Page %d: %s\n", b.spineIndex + 1, b.sectionPage + 1, b.label);
     } else if (type == ContentType::Xtc) {
       len = snprintf(line, sizeof(line), "Page %u: %s\n", static_cast<unsigned>(b.flatPage + 1), b.label);
@@ -62,14 +80,14 @@ bool BookmarkManager::save(Core& core, const char* cacheDir, ContentType type, c
   return true;
 }
 
-int BookmarkManager::load(Core& core, const char* cacheDir, Bookmark* bookmarks, int maxCount) {
+int BookmarkManager::load(hal::Storage& storage, const char* cacheDir, Bookmark* bookmarks, int maxCount) {
   if (!cacheDir || cacheDir[0] == '\0') return 0;
 
   char path[280];
   snprintf(path, sizeof(path), "%s/bookmarks.bin", cacheDir);
 
   FsFile file;
-  auto result = core.storage.openRead(path, file);
+  auto result = storage.openRead(path, file);
   if (!result.ok()) {
     LOG_DBG(TAG, "No saved bookmarks found");
     return 0;
@@ -105,6 +123,9 @@ int BookmarkManager::load(Core& core, const char* cacheDir, Bookmark* bookmarks,
       file.close();
       return 0;
     }
+    for (int i = 0; i < toLoad; i++) {
+      bookmarks[i].label[sizeof(bookmarks[i].label) - 1] = '\0';
+    }
   }
 
   file.close();
@@ -115,7 +136,7 @@ int BookmarkManager::load(Core& core, const char* cacheDir, Bookmark* bookmarks,
 int BookmarkManager::findAt(const Bookmark* bookmarks, int count, ContentType type, int spineIndex, int sectionPage,
                             uint32_t flatPage) {
   for (int i = 0; i < count; i++) {
-    if (type == ContentType::Epub) {
+    if (type == ContentType::Epub || type == ContentType::Fb2) {
       if (bookmarks[i].spineIndex == spineIndex && bookmarks[i].sectionPage == sectionPage) {
         return i;
       }

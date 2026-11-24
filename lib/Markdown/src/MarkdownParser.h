@@ -38,11 +38,13 @@ class MarkdownParser : public ContentParser {
   MarkdownParser(std::string filepath, GfxRenderer& renderer, const RenderConfig& config);
   ~MarkdownParser() override;
 
-  bool parsePages(const std::function<void(std::unique_ptr<Page>)>& onPageComplete, uint16_t maxPages = 0,
+  bool parsePages(const std::function<void(std::unique_ptr<Page>)>& onPageComplete, uint32_t maxPages = 0,
                   const AbortCallback& shouldAbort = nullptr) override;
   bool hasMoreContent() const override { return hasMore_; }
   bool canResume() const override { return currentOffset_ > 0 && hasMore_; }
   void reset() override;
+  uint32_t bytesConsumed() const override { return static_cast<uint32_t>(currentOffset_); }
+  uint32_t totalBytes() const override { return static_cast<uint32_t>(fileSize_); }
 
  private:
   // File state
@@ -63,6 +65,12 @@ class MarkdownParser : public ContentParser {
   // Carries over unconsumed words from a text block that was
   // interrupted by a page-batch limit.
   std::unique_ptr<ParsedText> pendingTextBlock_;
+  int16_t pendingSpacing_ = 0;
+
+  // Carries over a partial page so the next batch continues filling it
+  // instead of emitting a nearly-empty page.
+  std::unique_ptr<Page> pendingPage_;
+  int16_t pendingPageNextY_ = 0;
 
   // Parsing context passed through md_parser callback
   struct ParseContext {
@@ -75,9 +83,10 @@ class MarkdownParser : public ContentParser {
     bool inCodeBlock;
     int headerLevel;
     bool hitMaxPages;
-    uint16_t pagesCreated;
-    uint16_t maxPages;
+    uint32_t pagesCreated;
+    uint32_t maxPages;
     std::function<void(std::unique_ptr<Page>)> onPageComplete;
+    AbortCallback shouldAbort;
 
     // Word buffer for building words
     char wordBuffer[MAX_WORD_SIZE + 1];

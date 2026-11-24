@@ -31,14 +31,23 @@ class PlainTextParser : public ContentParser {
   // Carries over unconsumed words from a paragraph that was
   // interrupted by a page-batch limit.
   std::unique_ptr<ParsedText> pendingBlock_;
+  int16_t pendingSpacing_ = 0;
+  bool pendingSawNewline_ = false;
+  std::string pendingPartialWord_;
+
+  // Carries over a partial page so the next batch continues filling it.
+  std::unique_ptr<Page> pendingPage_;
+  int16_t pendingPageY_ = 0;
 
  public:
   PlainTextParser(std::string filepath, GfxRenderer& renderer, const RenderConfig& config);
   ~PlainTextParser() override = default;
 
-  bool parsePages(const std::function<void(std::unique_ptr<Page>)>& onPageComplete, uint16_t maxPages = 0,
+  bool parsePages(const std::function<void(std::unique_ptr<Page>)>& onPageComplete, uint32_t maxPages = 0,
                   const AbortCallback& shouldAbort = nullptr) override;
   bool hasMoreContent() const override { return hasMore_; }
   bool canResume() const override { return currentOffset_ > 0 && hasMore_; }
   void reset() override;
+  uint32_t bytesConsumed() const override { return static_cast<uint32_t>(currentOffset_); }
+  uint32_t totalBytes() const override { return static_cast<uint32_t>(fileSize_); }
 };

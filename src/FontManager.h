@@ -6,6 +6,7 @@
 #include <GfxRenderer.h>
 #include <StreamingEpdFont.h>
 
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -127,6 +128,8 @@ class FontManager {
 
   /// Returns true if the active reader font was loaded from SD card (not a builtin font).
   bool isUsingCustomReaderFont() const { return _activeReaderFontId != 0; }
+  /// Fingerprint of the active reader font files (or stable built-in font ID).
+  uint32_t activeReaderFontFingerprint() const { return _activeReaderFontFingerprint; }
 
   /**
    * Log information about all loaded fonts.
@@ -136,7 +139,7 @@ class FontManager {
   /**
    * Log current memory status for profiling.
    * Logs free heap size and largest free block.
-   * @param context Description of when this is called (e.g., "before font load")
+   * @param context Label for the log message (e.g., "before font load")
    */
   void logMemoryStatus(const char* context) const;
 
@@ -210,12 +213,16 @@ class FontManager {
     LoadedFont fonts[3];           // Indexed by Style: REGULAR=0, BOLD=1, ITALIC=2
     std::string deferredPaths[3];  // Paths for lazy loading (empty = not available)
     int fontId = 0;
+    uint32_t fingerprint = 0;
   };
 
   std::map<int, LoadedFamily> loadedFamilies;
 
   // Track active reader font for cleanup when switching sizes
   int _activeReaderFontId = 0;
+  uint32_t _activeReaderFontFingerprint = 0;
+  char _activeBinFontName[48] = {};
+  int _activeBinBuiltinFontId = 0;
 
   // External font for CJK fallback (pointer to avoid 54KB allocation when unused)
   ExternalFont* _externalFont = nullptr;

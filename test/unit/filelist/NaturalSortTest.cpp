@@ -1,41 +1,13 @@
-#include "test_utils.h"
+#include <FsHelpers.h>
 
 #include <algorithm>
-#include <cctype>
-#include <cstring>
 #include <string>
 #include <vector>
 
-// Inline the natural sort comparator from FileListState.cpp for testing
+#include "test_utils.h"
+
 static bool naturalLess(const std::string& a, const std::string& b) {
-  const char* s1 = a.c_str();
-  const char* s2 = b.c_str();
-
-  while (*s1 && *s2) {
-    const auto uc = [](char c) { return static_cast<unsigned char>(c); };
-    if (std::isdigit(uc(*s1)) && std::isdigit(uc(*s2))) {
-      while (*s1 == '0') s1++;
-      while (*s2 == '0') s2++;
-
-      int len1 = 0, len2 = 0;
-      while (std::isdigit(uc(s1[len1]))) len1++;
-      while (std::isdigit(uc(s2[len2]))) len2++;
-      if (len1 != len2) return len1 < len2;
-
-      for (int i = 0; i < len1; i++) {
-        if (s1[i] != s2[i]) return s1[i] < s2[i];
-      }
-      s1 += len1;
-      s2 += len2;
-    } else {
-      char c1 = std::tolower(uc(*s1));
-      char c2 = std::tolower(uc(*s2));
-      if (c1 != c2) return c1 < c2;
-      s1++;
-      s2++;
-    }
-  }
-  return *s1 == '\0' && *s2 != '\0';
+  return FsHelpers::naturalCompare(a.c_str(), b.c_str()) < 0;
 }
 
 // Helper: verify strict weak ordering properties for a pair
@@ -46,7 +18,7 @@ static void verifyPair(TestUtils::TestRunner& t, const std::string& lesser, cons
 }
 
 static void verifyEqual(TestUtils::TestRunner& t, const std::string& a, const std::string& b,
-                         const std::string& label) {
+                        const std::string& label) {
   t.expectFalse(naturalLess(a, b), label + ": !(" + a + " < " + b + ")");
   t.expectFalse(naturalLess(b, a), label + ": !(" + b + " < " + a + ")");
 }
@@ -108,9 +80,7 @@ int main() {
   // --- Chapter/book style filenames ---
   {
     std::vector<std::string> input = {"Chapter 10", "Chapter 1", "Chapter 20", "Chapter 2", "Chapter 3"};
-    std::sort(input.begin(), input.end(), [](const std::string& a, const std::string& b) {
-      return naturalLess(a, b);
-    });
+    std::sort(input.begin(), input.end(), [](const std::string& a, const std::string& b) { return naturalLess(a, b); });
     std::vector<std::string> expected = {"Chapter 1", "Chapter 2", "Chapter 3", "Chapter 10", "Chapter 20"};
     t.expectTrue(input == expected, "chapter sort order");
   }
@@ -118,9 +88,7 @@ int main() {
   // --- Typical filenames ---
   {
     std::vector<std::string> input = {"img100.jpg", "img2.jpg", "img1.jpg", "img10.jpg", "img20.jpg"};
-    std::sort(input.begin(), input.end(), [](const std::string& a, const std::string& b) {
-      return naturalLess(a, b);
-    });
+    std::sort(input.begin(), input.end(), [](const std::string& a, const std::string& b) { return naturalLess(a, b); });
     std::vector<std::string> expected = {"img1.jpg", "img2.jpg", "img10.jpg", "img20.jpg", "img100.jpg"};
     t.expectTrue(input == expected, "image filename sort order");
   }
@@ -129,6 +97,16 @@ int main() {
   t.expectFalse(naturalLess("abc", "abc"), "irreflexivity: abc");
   t.expectFalse(naturalLess("file10", "file10"), "irreflexivity: file10");
   t.expectFalse(naturalLess("", ""), "irreflexivity: empty");
+
+  // --- Explicit API boundaries ---
+  t.expectEq(0, FsHelpers::naturalCompare(nullptr, nullptr), "two null names compare equal");
+  t.expectTrue(FsHelpers::naturalCompare(nullptr, "a") < 0, "null name sorts before text");
+  t.expectTrue(FsHelpers::naturalCompare("a", nullptr) > 0, "text sorts after null name");
+  t.expectTrue(FsHelpers::naturalCompare("Apple", u8"épisode") < 0, "ASCII sorts before higher UTF-8 bytes");
+  t.expectTrue(FsHelpers::naturalCompare(u8"épisode2", u8"épisode10") < 0,
+               "natural digit runs apply after equal UTF-8 bytes");
+  t.expectTrue(FsHelpers::naturalCompare(u8"épisode", u8"Книга") < 0,
+               "non-ASCII names use deterministic UTF-8 byte order");
 
   // --- Transitivity spot check ---
   {

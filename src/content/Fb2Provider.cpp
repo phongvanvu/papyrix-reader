@@ -1,5 +1,7 @@
 #include "Fb2Provider.h"
 
+#include <Utf8.h>
+
 #include <cstring>
 
 namespace papyrix {
@@ -19,12 +21,10 @@ Result<void> Fb2Provider::open(const char* path, const char* cacheDir) {
   meta.type = ContentType::Fb2;
 
   const std::string& title = fb2->getTitle();
-  strncpy(meta.title, title.c_str(), sizeof(meta.title) - 1);
-  meta.title[sizeof(meta.title) - 1] = '\0';
+  utf8SafeCopy(meta.title, sizeof(meta.title), title.c_str());
 
   const std::string& author = fb2->getAuthor();
-  strncpy(meta.author, author.c_str(), sizeof(meta.author) - 1);
-  meta.author[sizeof(meta.author) - 1] = '\0';
+  utf8SafeCopy(meta.author, sizeof(meta.author), author.c_str());
 
   const std::string& cachePath = fb2->getCachePath();
   strncpy(meta.cachePath, cachePath.c_str(), sizeof(meta.cachePath) - 1);
@@ -36,7 +36,7 @@ Result<void> Fb2Provider::open(const char* path, const char* cacheDir) {
   meta.coverPath[sizeof(meta.coverPath) - 1] = '\0';
 
   // FB2 uses file size, not pages (pages calculated during rendering)
-  meta.totalPages = 1;  // Will be updated by reader
+  meta.totalPages = 1;  // The reader updates this value
   meta.currentPage = 0;
   meta.progressPercent = 0;
 
@@ -70,12 +70,31 @@ Result<TocEntry> Fb2Provider::getTocEntry(uint16_t index) const {
   const Fb2::TocItem item = fb2->getTocItem(index);
 
   TocEntry entry;
-  strncpy(entry.title, item.title.c_str(), sizeof(entry.title) - 1);
-  entry.title[sizeof(entry.title) - 1] = '\0';
+  utf8SafeCopy(entry.title, sizeof(entry.title), item.title.c_str());
   entry.pageIndex = item.sectionIndex;
   entry.depth = 0;
 
   return Ok(entry);
+}
+
+int Fb2Provider::getSectionCount() const {
+  if (!fb2) return 0;
+  return fb2->getSectionCount();
+}
+
+std::string Fb2Provider::getSectionPath(int sectionIndex) const {
+  if (!fb2) return "";
+  return fb2->getSectionPath(sectionIndex);
+}
+
+std::string Fb2Provider::getSectionCachePath(int sectionIndex) const {
+  if (!fb2) return "";
+  return fb2->getCachePath() + "/pages_" + std::to_string(sectionIndex) + ".bin";
+}
+
+int Fb2Provider::getSectionForTocEntry(int tocIndex) const {
+  if (!fb2) return 0;
+  return fb2->getSectionForTocEntry(tocIndex);
 }
 
 }  // namespace papyrix

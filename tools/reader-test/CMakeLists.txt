@@ -37,6 +37,7 @@ add_executable(reader-test
   ${PROJECT_ROOT}/lib/Epub/src/Epub/parsers/ChapterHtmlSlimParser.cpp
   ${PROJECT_ROOT}/lib/Epub/src/Epub/parsers/ContainerParser.cpp
   ${PROJECT_ROOT}/lib/Epub/src/Epub/parsers/ContentOpfParser.cpp
+  ${PROJECT_ROOT}/lib/Epub/src/Epub/parsers/CoverLinkParser.cpp
   ${PROJECT_ROOT}/lib/Epub/src/Epub/parsers/TocNcxParser.cpp
   ${PROJECT_ROOT}/lib/Epub/src/Epub/parsers/TocNavParser.cpp
   ${PROJECT_ROOT}/lib/Epub/src/Epub/htmlEntities.cpp
@@ -47,6 +48,7 @@ add_executable(reader-test
   # Font support
   ${PROJECT_ROOT}/lib/EpdFont/src/EpdFont.cpp
   ${PROJECT_ROOT}/lib/EpdFont/src/EpdFontFamily.cpp
+  ${PROJECT_ROOT}/lib/EpdFont/src/EpdFontLoader.cpp
   ${PROJECT_ROOT}/lib/ExternalFont/src/ExternalFont.cpp
 
   # Hyphenation
@@ -76,8 +78,10 @@ target_include_directories(reader-test PRIVATE
   ${PROJECT_ROOT}/src/core
   ${PROJECT_ROOT}/src/content
   ${PROJECT_ROOT}/lib/Utf8/src
+  ${PROJECT_ROOT}/lib/Encoding/src
   ${PROJECT_ROOT}/lib/Serialization/src
   ${PROJECT_ROOT}/lib/AsyncTask/src
+  ${PROJECT_ROOT}/lib/Memory/src
   ${PROJECT_ROOT}/lib/RenderTypes/src
   ${PROJECT_ROOT}/lib/Epub/src
   ${PROJECT_ROOT}/lib/Epub/src/Epub

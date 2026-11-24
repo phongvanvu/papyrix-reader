@@ -1,5 +1,7 @@
 #include "UtilityViews.h"
 
+#include <I18n.h>
+
 namespace ui {
 
 void render(const GfxRenderer& r, const Theme& t, const MessageView& v) {
@@ -16,7 +18,8 @@ void render(const GfxRenderer& r, const Theme& t, const ConfirmView& v) {
 
   dialog(r, t, v.title, v.message, v.selected);
 
-  buttonBar(r, t, v.buttons);
+  ButtonBar btns{tr(BACK), tr(SELECT), "<", ">"};
+  buttonBar(r, t, btns);
 
   r.displayBuffer();
 }
@@ -71,10 +74,11 @@ void render(const GfxRenderer& r, const Theme& t, const KeyboardView& v) {
   }
 
   // Keyboard below input
-  const int keyboardY = inputY + inputH + 20;
+  const int keyboardY = KeyboardView::KEYBOARD_Y;
   keyboard(r, t, keyboardY, v.keyboard);
 
-  buttonBar(r, t, v.buttons);
+  ButtonBar kbBtns{tr(BACK), tr(SELECT), "<", ">"};
+  buttonBar(r, t, kbBtns);
 
   r.displayBuffer();
 }

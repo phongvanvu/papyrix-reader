@@ -1,7 +1,9 @@
 #include "NetworkViews.h"
 
+#include <I18n.h>
 #include <qrcode.h>
 
+#include <algorithm>
 #include <cstdio>
 
 namespace ui {
@@ -36,47 +38,68 @@ void drawQRCode(const GfxRenderer& r, int x, int y, const char* data, bool fgBla
 
 }  // namespace
 
-// Static definitions
-constexpr const char* const NetworkModeView::ITEMS[];
-
 void render(const GfxRenderer& r, const Theme& t, const NetworkModeView& v) {
   r.clearScreen(t.backgroundColor);
 
-  title(r, t, t.screenMarginTop, "Network Mode");
+  title(r, t, t.screenMarginTop, tr(NETWORK_MODE));
 
-  const int startY = 100;
-  for (int i = 0; i < NetworkModeView::ITEM_COUNT; i++) {
-    const int y = startY + i * (t.itemHeight + 20);
-    menuItem(r, t, y, NetworkModeView::ITEMS[i], i == v.selected);
+  const int joinIdx = v.itemCount - 2;
+  const int hotspotIdx = v.itemCount - 1;
+
+  const int startY = NetworkModeView::LIST_START_Y;
+  for (int i = 0; i < v.itemCount; i++) {
+    const int y = startY + i * (t.itemHeight + NetworkModeView::ROW_SPACING);
+    const char* label;
+    if (v.showSaved && i == 0)
+      label = tr(SAVED_NETWORKS);
+    else if (i < joinIdx)
+      label = tr(RECENT_NETWORK);
+    else if (i == joinIdx)
+      label = tr(JOIN_NETWORK);
+    else
+      label = tr(CREATE_HOTSPOT);
+    menuItem(r, t, y, label, i == v.selected);
   }
 
-  // Description below options
-  const int descY = startY + 2 * (t.itemHeight + 20) + 40;
-  if (v.selected == 0) {
-    centeredText(r, t, descY, "Connect to existing WiFi");
-  } else {
-    centeredText(r, t, descY, "Create WiFi hotspot");
+  const int descY = startY + v.itemCount * (t.itemHeight + NetworkModeView::ROW_SPACING) + 40;
+  if (v.selected == hotspotIdx) {
+    centeredText(r, t, descY, tr(CREATE_WIFI_HOTSPOT));
+  } else if (!v.showSaved || v.selected != 0) {
+    centeredText(r, t, descY, tr(CONNECT_WIFI));
   }
 
+  ButtonBar btns{tr(BACK), tr(SELECT), "", ""};
+  buttonBar(r, t, btns);
+
+  r.displayBuffer();
+}
+
+void render(const GfxRenderer& r, const Theme& t, const WifiMenuView& v) {
+  r.clearScreen(t.backgroundColor);
+  title(r, t, t.screenMarginTop, v.title);
+  for (int i = 0; i < v.count; ++i) {
+    menuItem(r, t, 60 + i * (t.itemHeight + t.itemSpacing), v.items[i], i == v.selected);
+  }
   buttonBar(r, t, v.buttons);
-
   r.displayBuffer();
 }
 
 void render(const GfxRenderer& r, const Theme& t, const WifiListView& v) {
   r.clearScreen(t.backgroundColor);
 
-  title(r, t, t.screenMarginTop, "Select Network");
+  title(r, t, t.screenMarginTop, tr(SELECT_NETWORK));
 
   if (v.scanning) {
     const int centerY = r.getScreenHeight() / 2;
     centeredText(r, t, centerY, v.statusText);
   } else if (v.networkCount == 0) {
     const int centerY = r.getScreenHeight() / 2;
-    centeredText(r, t, centerY, "No networks found");
-    centeredText(r, t, centerY + 30, "Press Confirm to scan again");
+    const int lineHeight = r.getLineHeight(t.uiFontId);
+    const int messageLines = centeredText(r, t, centerY, tr(NO_NETWORKS_FOUND));
+    const int hintY = centerY + std::max(30, std::max(1, messageLines) * lineHeight + 1);
+    centeredText(r, t, hintY, tr(PRESS_CONFIRM_SCAN));
   } else {
-    const int listStartY = 60;
+    const int listStartY = WifiListView::LIST_START_Y;
     const int pageStart = v.getPageStart();
     const int pageEnd = v.getPageEnd();
 
@@ -86,7 +109,8 @@ void render(const GfxRenderer& r, const Theme& t, const WifiListView& v) {
     }
   }
 
-  buttonBar(r, t, v.buttons);
+  ButtonBar btns{tr(BACK), tr(CONNECT), "", tr(SCAN)};
+  buttonBar(r, t, btns);
 
   r.displayBuffer();
 }
@@ -94,21 +118,20 @@ void render(const GfxRenderer& r, const Theme& t, const WifiListView& v) {
 void render(const GfxRenderer& r, const Theme& t, const WifiConnectingView& v) {
   r.clearScreen(t.backgroundColor);
 
-  title(r, t, t.screenMarginTop, "Connecting");
+  title(r, t, t.screenMarginTop, tr(CONNECTING_TITLE));
 
   const int centerY = r.getScreenHeight() / 2 - 60;
+  const int lineHeight = r.getLineHeight(t.uiFontId);
 
-  // SSID
-  centeredText(r, t, centerY, v.ssid);
+  const int ssidLines = centeredText(r, t, centerY, v.ssid);
+  const int statusY = centerY + std::max(40, std::max(1, ssidLines) * lineHeight + 1);
+  const int statusLines = centeredText(r, t, statusY, v.statusMsg);
 
-  // Status message
-  centeredText(r, t, centerY + 40, v.statusMsg);
-
-  // IP address if connected
   if (v.status == WifiConnectingView::Status::Connected) {
     char ipLine[32];
-    snprintf(ipLine, sizeof(ipLine), "IP: %s", v.ipAddress);
-    centeredText(r, t, centerY + 80, ipLine);
+    snprintf(ipLine, sizeof(ipLine), tr(FMT_IP), v.ipAddress);
+    const int ipY = statusY + std::max(40, std::max(1, statusLines) * lineHeight + 1);
+    centeredText(r, t, ipY, ipLine);
   }
 
   buttonBar(r, t, v.buttons);
@@ -119,7 +142,7 @@ void render(const GfxRenderer& r, const Theme& t, const WifiConnectingView& v) {
 void render(const GfxRenderer& r, const Theme& t, const WebServerView& v) {
   r.clearScreen(t.backgroundColor);
 
-  title(r, t, t.screenMarginTop, "Web Server");
+  title(r, t, t.screenMarginTop, tr(WEB_SERVER));
 
   if (v.serverRunning) {
     // Build URL string
@@ -140,8 +163,10 @@ void render(const GfxRenderer& r, const Theme& t, const WebServerView& v) {
       drawQRCode(r, qrX + QR_PADDING, qrY + QR_PADDING, wifiQR, t.primaryTextBlack);
 
       const int labelY = qrY + qrSize + 15;
-      centeredText(r, t, labelY, v.ssid);
-      centeredText(r, t, labelY + 30, urlStr);
+      const int lineHeight = r.getLineHeight(t.uiFontId);
+      const int ssidLines = centeredText(r, t, labelY, v.ssid);
+      const int urlY = labelY + std::max(30, std::max(1, ssidLines) * lineHeight + 1);
+      centeredText(r, t, urlY, urlStr);
     } else {
       // STA mode: show single URL QR code centered
       const int qrX = (screenWidth - qrSize) / 2;
@@ -151,14 +176,17 @@ void render(const GfxRenderer& r, const Theme& t, const WebServerView& v) {
 
       // Label and network info below
       const int labelY = qrY + qrSize + 15;
-      centeredText(r, t, labelY, urlStr);
-      centeredText(r, t, labelY + 30, v.ssid);
+      const int lineHeight = r.getLineHeight(t.uiFontId);
+      const int urlLines = centeredText(r, t, labelY, urlStr);
+      const int ssidY = labelY + std::max(30, std::max(1, urlLines) * lineHeight + 1);
+      centeredText(r, t, ssidY, v.ssid);
     }
   } else {
-    centeredText(r, t, 180, "Server stopped");
+    centeredText(r, t, 180, tr(SERVER_STOPPED));
   }
 
-  buttonBar(r, t, v.buttons);
+  ButtonBar btns{tr(STOP)};
+  buttonBar(r, t, btns);
 
   r.displayBuffer();
 }

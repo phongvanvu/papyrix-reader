@@ -272,7 +272,7 @@ class GfxRenderer {
   void drawArabicText(int, int, int, const char*, bool = true, EpdFontFamily::Style = EpdFontFamily::REGULAR) const {}
 
   // UI Components
-  void drawButtonHints(int, const char*, const char*, const char*, const char*, bool = true) const {}
+  void warmCodepointsBatch(int, const uint32_t*, size_t, EpdFontFamily::Style = EpdFontFamily::REGULAR) const {}
 
   // Grayscale - no-ops
   void setRenderMode(const RenderMode mode) { this->renderMode = mode; }

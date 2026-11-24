@@ -10,6 +10,7 @@
 
 #include "blocks/TextBlock.h"
 
+class BuildArena;
 class GfxRenderer;
 
 /**
@@ -19,10 +20,23 @@ class GfxRenderer;
 using AbortCallback = std::function<bool()>;
 
 class ParsedText {
+  struct FixedLayoutWorkspace;
+  enum class ScratchLayoutResult : uint8_t { Completed, Fallback, Aborted };
+  enum class SplitResult : uint8_t { NotSplit, Split, Exhausted };
+
+  // Per-word style plus occurrence index: one index per addWord, split
+  // pieces inherit the index of the word they came from.
+  struct WordInfo {
+    EpdFontFamily::Style style;
+    uint32_t source;
+  };
   std::list<std::string> words;
-  std::list<EpdFontFamily::Style> wordStyles;
+  std::list<WordInfo> wordInfos;
+  uint32_t nextSourceIndex_ = 0;
+  size_t pendingWindowWords_ = 0;
   TextBlock::BLOCK_STYLE style;
   uint8_t indentLevel;
+  bool indentApplied = false;
   bool hyphenationEnabled;
   bool useGreedyBreaking = true;  // Default to greedy to avoid Knuth-Plass memory spike
   bool isRtl = false;
@@ -33,17 +47,36 @@ class ParsedText {
                                               std::vector<uint16_t>& wordWidths,
                                               const AbortCallback& shouldAbort = nullptr);
   bool trySplitWordForLineEnd(const GfxRenderer& renderer, int fontId, int remainingWidth,
-                              std::list<std::string>::iterator wordIt,
-                              std::list<EpdFontFamily::Style>::iterator styleIt, size_t wordIndex,
-                              std::vector<uint16_t>& wordWidths);
-  void extractLine(size_t breakIndex, int pageWidth, int spaceWidth, const std::vector<uint16_t>& wordWidths,
-                   const std::vector<size_t>& lineBreakIndices,
+                              std::list<std::string>::iterator wordIt, std::list<WordInfo>::iterator infoIt,
+                              size_t wordIndex, std::vector<uint16_t>& wordWidths);
+  SplitResult trySplitWordForLineEnd(const GfxRenderer& renderer, int fontId, int remainingWidth,
+                                     std::list<std::string>::iterator wordIt, std::list<WordInfo>::iterator infoIt,
+                                     size_t wordIndex, FixedLayoutWorkspace& workspace);
+  void extractLine(size_t breakIndex, int pageWidth, int spaceWidth, const uint16_t* wordWidths,
+                   const size_t* lineBreakIndices, size_t lineBreakCount,
                    const std::function<void(std::shared_ptr<TextBlock>)>& processLine);
+  void applyIndentation();
   std::vector<uint16_t> calculateWordWidths(const GfxRenderer& renderer, int fontId);
   bool preSplitOversizedWords(const GfxRenderer& renderer, int fontId, int pageWidth,
                               const AbortCallback& shouldAbort = nullptr);
+  void rejoinInterruptedWords();
+  ScratchLayoutResult layoutGreedyWithArena(const GfxRenderer& renderer, int fontId, int pageWidth, int spaceWidth,
+                                            const std::function<void(std::shared_ptr<TextBlock>)>& processLine,
+                                            bool includeLastLine, const AbortCallback& shouldAbort,
+                                            BuildArena& scratch);
+  bool layoutInWindows(const GfxRenderer& renderer, int fontId, uint16_t viewportWidth,
+                       const std::function<void(std::shared_ptr<TextBlock>)>& processLine, bool includeLastLine,
+                       const AbortCallback& shouldAbort, BuildArena* scratch);
 
  public:
+  // Upper bound on the words laid out in a single pass. A paragraph larger than
+  // this is split into chunks so the transient heap used by word preprocessing
+  // and the width/break workspaces stays bounded. Without it a
+  // pathological "paragraph" — e.g. a source/patch file where hundreds of
+  // non-blank lines join into one paragraph — exhausts the device heap and
+  // reboots it (Issue #137).
+  static constexpr size_t kMaxWordsPerBlock = 512;
+
   explicit ParsedText(const TextBlock::BLOCK_STYLE style, const uint8_t indentLevel,
                       const bool hyphenationEnabled = true, const bool useGreedy = true, const bool rtl = false)
       : style(style),
@@ -62,5 +95,7 @@ class ParsedText {
   bool isEmpty() const { return words.empty(); }
   bool layoutAndExtractLines(const GfxRenderer& renderer, int fontId, uint16_t viewportWidth,
                              const std::function<void(std::shared_ptr<TextBlock>)>& processLine,
-                             bool includeLastLine = true, const AbortCallback& shouldAbort = nullptr);
+                             bool includeLastLine = true, const AbortCallback& shouldAbort = nullptr,
+                             BuildArena* scratch = nullptr);
+  uint32_t sourceWordCount() const { return nextSourceIndex_; }
 };

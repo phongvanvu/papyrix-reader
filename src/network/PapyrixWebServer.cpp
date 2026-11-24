@@ -5,31 +5,88 @@
 #include <FsHelpers.h>
 #include <Logging.h>
 #include <SDCardManager.h>
+#include <Utf8Nfc.h>
 #include <WiFi.h>
-#include <esp_heap_caps.h>
 
+#include <cstring>
+#include <new>
+#include <string_view>
+
+#include "../IniParser.h"
 #include "../config.h"
+#include "../content/RecentBooksStore.h"
+#include "../ui/ImageFileView.h"
+#include "RequestWebServer.h"
+#include "WebFileNameValidation.h"
 #include "html/AppPageHtml.generated.h"
 
 #define TAG "WEBSERVER"
 
 namespace papyrix {
+namespace {
 
-static void sendGzipHtml(WebServer* server, const char* data, size_t len) {
-  server->sendHeader("Content-Encoding", "gzip");
-  server->send_P(200, "text/html", data, len);
+web::FileNameError prepareWebFileName(String& name) {
+  if (name.isEmpty()) return web::FileNameError::Empty;
+  if (!web::isValidUtf8(name.c_str(), name.length())) return web::FileNameError::InvalidUtf8;
+
+  const size_t normalizedLength = utf8NormalizeNfc(name.begin(), name.length());
+  if (normalizedLength < name.length()) name.remove(normalizedLength);
+  return web::validateFileName(name.c_str(), name.length());
 }
 
-bool PapyrixWebServer::flushUploadBuffer() {
-  if (upload_.bufferPos > 0 && upload_.file) {
-    const size_t written = upload_.file.write(upload_.buffer.data(), upload_.bufferPos);
-    if (written != upload_.bufferPos) {
-      upload_.bufferPos = 0;
-      return false;
-    }
-    upload_.bufferPos = 0;
-  }
+bool appendWebPathComponent(String& path, const String& name) {
+  const bool endsWithSlash = path.endsWith("/");
+  if (!web::canAppendPathComponent(path.length(), endsWithSlash, name.length())) return false;
+  if (!endsWithSlash) path += "/";
+  path += name;
   return true;
+}
+
+bool prepareWebPath(String& path) {
+  if (path.isEmpty()) return false;
+  if (!path.startsWith("/")) path = "/" + path;
+  if (path.length() > 1 && path.endsWith("/")) path = path.substring(0, path.length() - 1);
+  return web::isSafeWebPath(path.c_str(), path.length());
+}
+
+}  // namespace
+
+static bool matchesEtag(std::string_view value, const std::string_view etag) {
+  const size_t first = value.find_first_not_of(" \t");
+  if (first == std::string_view::npos) return false;
+  value.remove_prefix(first);
+  if (value.front() == '*') return value.find_first_not_of(" \t", 1) == std::string_view::npos;
+
+  bool matched = false;
+  while (!value.empty()) {
+    const size_t start = value.find_first_not_of(" \t,");
+    if (start == std::string_view::npos) break;
+    value.remove_prefix(start);
+    if (value.substr(0, 2) == "W/") value.remove_prefix(2);
+    if (value.empty() || value.front() != '"') return false;
+    const size_t end = value.find('"', 1);
+    if (end == std::string_view::npos) return false;
+    matched = matched || value.substr(0, end + 1) == etag;
+    value.remove_prefix(end + 1);
+    const size_t next = value.find_first_not_of(" \t");
+    if (next == std::string_view::npos) break;
+    if (value[next] != ',') return false;
+    value.remove_prefix(next + 1);
+  }
+  return matched;
+}
+
+static void sendGzipHtml(WebServer* server, const char* data, size_t len, const char* etag) {
+  server->sendHeader("ETag", etag);
+  server->sendHeader("Cache-Control", "no-cache");
+  server->sendHeader("Content-Encoding", "gzip");
+  const String condition = server->header("If-None-Match");
+  if (matchesEtag(std::string_view(condition.c_str(), condition.length()), etag)) {
+    server->setContentLength(len);
+    server->send(304, "text/html", "");
+    return;
+  }
+  server->send_P(200, "text/html", data, len);
 }
 
 PapyrixWebServer::PapyrixWebServer() = default;
@@ -56,7 +113,7 @@ void PapyrixWebServer::begin() {
 
   LOG_INF(TAG, "Creating server on port %d (free heap: %d)", port_, ESP.getFreeHeap());
 
-  server_.reset(new WebServer(port_));
+  server_.reset(new (std::nothrow) RequestWebServer(port_));
   if (!server_) {
     LOG_ERR(TAG, "Failed to create WebServer");
     return;
@@ -71,6 +128,12 @@ void PapyrixWebServer::begin() {
   server_->on("/mkdir", HTTP_POST, [this] { handleCreateFolder(); });
   server_->on("/delete", HTTP_POST, [this] { handleDelete(); });
   server_->on("/rename", HTTP_POST, [this] { handleRename(); });
+  server_->on("/api/locale", HTTP_GET, [this] { handleLocaleStatus(); });
+  server_->on("/api/locale", HTTP_POST, [this] { handleLocaleUploadPost(); }, [this] { handleLocaleUpload(); });
+  server_->on("/api/locale-delete", HTTP_POST, [this] { handleLocaleDelete(); });
+  server_->on("/api/firmware", HTTP_GET, [this] { handleFirmwareStatus(); });
+  server_->on("/api/firmware", HTTP_POST, [this] { handleFirmwareUploadPost(); }, [this] { handleFirmwareUpload(); });
+  server_->on("/api/firmware-delete", HTTP_POST, [this] { handleFirmwareDelete(); });
   server_->onNotFound([this] { handleNotFound(); });
 
   server_->begin();
@@ -94,19 +157,7 @@ void PapyrixWebServer::stop() {
   delay(50);
   server_.reset();
 
-  // Clear upload state
-  if (upload_.file) {
-    upload_.file.close();
-  }
-  upload_.fileName = "";
-  upload_.path = "/";
-  upload_.size = 0;
-  upload_.success = false;
-  upload_.error = "";
-  upload_.bufferPos = 0;
-  upload_.buffer.clear();
-  upload_.buffer.shrink_to_fit();
-
+  upload_.reset();
   LOG_INF(TAG, "Server stopped (free heap: %d)", ESP.getFreeHeap());
 }
 
@@ -117,7 +168,9 @@ void PapyrixWebServer::handleClient() {
   server_->handleClient();
 }
 
-void PapyrixWebServer::handleRoot() { sendGzipHtml(server_.get(), AppPageHtml, AppPageHtmlCompressedSize); }
+void PapyrixWebServer::handleRoot() {
+  sendGzipHtml(server_.get(), AppPageHtml, AppPageHtmlCompressedSize, AppPageHtmlETag);
+}
 
 void PapyrixWebServer::handleNotFound() { server_->send(404, "text/plain", "404 Not Found"); }
 
@@ -137,11 +190,9 @@ void PapyrixWebServer::handleFileListData() {
   String currentPath = "/";
   if (server_->hasArg("path")) {
     currentPath = server_->arg("path");
-    if (!currentPath.startsWith("/")) {
-      currentPath = "/" + currentPath;
-    }
-    if (currentPath.length() > 1 && currentPath.endsWith("/")) {
-      currentPath = currentPath.substring(0, currentPath.length() - 1);
+    if (!prepareWebPath(currentPath)) {
+      server_->send(400, "application/json", "[]");
+      return;
     }
   }
 
@@ -152,6 +203,8 @@ void PapyrixWebServer::handleFileListData() {
     return;
   }
 
+  // Combine small chunks to keep RAM available for WiFi buffers.
+  server_->client().setNoDelay(false);
   server_->setContentLength(CONTENT_LENGTH_UNKNOWN);
   server_->send(200, "application/json", "");
   server_->sendContent("[");
@@ -165,28 +218,26 @@ void PapyrixWebServer::handleFileListData() {
 
     // Skip hidden items
     if (name[0] != '.' && !FsHelpers::isHiddenFsItem(name)) {
+      // A borrowed scalar needs no JSON heap allocation.
       JsonDocument doc;
-      doc["name"] = name;
-      doc["isDirectory"] = file.isDirectory();
-
-      if (file.isDirectory()) {
-        doc["size"] = 0;
-        doc["isEpub"] = false;
-      } else {
-        doc["size"] = file.size();
-        doc["isEpub"] = FsHelpers::isEpubFile(name);
+      doc.set(JsonString(name, true));
+      char output[sizeof(name) * 2 + 96];
+      const size_t prefixLength = seenFirst ? 9 : 8;
+      memcpy(output, seenFirst ? ",{\"name\":" : "{\"name\":", prefixLength);
+      const size_t written = prefixLength + serializeJson(doc, output + prefixLength, sizeof(output) - prefixLength);
+      const bool isDirectory = file.isDirectory();
+      const int suffixLength =
+          snprintf(output + written, sizeof(output) - written, ",\"isDirectory\":%s,\"size\":%llu,\"isEpub\":%s}",
+                   isDirectory ? "true" : "false", static_cast<unsigned long long>(isDirectory ? 0 : file.size()),
+                   !isDirectory && FsHelpers::isEpubFile(name) ? "true" : "false");
+      if (suffixLength < 0 || static_cast<size_t>(suffixLength) >= sizeof(output) - written) {
+        file.close();
+        root.close();
+        server_->client().stop();
+        return;
       }
-
-      char output[512];
-      size_t written = serializeJson(doc, output, sizeof(output));
-      if (written < sizeof(output)) {
-        if (seenFirst) {
-          server_->sendContent(",");
-        } else {
-          seenFirst = true;
-        }
-        server_->sendContent(output);
-      }
+      server_->sendContent(output, written + static_cast<size_t>(suffixLength));
+      seenFirst = true;
     }
 
     file.close();
@@ -204,24 +255,21 @@ void PapyrixWebServer::handleUpload() {
   HTTPUpload& upload = server_->upload();
 
   if (upload.status == UPLOAD_FILE_START) {
+    upload_.reset();
     upload_.fileName = upload.filename;
-    upload_.size = 0;
-    upload_.success = false;
-    upload_.error = "";
-    upload_.bufferPos = 0;
-    if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < UploadState::BUFFER_SIZE * 2) {
-      upload_.error = "Insufficient memory for upload";
+
+    const web::FileNameError nameError = prepareWebFileName(upload_.fileName);
+    if (nameError != web::FileNameError::None) {
+      upload_.error = web::fileNameErrorMessage(nameError);
+      LOG_ERR(TAG, "Rejected upload filename: %s", upload_.error.c_str());
       return;
     }
-    upload_.buffer.resize(UploadState::BUFFER_SIZE);
 
     if (server_->hasArg("path")) {
       upload_.path = server_->arg("path");
-      if (!upload_.path.startsWith("/")) {
-        upload_.path = "/" + upload_.path;
-      }
-      if (upload_.path.length() > 1 && upload_.path.endsWith("/")) {
-        upload_.path = upload_.path.substring(0, upload_.path.length() - 1);
+      if (!prepareWebPath(upload_.path)) {
+        upload_.error = "Invalid path";
+        return;
       }
     } else {
       upload_.path = "/";
@@ -230,8 +278,11 @@ void PapyrixWebServer::handleUpload() {
     LOG_INF(TAG, "Upload start: %s to %s", upload_.fileName.c_str(), upload_.path.c_str());
 
     String filePath = upload_.path;
-    if (!filePath.endsWith("/")) filePath += "/";
-    filePath += upload_.fileName;
+    if (!appendWebPathComponent(filePath, upload_.fileName)) {
+      upload_.error = "Path is too long";
+      LOG_ERR(TAG, "Rejected upload path: too long");
+      return;
+    }
 
     if (!FsHelpers::isSupportedBookFile(upload_.fileName.c_str()) &&
         !FsHelpers::isImageFile(upload_.fileName.c_str()) &&
@@ -243,67 +294,20 @@ void PapyrixWebServer::handleUpload() {
       return;
     }
 
-    if (SdMan.exists(filePath.c_str())) {
-      SdMan.remove(filePath.c_str());
+    if (!upload_.begin(filePath)) {
+      LOG_ERR(TAG, "Failed to start upload: %s", upload_.error.c_str());
     }
-
-    if (!SdMan.openFileForWrite("WEB", filePath, upload_.file)) {
-      upload_.error = "Failed to create file";
-      LOG_ERR(TAG, "Failed to create: %s", filePath.c_str());
-      return;
-    }
-
   } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (upload_.file && upload_.error.isEmpty()) {
-      const uint8_t* data = upload.buf;
-      size_t remaining = upload.currentSize;
-
-      while (remaining > 0) {
-        size_t space = UploadState::BUFFER_SIZE - upload_.bufferPos;
-        size_t toCopy = remaining < space ? remaining : space;
-        memcpy(upload_.buffer.data() + upload_.bufferPos, data, toCopy);
-        upload_.bufferPos += toCopy;
-        data += toCopy;
-        remaining -= toCopy;
-
-        if (upload_.bufferPos >= UploadState::BUFFER_SIZE) {
-          if (!flushUploadBuffer()) {
-            upload_.error = "Write failed - disk full?";
-            upload_.file.close();
-            return;
-          }
-        }
-      }
-
-      upload_.size += upload.currentSize;
-    }
-
+    upload_.write(upload.buf, upload.currentSize);
   } else if (upload.status == UPLOAD_FILE_END) {
-    if (upload_.file) {
-      if (upload_.error.isEmpty() && !flushUploadBuffer()) {
-        upload_.error = "Write failed - disk full?";
-      }
-      upload_.file.close();
-      if (upload_.error.isEmpty()) {
-        upload_.success = true;
-        LOG_INF(TAG, "Upload complete: %s (%zu bytes)", upload_.fileName.c_str(), upload_.size);
-      }
+    upload_.finish();
+    if (upload_.success) {
+      LOG_INF(TAG, "Upload complete: %s (%zu bytes)", upload_.fileName.c_str(), upload_.size);
     }
-    upload_.buffer.clear();
-    upload_.buffer.shrink_to_fit();
-
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
-    upload_.bufferPos = 0;
-    upload_.buffer.clear();
-    upload_.buffer.shrink_to_fit();
-    if (upload_.file) {
-      upload_.file.close();
-      String filePath = upload_.path;
-      if (!filePath.endsWith("/")) filePath += "/";
-      filePath += upload_.fileName;
-      SdMan.remove(filePath.c_str());
-    }
-    upload_.error = "Upload aborted";
+    if (upload_.success) return;
+    upload_.abort();
+    if (upload_.error.isEmpty()) upload_.error = "Upload aborted";
     LOG_ERR(TAG, "Upload aborted");
   }
 }
@@ -324,25 +328,26 @@ void PapyrixWebServer::handleCreateFolder() {
   }
 
   String folderName = server_->arg("name");
-  if (folderName.isEmpty()) {
-    server_->send(400, "text/plain", "Folder name cannot be empty");
+  const web::FileNameError nameError = prepareWebFileName(folderName);
+  if (nameError != web::FileNameError::None) {
+    server_->send(400, "text/plain", web::fileNameErrorMessage(nameError));
     return;
   }
 
   String parentPath = "/";
   if (server_->hasArg("path")) {
     parentPath = server_->arg("path");
-    if (!parentPath.startsWith("/")) {
-      parentPath = "/" + parentPath;
-    }
-    if (parentPath.length() > 1 && parentPath.endsWith("/")) {
-      parentPath = parentPath.substring(0, parentPath.length() - 1);
+    if (!prepareWebPath(parentPath)) {
+      server_->send(400, "text/plain", "Invalid path");
+      return;
     }
   }
 
   String folderPath = parentPath;
-  if (!folderPath.endsWith("/")) folderPath += "/";
-  folderPath += folderName;
+  if (!appendWebPathComponent(folderPath, folderName)) {
+    server_->send(400, "text/plain", "Path is too long");
+    return;
+  }
 
   if (SdMan.exists(folderPath.c_str())) {
     server_->send(400, "text/plain", "Folder already exists");
@@ -371,8 +376,9 @@ void PapyrixWebServer::handleDelete() {
     return;
   }
 
-  if (!itemPath.startsWith("/")) {
-    itemPath = "/" + itemPath;
+  if (!prepareWebPath(itemPath)) {
+    server_->send(400, "text/plain", "Invalid path");
+    return;
   }
 
   // Security: prevent deletion of hidden/system files
@@ -389,6 +395,7 @@ void PapyrixWebServer::handleDelete() {
 
   bool success = false;
   if (itemType == "folder") {
+    ui::removeImageCachesInDir(itemPath.c_str());
     FsFile dir = SdMan.open(itemPath.c_str());
     if (dir && dir.isDirectory()) {
       FsFile entry = dir.openNextFile();
@@ -406,6 +413,10 @@ void PapyrixWebServer::handleDelete() {
   }
 
   if (success) {
+    if (itemType != "folder" && FsHelpers::isImageFile(itemPath.c_str())) {
+      ui::removeImageCache(itemPath.c_str());
+    }
+    RecentBooksStore::instance().remove(itemPath.c_str());
     LOG_INF(TAG, "Deleted: %s", itemPath.c_str());
     server_->send(200, "text/plain", "Deleted");
   } else {
@@ -420,7 +431,7 @@ void PapyrixWebServer::handleDownload() {
   }
 
   String filePath = server_->arg("path");
-  if (filePath.isEmpty() || !filePath.startsWith("/") || filePath.indexOf("..") >= 0) {
+  if (filePath.isEmpty() || !filePath.startsWith("/") || !web::isSafeWebPath(filePath.c_str(), filePath.length())) {
     server_->send(400, "text/plain", "Invalid path");
     return;
   }
@@ -449,7 +460,12 @@ void PapyrixWebServer::handleDownload() {
   while (file.available()) {
     size_t bytesRead = file.read(buf, sizeof(buf));
     if (bytesRead == 0) break;
-    server_->client().write(buf, bytesRead);
+    const size_t bytesWritten = server_->client().write(buf, bytesRead);
+    if (bytesWritten != bytesRead) {
+      LOG_ERR(TAG, "Download of %s aborted: wrote %zu of %zu bytes", filePath.c_str(), bytesWritten, bytesRead);
+      server_->client().stop();
+      break;
+    }
   }
 
   file.close();
@@ -464,18 +480,14 @@ void PapyrixWebServer::handleRename() {
   String itemPath = server_->arg("path");
   String newName = server_->arg("newName");
 
-  if (itemPath.isEmpty() || itemPath == "/" || newName.isEmpty() || itemPath.indexOf("..") >= 0) {
+  if (itemPath.isEmpty() || itemPath == "/" || !prepareWebPath(itemPath)) {
     server_->send(400, "text/plain", "Invalid parameters");
     return;
   }
 
-  if (!itemPath.startsWith("/")) {
-    itemPath = "/" + itemPath;
-  }
-
-  // Security: reject path traversal and hidden names
-  if (newName.indexOf('/') >= 0 || newName.indexOf("..") >= 0 || newName.startsWith(".")) {
-    server_->send(400, "text/plain", "Invalid new name");
+  const web::FileNameError nameError = prepareWebFileName(newName);
+  if (nameError != web::FileNameError::None) {
+    server_->send(400, "text/plain", web::fileNameErrorMessage(nameError));
     return;
   }
 
@@ -492,8 +504,12 @@ void PapyrixWebServer::handleRename() {
   }
 
   // Build new path: same parent directory + new name
-  int lastSlash = itemPath.lastIndexOf('/');
-  String newPath = (lastSlash <= 0) ? "/" + newName : itemPath.substring(0, lastSlash) + "/" + newName;
+  const int lastSlash = itemPath.lastIndexOf('/');
+  String newPath = lastSlash <= 0 ? "/" : itemPath.substring(0, lastSlash);
+  if (!appendWebPathComponent(newPath, newName)) {
+    server_->send(400, "text/plain", "Path is too long");
+    return;
+  }
 
   if (SdMan.exists(newPath.c_str())) {
     server_->send(400, "text/plain", "An item with that name already exists");
@@ -501,10 +517,178 @@ void PapyrixWebServer::handleRename() {
   }
 
   if (SdMan.rename(itemPath.c_str(), newPath.c_str())) {
+    if (FsHelpers::isImageFile(itemPath.c_str())) ui::removeImageCache(itemPath.c_str());
     LOG_INF(TAG, "Renamed: %s -> %s", itemPath.c_str(), newPath.c_str());
     server_->send(200, "text/plain", "Renamed");
   } else {
     server_->send(500, "text/plain", "Failed to rename");
+  }
+}
+
+// --- Locale file management ---
+
+static constexpr const char* LOCALE_PATH = PAPYRIX_DIR "/locale.txt";
+
+void PapyrixWebServer::handleLocaleStatus() {
+  JsonDocument doc;
+  bool exists = SdMan.exists(LOCALE_PATH);
+  doc["exists"] = exists;
+
+  if (exists) {
+    FsFile file = SdMan.open(LOCALE_PATH);
+    if (file) {
+      doc["size"] = file.size();
+      file.close();
+    }
+
+    char langName[64] = "";
+    IniParser::parseFile(LOCALE_PATH, [&langName](const char*, const char* key, const char* value) -> bool {
+      if (strcmp(key, "_language_name") == 0) {
+        strncpy(langName, value, sizeof(langName) - 1);
+        langName[sizeof(langName) - 1] = '\0';
+        return false;
+      }
+      return true;
+    });
+    if (langName[0] != '\0') {
+      doc["language"] = langName;
+    }
+  }
+
+  char json[256];
+  serializeJson(doc, json, sizeof(json));
+  server_->send(200, "application/json", json);
+}
+
+void PapyrixWebServer::handleLocaleUpload() {
+  if (!running_ || !server_) return;
+
+  HTTPUpload& upload = server_->upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    upload_.reset();
+    upload_.fileName = "locale.txt";
+    upload_.path = PAPYRIX_DIR;
+
+    if (!FsHelpers::hasExtension(upload.filename.c_str(), ".txt")) {
+      upload_.error = "Only .txt files accepted";
+      return;
+    }
+
+    LOG_INF(TAG, "Locale upload start: %s", upload.filename.c_str());
+
+    upload_.begin(LOCALE_PATH);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    upload_.write(upload.buf, upload.currentSize);
+  } else if (upload.status == UPLOAD_FILE_END) {
+    upload_.finish();
+    if (upload_.success) {
+      LOG_INF(TAG, "Locale upload complete: %zu bytes", upload_.size);
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (upload_.success) return;
+    upload_.abort();
+    if (upload_.error.isEmpty()) upload_.error = "Upload aborted";
+    LOG_ERR(TAG, "Locale upload aborted");
+  }
+}
+
+void PapyrixWebServer::handleLocaleUploadPost() {
+  if (upload_.success) {
+    server_->send(200, "text/plain", "Locale file uploaded");
+  } else {
+    String error = upload_.error.isEmpty() ? "Unknown error" : upload_.error;
+    server_->send(400, "text/plain", error);
+  }
+}
+
+void PapyrixWebServer::handleLocaleDelete() {
+  if (!SdMan.exists(LOCALE_PATH)) {
+    server_->send(404, "text/plain", "No locale file found");
+    return;
+  }
+
+  if (SdMan.remove(LOCALE_PATH)) {
+    LOG_INF(TAG, "Locale file deleted");
+    server_->send(200, "text/plain", "Locale file deleted");
+  } else {
+    server_->send(500, "text/plain", "Failed to delete locale file");
+  }
+}
+
+// --- Firmware file management ---
+
+void PapyrixWebServer::handleFirmwareStatus() {
+  JsonDocument doc;
+  bool exists = SdMan.exists(PAPYRIX_FIRMWARE_FILE);
+  doc["exists"] = exists;
+
+  if (exists) {
+    FsFile file = SdMan.open(PAPYRIX_FIRMWARE_FILE);
+    if (file) {
+      doc["size"] = file.size();
+      file.close();
+    }
+  }
+
+  char json[128];
+  serializeJson(doc, json, sizeof(json));
+  server_->send(200, "application/json", json);
+}
+
+void PapyrixWebServer::handleFirmwareUpload() {
+  if (!running_ || !server_) return;
+
+  HTTPUpload& upload = server_->upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    upload_.reset();
+    upload_.fileName = "firmware.bin";
+    upload_.path = "/";
+
+    if (!FsHelpers::hasExtension(upload.filename.c_str(), ".bin")) {
+      upload_.error = "Only .bin files accepted";
+      return;
+    }
+
+    LOG_INF(TAG, "Firmware upload start: %s", upload.filename.c_str());
+
+    upload_.begin(PAPYRIX_FIRMWARE_FILE);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    upload_.write(upload.buf, upload.currentSize);
+  } else if (upload.status == UPLOAD_FILE_END) {
+    upload_.finish();
+    if (upload_.success) {
+      LOG_INF(TAG, "Firmware upload complete: %zu bytes", upload_.size);
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (upload_.success) return;
+    upload_.abort();
+    if (upload_.error.isEmpty()) upload_.error = "Upload aborted";
+    LOG_ERR(TAG, "Firmware upload aborted");
+  }
+}
+
+void PapyrixWebServer::handleFirmwareUploadPost() {
+  if (upload_.success) {
+    server_->send(200, "text/plain", "Firmware file uploaded");
+  } else {
+    String error = upload_.error.isEmpty() ? "Unknown error" : upload_.error;
+    server_->send(400, "text/plain", error);
+  }
+}
+
+void PapyrixWebServer::handleFirmwareDelete() {
+  if (!SdMan.exists(PAPYRIX_FIRMWARE_FILE)) {
+    server_->send(404, "text/plain", "No firmware file found");
+    return;
+  }
+
+  if (SdMan.remove(PAPYRIX_FIRMWARE_FILE)) {
+    LOG_INF(TAG, "Firmware file deleted");
+    server_->send(200, "text/plain", "Firmware file deleted");
+  } else {
+    server_->send(500, "text/plain", "Failed to delete firmware file");
   }
 }
 

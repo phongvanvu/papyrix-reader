@@ -1,104 +1,176 @@
-# Papyrix
+# PapyriX
 
-> Chào mừng đến với Papyrix Reader — firmware máy đọc sách e-ink mã nguồn mở. Chúc bạn đọc sách vui vẻ!
-[![Changelog](https://img.shields.io/badge/changelog-CHANGELOG.md-blue)](CHANGELOG.md)
-[![User Guide](https://img.shields.io/badge/docs-User_Guide-green)](docs/user_guide.md)
-[![Customization](https://img.shields.io/badge/docs-Customization-green)](docs/customization.md)
-[![Fonts](https://img.shields.io/badge/docs-Fonts-green)](docs/fonts.md)
-[![Architecture](https://img.shields.io/badge/docs-Architecture-green)](docs/architecture.md)
-[![Device Specs](https://img.shields.io/badge/docs-Device_Specs-green)](docs/device-specifications.md)
-[![File Formats](https://img.shields.io/badge/docs-File_Formats-green)](docs/file-formats.md)
-[![Images](https://img.shields.io/badge/docs-Images-green)](docs/images.md)
-[![SSD1677 Driver](https://img.shields.io/badge/docs-SSD1677_Driver-green)](docs/ssd1677-driver.md)
-[![Webserver](https://img.shields.io/badge/docs-Webserver-green)](docs/webserver.md)
-[![Calibre](https://img.shields.io/badge/docs-Calibre_Wireless-green)](docs/calibre.md)
+> Chào mừng đến với PapyriX Reader — firmware máy đọc sách e-ink mã nguồn mở. Chúc bạn đọc sách vui vẻ!
 
+<img alt="PapyriX" src="./images/logo-light.jpg" width="160">
 
-A lightweight, user-friendly firmware for the **Xteink X4** e-paper display reader.
-Built using **PlatformIO** and targeting the **ESP32-C3** microcontroller.
+PapyriX is firmware for Xteink X3, X4, X4 Pro, X4 v2 Classic, Seeed reTerminal Sticky, and Murphy M4 e-paper readers. X3/X4 use one ESP32-C3 image. Pro, Classic, Sticky, and Murphy M4 use separate ESP32-S3 images.
 
-![Home screen](./docs/images/device.jpg)
+> **Warning:** Some Xteink units (for example, units from AliExpress) lock USB flash.
+> If USB flash is locked, you cannot update or recover through USB.
+> Install, update, and do [emergency recovery](#emergency-recovery) from the SD card.
+> Flash through USB only on devices that have unlocked USB.
 
-## Motivation
+<img alt="Home screen" src="./docs/images/device.jpg" width="240">
 
-E-paper devices are fantastic for reading, but most commercially available readers are closed systems with limited customisation. The **Xteink X4** is an affordable e-paper device, however the official firmware remains closed.
+This project is **not affiliated with Xteink**. It is a community project.
 
-Papyrix aims to:
-* Provide a **lightweight, open-source alternative** to the official firmware.
-* Offer a **document reader** capable of handling EPUB content on constrained hardware.
-* Support **customisable font, layout, and display** options.
-* Run purely on the **Xteink X4 hardware**.
+## Documentation
 
-This project is **not affiliated with Xteink**; it's built as a community project.
+- **Use:** [User Guide](docs/user_guide.md), [Troubleshooting](docs/troubleshooting.md), [Customization](docs/customization.md), [Fonts](docs/fonts.md), [Localization](docs/localization.md)
+- **Transfer:** [Web UI](docs/webserver.md), [Calibre](docs/calibre.md), [LocalSend](docs/localsend.md), [Printer](docs/printer.md)
+- **Develop:** [Architecture](docs/architecture.md), [Rendering](docs/rendering-pipeline.md), [File Formats](docs/file-formats.md), [Changelog](CHANGELOG.md)
+- **Hardware:** [Device Support](docs/device-support-matrix.md), [Specifications](docs/device-specifications.md), [SSD1677 Driver](docs/ssd1677-driver.md)
+
+## Supported devices
+
+- **[Xteink X4 (original)](docs/x4-specifications.md)**
+  - Release file: `papyrix-xteink-c3.bin`
+  - Panel: 800×480 SSD1677
+- **[Xteink X3](docs/x3-specifications.md)**
+  - Release file: `papyrix-xteink-c3.bin`
+  - Panel: 792×528 UC8253 or UC8279
+- **[Xteink X4 Pro](docs/x4pro-specifications.md)**
+  - Release file: `papyrix-x4pro.bin`
+  - Panel: 800×480 UC8279 or UC8179
+- **[Xteink X4 v2 Classic](docs/x4-classic-specifications.md)**
+  - Release file: `papyrix-x4c.bin`
+  - Panel: 800×480 SSD1677, UC8179, or UC8279
+
+- **[Seeed reTerminal Sticky](docs/sticky-specifications.md)**
+  - Status: USB installation, startup, and touch verified on one SSD1677 device
+  - App update: `papyrix-sticky.bin`
+  - First installation: `papyrix-sticky-install.zip`
+  - Panel: 800×480 SSD1677 or SSD2677
+
+- **[Murphy M4](docs/murphy-m4-specifications.md)**
+  - Status: **Implemented, not device-tested**
+  - App update: `papyrix-murphy-m4.bin`
+  - First installation: `papyrix-murphy-m4-install.zip`
+  - Panel: 800×480 SSD1677
+  - Physical operation and stock restoration remain unverified.
+
+See the [device support matrix](docs/device-support-matrix.md) for build targets and hardware services. Using the wrong binary can drive incorrect pins and can damage hardware.
+
+Page caches use profile-specific folders. Moving an SD card between supported devices does not reuse incompatible rendered pages.
+
+## Devices tested on hardware
+
+- Xteink X3
+- Xteink X4 (original)
+- Xteink X4 Pro
+- Xteink X4 v2 Classic
 
 ## Features
 
 ### Reading & Format Support
-- [x] EPUB 2 and EPUB 3 parsing (nav.xhtml with NCX fallback)
-- [x] CSS stylesheet parsing (text-align, font-style, font-weight, text-indent, margins, direction)
-- [x] FB2 (FictionBook 2.0) support with metadata, TOC navigation, and metadata caching (no inline images)
-- [x] HTML (.html, .htm) file support (standalone HTML documents)
-- [x] XTC/XTCH native format support
-- [x] Markdown (.md, .markdown) file support with formatting
-- [x] Plain text (.txt, .text) file support
-- [x] Saved reading position
-- [x] Bookmarks (up to 20 per book, persisted to SD card)
-- [x] Book cover display (JPG/JPEG/PNG/BMP, case-insensitive)
-- [x] Table of contents navigation
-- [x] Image support within EPUB (JPEG/PNG/BMP, baseline JPEG only, max 2048×3072)
+
+- EPUB 2 and EPUB 3 with CSS formatting
+- FB2 metadata, navigation, and formatted text
+- HTML, Markdown, and plain text
+- Native XTC and XTCH pages
+- Saved reading position and recent books
+- Reading progress, time, and sessions for each book
+- Bookmarks saved on the SD card
+- Book covers in JPEG, PNG, and BMP formats
+- Table of contents navigation
+- JPEG, PNG, and BMP images in EPUB
+
+See [format behavior](docs/user_guide.md#format-behavior) and [image limits](docs/images.md#supported-formats).
 
 ### Text & Display
-- [x] Configurable font sizes (XSmall/Small/Normal/Large)
-- [x] Paragraph alignment (Justified/Left/Center/Right)
-- [x] Text layout presets (Compact/Standard/Large) for indentation and spacing
-- [x] Soft hyphen support for text layout
-- [x] Liang-pattern hyphenation with language detection from EPUB metadata (de, en, es, fr, it, ru, uk)
-- [x] Native Vietnamese, Thai, Greek, and Arabic support in builtin fonts
-- [x] CJK (Chinese/Japanese/Korean) text layout (book text only, not UI)
-- [x] Thai text rendering with proper mark positioning
-- [x] Arabic text shaping - contextual forms, Lam-Alef ligatures with RTL layout
-- [x] Knuth-Plass line breaking algorithm (TeX-quality justified text)
-- [x] Text anti-aliasing toggle (grayscale text rendering for builtin and custom fonts)
-- [x] Pages per refresh setting (1/5/10/15/30)
-- [x] Sunlight fading fix (powers down display after refresh to prevent UV fading)
-- [x] 4 screen orientations
+
+- Adjustable font size, paragraph alignment, indent, and spacing
+- Soft hyphens and language-specific Liang-pattern hyphenation
+- Built-in fonts for Vietnamese, Thai, Greek, and Arabic
+- CJK text layout with external fonts for book text only, not the UI
+- Thai mark placement
+- Arabic contextual forms, ligatures, and right-to-left layout
+- Justified text with Knuth–Plass line breaking
+- Switchable text antialiasing for built-in and custom fonts
+- Configurable pages per refresh
+- Sunlight fading protection through display power-off after refresh
+- Cached turbo LUTs for X3 page turns
+- Four screen orientations
+- Touch controls on X4 Pro, Sticky, and Murphy M4
+- Front-light brightness and warmth on X4 Pro and Murphy M4
+
+See [reader and screen settings](docs/user_guide.md#35-settings) and [font coverage](docs/fonts.md#built-in-font-coverage).
 
 ### Customization
-- [x] Custom themes from SD card (`/config/themes/`)
-- [x] Custom fonts from SD card (`/config/fonts/`, .epdfont format)
-- [x] Custom sleep screens (Dark/Light/Custom/Cover modes)
-- [x] Button remapping (side and front buttons)
-- [x] Power button page turn (one-handed reading)
+
+- Custom themes
+- Custom fonts from the SD card
+- Dark, Light, Custom, Cover, and Keep Page sleep screens
+- Side and front button remapping
+- Short Power-button actions for page turns, bookmarks, or sleep
+
+See [Customization](docs/customization.md), [sleep screens](docs/user_guide.md#37-sleep-screen), and [example files](docs/examples/).
+
+### Applications
+
+- Image Viewer and slideshow
+- Clock with multiple faces
+- Pomodoro timer
+- [2048](docs/user_guide.md#312-2048) with button and touch controls, and saved games
+- [Go 9×9](docs/user_guide.md#313-go) against an offline opponent, with button and touch controls
+- [Lights Out](docs/user_guide.md#314-lights-out) with solvable 5 by 5 boards, button and touch controls, and saved games
+- [Sokoban](docs/user_guide.md#315-sokoban) with 12 built-in levels, undo, button and touch controls, and saved games
+
+The [Apps menu](docs/user_guide.md#apps) groups file transfer, common apps, and games.
 
 ### Network & Connectivity
-- [x] WiFi file transfer (web server)
-- [x] Calibre Wireless Device - Send books from Calibre desktop
+
+- [WiFi file transfer](docs/webserver.md) through the web interface
+- [Calibre Wireless Device](docs/calibre.md) for books from Calibre desktop
+- [LocalSend receiver](docs/localsend.md) for files from the LocalSend app
+- [AirPrint-compatible network printer](docs/printer.md) with printouts saved on the SD card
 
 ### Maintenance
-- [x] Cleanup menu (clear caches, fonts, factory reset)
-- [x] System info (version, uptime, memory, storage)
+
+- Cache, trash, storage, and factory-reset cleanup actions
+- Firmware updates from the SD card
+- System information for version, uptime, memory, and storage
+
+See [maintenance settings](docs/user_guide.md#cleanup) before deleting data.
 
 ### File System
-- [x] exFAT and FAT32 SD card support
-- [x] UTF-8 filenames (Cyrillic, etc.)
-- [x] File explorer with nested folders
-- [x] Hidden system folders filtering (LOST.DIR, $RECYCLE.BIN, etc.)
 
-See [the user guide](docs/user_guide.md) for operating instructions, and the [customization guide](docs/customization.md) for themes and fonts. Example theme and font files are available in [`docs/examples/`](docs/examples/).
+- exFAT and FAT32 SD cards
+- Web UI uploads with supported UTF-8 filenames
+- File browser with nested folders
+- Recycle bin for deleted files
+- Hidden system folder filter
 
-## Installing
+CJK filenames are not supported. See [filename rules](docs/webserver.md#unicode-filenames) and [file operations](docs/user_guide.md#file-browser).
 
-### Using Papyrix Flasher (Recommended)
+### Installing & Firmware Updates
 
-The easiest way to install Papyrix is using [papyrix-flasher](https://github.com/bigbag/papyrix-flasher) — a cross-platform CLI tool with auto-detection and embedded bootloader. Download the latest release for your platform and run:
+> Do you need to recover a device that does not start? [Go to emergency recovery](#emergency-recovery).
+
+Use the image listed for your device under [Supported devices](#supported-devices).
+
+For first installation, follow the [Sticky guide](docs/sticky-specifications.md#installation) or the [Murphy M4 guide](docs/murphy-m4-specifications.md#installation). Switching firmware can delete internal data.
+
+For M4, confirm the model, hardware batch, flash/layout, and security state before any write. Keep a private, verified 16 MiB flash backup and a separate SD backup. No M4 device is available for physical checks.
+
+Pro, Classic, Sticky, and Murphy M4 images are not interchangeable. Do not erase the chip or install a full-flash image from another device. For Classic partition and OTA-slot requirements, see the [Classic specifications](docs/x4-classic-specifications.md#installation).
+
+Select the image for the correct board and partition layout. An image for the wrong board can pass validation and damage hardware. See [update compatibility](docs/device-support-matrix.md#firmware-update-compatibility) for the validation rules and limits.
+
+For X3 and the original X4, use **[papyrix-flasher](https://github.com/bigbag/papyrix-flasher)**. USB flashing requires an unlocked device. Do not flash an S3 image to a C3 device or a C3 image to an S3 device.
 
 ```bash
-papyrix-flasher flash firmware.bin
+papyrix-flasher flash papyrix-xteink-c3.bin
 ```
 
-### Manual Build
+**SD app updates:** Follow the [normal update procedure](docs/user_guide.md#firmware-update). It requires an existing compatible PapyriX installation. It does not install PapyriX over Sticky or Murphy M4 stock firmware. Do not remove power or the SD card during an update.
 
-See [Development](#development) below.
+#### Emergency Recovery
+
+Emergency recovery requires bootable PapyriX and working SD access. It cannot restore an erased bootloader or damaged partition table.
+
+Follow [firmware recovery](docs/troubleshooting.md#firmware-recovery) when the UI cannot start. The procedure includes image selection, file handling, and retry limits. Do not remove power or the SD card during recovery.
 
 ## Development
 
@@ -106,18 +178,18 @@ See [Development](#development) below.
 
 * **PlatformIO Core** (`pio`) or **VS Code + PlatformIO IDE**
 * Python 3.12+ with [uv](https://docs.astral.sh/uv/) (for font conversion)
-* Node.js 18+ (for sleep screen and logo scripts)
-* USB-C cable for flashing the ESP32-C3
-* Xteink X4
+* Node.js 18+ (for sleep screen scripts and logo scripts)
+* USB-C data cable
+* A supported device with unlocked flashing, for upload and hardware checks
 
-Install Node.js dependencies (for sleep screen and logo scripts):
+Install Node.js dependencies (for sleep screen scripts and logo scripts):
 ```bash
 cd scripts && npm install
 ```
 
-### Using Nix (Recommended)
+### Using Nix
 
-If you have [Nix](https://nixos.org/) installed, all dependencies are provided via `shell.nix`:
+If you have [Nix](https://nixos.org/), `shell.nix` supplies all dependencies:
 
 ```bash
 # Enter development environment
@@ -140,10 +212,10 @@ nix-channel --update
 
 ### Checking out the code
 
-Papyrix uses PlatformIO for building and flashing the firmware. To get started, clone the repository:
+PapyriX uses PlatformIO to build and flash the firmware. Clone the repository:
 
 ```
-git clone --recursive https://github.com/pliashkou/papyrix
+git clone --recursive https://github.com/bigbag/papyrix-reader
 
 # Or, if you've already cloned without --recursive:
 git submodule update --init --recursive
@@ -151,36 +223,83 @@ git submodule update --init --recursive
 
 ### Building
 
+Run host tests before you build firmware. Host tests require CMake 3.16 or later, Make, C and C++17 compilers, and the Expat development library.
+
+CMake downloads pngle 1.0.2 and checks its archive hash on the first configuration. The download requires network access. CMake keeps the source in `test/build/_deps` for later builds. Host tests do not require PlatformIO packages.
+
 ```sh
-# Build firmware
+# Build and run host tests
+make test
+
+# Build development firmware for X3/X4
 make build
 
-# Build release firmware
+# Build development firmware for X4 Pro
+pio run -e x4pro
+
+# Build development firmware for X4 v2 Classic
+pio run -e x4c
+
+# Build development firmware for Sticky
+pio run -e sticky
+
+# Build development and release firmware for Murphy M4
+pio run -e murphy_m4 -e release_murphy_m4
+
+# Build all five release environments
 make release
 
-# Or using PlatformIO directly
-pio run
+# Build, verify, and package deterministic release files in dist/
+make package
 ```
 
 ### Flashing your device
 
-Connect your Xteink X4 to your computer via USB-C and run the following command.
+On Sticky, use `make install-sticky` for the first installation. Use `make flash-sticky` to update an existing PapyriX installation without clearing LittleFS. See [installation and recovery](docs/sticky-specifications.md#installation).
+
+For M4, use its [first-install guide](docs/murphy-m4-specifications.md#installation). M4 uses native USB-Serial/JTAG, not the Sticky UART bridge.
+
+The commands below apply to Xteink devices.
+
+Connect the device through unlocked USB. Build and flash the release firmware for the device:
 
 ```sh
-make flash
-
-# Or using PlatformIO directly
-pio run --target upload
+make flash-xteink-c3  # X3 and X4
+make flash-x4pro      # X4 Pro
+make flash-x4c        # X4 v2 Classic
 ```
 
-You can also flash using esptool directly (useful if you have a pre-built firmware binary):
+X4 Pro USB flashing does not require holding Power. Close the serial monitor before flashing. To select a port:
 
 ```sh
-esptool.py --chip esp32c3 --port /dev/ttyACM0 --baud 460800 \
-  write_flash -z 0x0 firmware.bin
+PLATFORMIO_UPLOAD_PORT=/dev/ttyACM0 make flash-x4pro
 ```
 
-Replace `/dev/ttyACM0` with your device port (e.g., `COM3` on Windows, `/dev/tty.usbmodem*` on macOS).
+`make flash-release` and `make upload-release` select X3/X4 only. The following commands update only the application at `0x10000`. Use them only when the device partition table matches and this slot is selected for boot. Use esptool 5.4 or later.
+
+```sh
+# ESP32-C3: X3/X4
+esptool --chip esp32c3 --port /dev/ttyACM0 --baud 460800 \
+  write-flash -z 0x10000 papyrix-xteink-c3.bin
+
+# ESP32-S3: X4 Pro
+esptool --chip esp32s3 --port /dev/ttyACM0 --baud 460800 \
+  write-flash -z 0x10000 papyrix-x4pro.bin
+
+# ESP32-S3: X4 v2 Classic
+esptool --chip esp32s3 --port /dev/ttyACM0 --baud 460800 \
+  write-flash -z 0x10000 papyrix-x4c.bin
+```
+
+PlatformIO upload remains available for a connected development target:
+
+```sh
+pio run -e default --target upload
+pio run -e x4pro --target upload
+pio run -e x4c --target upload
+```
+
+Replace `/dev/ttyACM0` with the device port. Use `COM3` on Windows or `/dev/tty.usbmodem*` on macOS where applicable.
 
 ### Build Scripts
 
@@ -188,109 +307,55 @@ Build scripts are in the `scripts/` directory.
 
 #### Converting fonts
 
-Convert TTF/OTF fonts to Papyrix `.epdfont` format using Python (requires [uv](https://docs.astral.sh/uv/)):
-
-```bash
-# Basic conversion (outputs to current directory)
-uv run scripts/fontconvert.py my-font -r MyFont-Regular.ttf --2bit
-
-# Full font family with all reader sizes (14, 16, 18pt)
-uv run scripts/fontconvert.py my-font -r Regular.ttf -b Bold.ttf --2bit --all-sizes -o /tmp/fonts/
-
-# With Thai script support
-uv run scripts/fontconvert.py my-font -r Regular.ttf --2bit --thai -o /tmp/fonts/
-
-# With Arabic script support
-uv run scripts/fontconvert.py my-font -r Regular.ttf --2bit --arabic -o /tmp/fonts/
-
-# Generate C header instead of binary (for builtin fonts)
-uv run scripts/fontconvert.py my_font 16 Regular.ttf --2bit > my_font_16_2b.h
-```
-
-Options: `-r/--regular`, `-b/--bold`, `-i/--italic`, `-o/--output`, `-s/--size`, `--2bit`, `--all-sizes`, `--header`, `--thai`, `--arabic`
-
-See [customization guide](docs/customization.md) for detailed font conversion instructions.
+See [custom font conversion](docs/customization.md#converting-fonts) for `.epdfont` files. See [built-in font regeneration](docs/fonts.md#regenerating-built-in-fonts) for C headers and font hashes.
 
 #### Creating sleep screen images
 
-Convert any image to sleep screen BMP format (requires `cd scripts && npm install`):
+Create a BMP from an image:
 
 ```bash
-# Via Makefile
-make sleep-screen INPUT=photo.jpg OUTPUT=sleep.bmp
-make sleep-screen INPUT=photo.jpg OUTPUT=sleep.bmp ARGS='--dither --bits 8'
-
-# Or directly
-cd scripts && node create-sleep-screen.mjs photo.jpg sleep.bmp --dither --bits 8
+make sleep-screen INPUT=photo.jpg OUTPUT=sleep.bmp ARGS='--bits 8'
 ```
 
-Options:
-- `--orientation portrait|landscape` - Screen orientation (default: portrait)
-- `--bits 2|4|8` - Output bit depth (default: 4)
-- `--dither` - Enable Floyd-Steinberg dithering
-- `--fit contain|cover|stretch` - Resize mode (default: contain)
-
-Copy the output BMP to `/sleep/` directory or as `/sleep.bmp` on the SD card.
+See [sleep image conversion](docs/customization.md#custom-sleep-screens) for options. See [sleep screen setup](docs/user_guide.md#37-sleep-screen) for SD locations and device settings.
 
 #### Converting logo
 
-Convert image to C header for firmware logo (128x128 monochrome):
+Convert an image to a C header for the firmware logo (384x384 monochrome):
 
 ```bash
-cd scripts && node convert-logo.mjs logo.png ../src/images/PapyrixLogo.h
+cd scripts && node convert-logo.mjs ../images/logo-light.jpg ../src/images/PapyrixLogo.h
 ```
 
-Options: `--invert`, `--threshold <0-255>`, `--rotate <0|90|180|270>`
+Options: `--invert`, `--threshold <0-255>`, `--rotate <0|90|180|270>` (default: `270`)
 
 #### Calibre simulators (development/testing)
 
-Two simulators are provided for testing the Calibre Wireless Device feature without real hardware:
-
-```bash
-cd scripts
-
-# Simulate a Papyrix device (for testing Calibre desktop connection)
-node device-simulator.mjs
-
-# Simulate Calibre desktop (for testing device firmware)
-node calibre-simulator.mjs
-```
-
-The device simulator listens for Calibre broadcasts and can receive books (saved to `scripts/received_books/`). The Calibre simulator broadcasts discovery packets and sends test books to connected devices.
+See the [library testing guide](lib/Calibre/README.md#testing) for device and desktop simulators.
 
 #### Serial monitor
 
-A standalone Go binary for reading device logs without PlatformIO. Pre-built binaries are available on the [releases page](https://github.com/pliashkou/papyrix/releases), or build from source:
+The standalone Go monitor reads device logs without PlatformIO. Download it from [Releases](https://github.com/bigbag/papyrix-reader/releases), or build it:
 
 ```bash
 cd tools/monitor && go build -o monitor .
 ```
 
-Usage:
 ```bash
-./monitor                                  # Auto-detect port
-./monitor -port /dev/ttyACM0               # Explicit port
-./monitor -port /dev/ttyACM0 -log out.txt  # Also save to file
-./monitor -speed 921600                    # Custom baud rate (default: 115200)
+./monitor -port /dev/ttyACM0 -log out.txt
 ```
+
+Omit `-port` for automatic port selection. Use `-speed` to change the default 115200 baud rate. See [serial log capture](docs/troubleshooting.md#serial-log-capture) for reconnecting capture.
 
 #### Reader test (desktop)
 
-A desktop tool for testing the content parsing pipeline (EPUB, FB2, HTML, TXT, Markdown) without flashing to hardware. Useful for catching parsing bugs, layout issues, or crashes.
+The desktop tool runs EPUB, FB2, HTML, TXT, and Markdown parsers without flashing a device.
 
 ```bash
-# Build only
-make reader-test
-
-# Build and process a book
 make reader-test FILE=book.epub OUTPUT=/tmp/cache
-
-# Dump parsed text content of each page
-tools/reader-test/build/reader-test --dump book.epub /tmp/cache
 ```
 
-Options:
-- `--dump` — Print the parsed text content of each page (useful for verifying entity resolution, text extraction, and layout)
+See [desktop parser checks](docs/architecture.md#desktop-parser-tool) for text dumps, batch parsing, and cache comparison.
 
 ### Creating a GitHub release
 
@@ -304,122 +369,67 @@ make gh-release VERSION=0.1.1 NOTES="Release notes here"
 
 ### Generating changelog
 
-Generate `CHANGELOG.md` from git tags and commit history:
+Make `CHANGELOG.md` from git tags and commit history:
 
 ```sh
 make changelog
 ```
 
-This creates a changelog grouped by version tags, with commit messages and author information.
+This makes a changelog grouped by version tags, with commit messages and author data.
 
 ## Internals
 
-Papyrix is designed for the ESP32-C3's ~380KB RAM constraint. See [docs/architecture.md](docs/architecture.md) for detailed architecture documentation.
+PapyriX retains the low-memory ESP32-C3 path. ESP32-S3 targets also use PSRAM for selected reader buffers. See the [architecture](docs/architecture.md) and [S3 reader platform](docs/s3-platform.md).
 
 ### Data caching
 
-The first time chapters of a book are loaded, they are cached to the SD card. Subsequent loads are served from the cache. This cache directory exists at `.papyrix` on the SD card. The structure is as follows:
+The device caches book data on the SD card. Each model uses a [device-specific cache directory](docs/device-specifications.md#storage).
 
+To clear cached data, use **Settings > Cleanup** (see [User Guide](docs/user_guide.md)). Clearing the book cache also removes reading progress. Deleting the entire `.papyrix` directory also removes reading history.
 
-```
-.papyrix/
-├── epub_12471232/       # Each EPUB is cached to a subdirectory named `epub_<hash>`
-│   ├── progress.bin     # Stores reading progress (chapter, page, etc.)
-│   ├── bookmarks.bin    # Saved bookmarks (up to 20 per book)
-│   ├── bookmarks.txt    # Human-readable bookmark list (companion to bookmarks.bin)
-│   ├── cover.bmp        # Book cover image (once generated)
-│   ├── book.bin         # Book metadata (title, author, spine, table of contents, etc.)
-│   ├── sections/        # All chapter data is stored in the sections subdirectory
-│   │   ├── 0.bin        # Chapter data (screen count, all text layout info, etc.)
-│   │   ├── 1.bin        #     files are named by their index in the spine
-│   │   └── ...
-│   └── images/          # Cached inline images (converted to 2-bit BMP)
-│       ├── 123456.bmp   # Images named by hash of source path
-│       └── ...
-│
-├── fb2_55667788/        # Each FB2 file is cached to a subdirectory named `fb2_<hash>`
-│   ├── meta.bin         # Cached metadata (title, author, TOC) for faster reloads
-│   ├── progress.bin     # Stores reading progress
-│   ├── cover.bmp        # Cover image (converted from adjacent image file)
-│   ├── sections/        # Cached chapter pages (same format as EPUB sections)
-│   │   ├── 0.bin
-│   │   └── ...
-│
-│
-├── txt_98765432/        # Each TXT file is cached to a subdirectory named `txt_<hash>`
-│   ├── progress.bin     # Stores current page number (4-byte uint32)
-│   ├── index.bin        # Page index (byte offsets for each page start)
-│   └── cover.bmp        # Cover image (converted from book.jpg/png/bmp or cover.jpg/png/bmp)
-│
-├── md_12345678/         # Each Markdown file is cached to a subdirectory named `md_<hash>`
-│   ├── progress.bin     # Stores current page number (2-byte uint16)
-│   ├── section.bin      # Parsed pages (same format as EPUB sections)
-│   └── cover.bmp        # Cover image (converted from README.jpg/png/bmp or cover.jpg/png/bmp)
-│
-├── html_12345678/       # Each HTML file is cached to a subdirectory named `html_<hash>`
-│   ├── progress.bin     # Stores current page number (4-byte, same as TXT/Markdown)
-│   ├── pages_<fontId>.bin  # Parsed pages (same format as Markdown/FB2 sections)
-│   └── cover.bmp        # Cover image (converted from adjacent image file)
-│
-└── epub_189013891/
-```
+The cache does not clear automatically when you delete a book. If you move a book file, the device uses a new cache directory. This resets the reading progress.
 
-To clear cached data, use **Settings > Cleanup** (see [User Guide](docs/user_guide.md)). Alternatively, delete the `.papyrix` directory manually.
-
-Due the way it's currently implemented, the cache is not automatically cleared when a book is deleted and moving a book file will use a new cache directory, resetting the reading progress.
-
-For more details on the internal file structures, see the [file formats document](./docs/file-formats.md).
+See [file formats](./docs/file-formats.md) for cache records. See the [rendering pipeline](./docs/rendering-pipeline.md#page-cache) for cache scheduling and ownership.
 
 ## Related Tools
 
-### EPUB to XTC Converter (Web)
-
-[epub-to-xtc-converter](https://github.com/bigbag/epub-to-xtc-converter) — browser-based converter from EPUB to Xteink's native XTC/XTCH format. Uses CREngine WASM for accurate rendering.
-
-- Device presets for Xteink X4/X3 (480x800)
-- Font selection from Google Fonts or custom TTF/OTF
-- Configurable margins, line height, hyphenation (42 languages)
-- Dark mode and dithering options
-- Batch processing and ZIP export
-
-**Live version:** [liashkov.site/epub-to-xtc-converter](https://liashkov.site/epub-to-xtc-converter/)
-
-### EPUB Optimizer (CLI)
-
-[xteink-epub-optimizer](https://github.com/bigbag/xteink-epub-optimizer) — command-line tool to optimize EPUB files for the Xteink X4's constraints (480×800 display, limited RAM):
-
-- **CSS Sanitization** - Removes complex layouts (floats, flexbox, grid)
-- **Font Removal** - Strips embedded fonts to reduce file size
-- **Image Optimization** - Grayscale conversion, resizing to 480px max width
-- **XTC/XTCH Conversion** - Convert EPUBs to Xteink's native format
-
-```bash
-# Optimize EPUB
-python src/optimizer.py ./ebooks ./optimized
-
-# Convert to XTCH format
-python src/converter.py book.epub book.xtch --font fonts/MyFont.ttf
-```
+- [EPUB to XTC Converter](https://github.com/bigbag/epub-to-xtc-converter) converts books in a browser. It provides device presets, font selection, and batch export. [Open the web app](https://liashkov.site/epub-to-xtc-converter/).
+- [EPUB Optimizer](https://github.com/bigbag/xteink-epub-optimizer) prepares EPUB files for X4 display and memory limits. It also converts books to XTC and XTCH.
 
 ## Contributing
 
-Contributions are very welcome!
+1. Fork the repository.
+2. Create a branch.
+3. Make the changes.
+4. Run `make test`, `make format`, and `make check`.
+5. Inspect formatter changes.
+6. Submit a pull request.
 
-### To submit a contribution:
+For documentation, comments, and docstrings:
 
-1. Fork the repo
-2. Create a branch (`feature/your-feature`)
-3. Make changes
-4. Submit a PR
+- Write one idea per sentence.
+- Group related sentences into paragraphs. Separate topics with blank lines, not a new source line for every sentence.
+- Name the actor and use active voice.
+- Use present tense for current behavior and imperative verbs for instructions.
+- Use approved STE words in their approved meaning and part of speech. Keep permitted technical terms, API names, UI labels, paths, and flags exact.
+- Keep procedural sentences within 20 words and descriptive sentences within 25 words.
+- Keep paragraphs within six sentences.
+- Remove filler, cliches, and unsupported claims.
+- Put safety conditions before the affected action.
+- Keep one full source for each procedure or changing fact. Check links when headings or files change.
+
+Preserve the meaning and time of historical events. Do not rewrite release history, quotations, legal text, or upstream attribution to force present tense.
 
 ---
 
-Papyrix is a fork of [CrossPoint Reader](https://github.com/daveallie/crosspoint-reader) by Dave Allie.
+PapyriX is a fork of [CrossPoint Reader](https://github.com/daveallie/crosspoint-reader) by Dave Allie.
 
-X4 hardware insights from [bb_epaper](https://github.com/bitbank2/bb_epaper) by Larry Bank.
+The IPP print server core ([lib/Ipp](lib/Ipp)) comes from the [crosspoint-reader fork](https://github.com/NishantJoshi00/crosspoint-reader) by [Nishant Joshi](https://nishantjosh.dev), commit [`df0d5e3`](https://github.com/NishantJoshi00/crosspoint-reader/commit/df0d5e367b08e206ab914dcff10a2d255d67bcdb).
 
-Markdown parsing using [MD4C](https://github.com/mity/md4c) by Martin Mitáš.
+X4 hardware data comes from [bb_epaper](https://github.com/bitbank2/bb_epaper) by Larry Bank.
 
-CSS parser adapted from [microreader](https://github.com/CidVonHighwind/microreader) by CidVonHighwind.
+Markdown parse uses [MD4C](https://github.com/mity/md4c) by Martin Mitáš.
 
-**Not affiliated with Xteink or any manufacturer of the X4 hardware**.
+CSS parser is adapted from [microreader](https://github.com/CidVonHighwind/microreader) by CidVonHighwind.
+
+**Not affiliated with Xteink or a manufacturer of the X4 hardware**.

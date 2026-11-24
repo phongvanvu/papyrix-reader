@@ -1,16 +1,18 @@
 /**
  * Fb2.h
  *
- * FictionBook 2.0 XML e-book handler for Papyrix Reader
+ * FictionBook 2.0 XML e-book handler for PapyriX Reader
  * Provides EPUB-like interface for FB2 file handling
  */
 
 #pragma once
 
+#include <HomeThumbnail.h>
 #include <expat.h>
 
 #include <climits>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -26,6 +28,11 @@ class Fb2 {
     int sectionIndex = -1;  // Sequential section number (0-based)
   };
 
+  struct SectionOffset {
+    uint32_t startOffset = 0;
+    uint32_t endOffset = 0;
+  };
+
  private:
   std::string filepath;
   std::string cachePath;
@@ -37,6 +44,7 @@ class Fb2 {
   int64_t coverBinaryOffset_ = -1;  // Byte offset of cover <binary> tag (-1 = not found)
   size_t fileSize;
   bool loaded;
+  std::vector<SectionOffset> sectionOffsets_;
 
   // XML parsing state
   XML_Parser xmlParser_ = nullptr;
@@ -74,11 +82,19 @@ class Fb2 {
   static void XMLCALL characterData(void* userData, const XML_Char* s, int len);
 
   // Helper methods
+  bool metadataOnly_ = false;
+
   bool parseXmlStream();
+  bool scanSectionOffsets();
+  void filterNestedSections();
+  bool generateSectionFiles();
   void postProcessMetadata();
   bool loadMetaCache();
   bool saveMetaCache() const;
   std::string metaCachePath() const;
+  std::string sectionFilePath(int sectionIndex) const;
+  home_thumbnail::Result prepareCoverSource(std::string& sourcePath, bool& temporary,
+                                            const std::function<bool()>& shouldAbort) const;
 
  public:
   explicit Fb2(std::string filepath, const std::string& cacheDir);
@@ -89,6 +105,13 @@ class Fb2 {
    * @return true on success
    */
   bool load();
+
+  /**
+   * Load only metadata (title, author, language, cover ref) without scanning sections
+   * or generating section files. Uses cache when available.
+   * @return true on success
+   */
+  bool loadMetadataOnly();
 
   /**
    * Clear cached data
@@ -113,9 +136,7 @@ class Fb2 {
 
   // Cover image support
   std::string getCoverBmpPath() const;
-  bool generateCoverBmp(bool use1BitDithering = false) const;
-  std::string getThumbBmpPath() const;
-  bool generateThumbBmp() const;
+  bool generateCoverBmp(bool use1BitDithering = false, const std::function<bool()>& shouldAbort = nullptr) const;
 
   /**
    * Read content from file at specified offset
@@ -131,13 +152,13 @@ class Fb2 {
    * @param outputPath Path to write the decoded image
    * @return true on success
    */
-  bool extractEmbeddedCover(const std::string& outputPath) const;
+  bool extractEmbeddedCover(const std::string& outputPath, const std::function<bool()>& shouldAbort = nullptr) const;
 
   /**
    * Find a cover image in the same directory as the FB2 file
    * @return Path to cover image, or empty string if not found
    */
-  std::string findCoverImage() const;
+  std::string findCoverImage(const std::function<bool()>& shouldAbort = nullptr) const;
 
   // Check if file is loaded
   bool isLoaded() const { return loaded; }
@@ -145,4 +166,10 @@ class Fb2 {
   // TOC access (lazy: reads from cache file on demand)
   uint16_t tocCount() const { return tocItemCount_; }
   TocItem getTocItem(uint16_t index) const;
+
+  // Section access (for per-section spine emulation)
+  uint16_t getSectionCount() const { return static_cast<uint16_t>(sectionOffsets_.size()); }
+  std::string getSectionPath(int sectionIndex) const;
+  int getSectionForTocEntry(int tocIndex) const;
+  const std::vector<SectionOffset>& getSectionOffsets() const { return sectionOffsets_; }
 };

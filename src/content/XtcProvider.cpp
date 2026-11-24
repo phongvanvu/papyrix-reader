@@ -1,8 +1,9 @@
 #include "XtcProvider.h"
 
-#include <CoverHelpers.h>
 #include <HardwareSerial.h>
+#include <HomeThumbnail.h>
 #include <SDCardManager.h>
+#include <Utf8.h>
 #include <XtcCoverHelper.h>
 
 #include <cstring>
@@ -25,19 +26,16 @@ Result<void> XtcProvider::open(const char* path, const char* cacheDir) {
 
   std::string title = parser.getTitle();
   if (title.empty()) {
-    // Use filename as title
     const char* lastSlash = strrchr(path, '/');
     const char* filename = lastSlash ? lastSlash + 1 : path;
-    strncpy(meta.title, filename, sizeof(meta.title) - 1);
+    utf8SafeCopy(meta.title, sizeof(meta.title), filename);
   } else {
-    strncpy(meta.title, title.c_str(), sizeof(meta.title) - 1);
+    utf8SafeCopy(meta.title, sizeof(meta.title), title.c_str());
   }
-  meta.title[sizeof(meta.title) - 1] = '\0';
 
   std::string author = parser.getAuthor();
   if (!author.empty()) {
-    strncpy(meta.author, author.c_str(), sizeof(meta.author) - 1);
-    meta.author[sizeof(meta.author) - 1] = '\0';
+    utf8SafeCopy(meta.author, sizeof(meta.author), author.c_str());
   } else {
     meta.author[0] = '\0';
   }
@@ -48,6 +46,8 @@ Result<void> XtcProvider::open(const char* path, const char* cacheDir) {
     size_t hash = std::hash<std::string>{}(pathStr);
     snprintf(meta.cachePath, sizeof(meta.cachePath), "%s/xtc_%zu", cacheDir, hash);
     SdMan.mkdir(meta.cachePath);
+
+    xtc::migrateStaleFailureMarkers(meta.cachePath, parser.getBitDepth() == 2);
   } else {
     meta.cachePath[0] = '\0';
   }
@@ -81,8 +81,7 @@ Result<TocEntry> XtcProvider::getTocEntry(uint16_t index) const {
   const auto& chapter = chapters[index];
 
   TocEntry entry;
-  strncpy(entry.title, chapter.name.c_str(), sizeof(entry.title) - 1);
-  entry.title[sizeof(entry.title) - 1] = '\0';
+  utf8SafeCopy(entry.title, sizeof(entry.title), chapter.name.c_str());
   entry.pageIndex = chapter.startPage;
   entry.depth = 0;  // XTC chapters are flat
 
@@ -91,42 +90,31 @@ Result<TocEntry> XtcProvider::getTocEntry(uint16_t index) const {
 
 std::string XtcProvider::getCoverBmpPath() const { return std::string(meta.cachePath) + "/cover.bmp"; }
 
-std::string XtcProvider::getThumbBmpPath() const { return std::string(meta.cachePath) + "/thumb.bmp"; }
-
-bool XtcProvider::generateCoverBmp() {
-  const auto coverPath = getCoverBmpPath();
-  if (SdMan.exists(coverPath.c_str())) {
+bool XtcProvider::generateCoverBmp(const std::function<bool()>& shouldAbort) {
+  const std::string coverPath = getCoverBmpPath();
+  const std::string failedMarkerPath = std::string(meta.cachePath) + "/.cover.failed";
+  if (home_thumbnail::validateCover(coverPath)) {
+    SdMan.remove(failedMarkerPath.c_str());
     return true;
   }
-  return xtc::generateCoverBmpFromParser(parser, coverPath);
-}
+  if (SdMan.exists(coverPath.c_str())) SdMan.remove(coverPath.c_str());
+  if (SdMan.exists(failedMarkerPath.c_str())) return false;
 
-bool XtcProvider::generateThumbBmp() {
-  const auto thumbPath = getThumbBmpPath();
-  const auto failedMarkerPath = std::string(meta.cachePath) + "/.thumb.failed";
-
-  if (SdMan.exists(thumbPath.c_str())) return true;
-
-  if (SdMan.exists(failedMarkerPath.c_str())) {
-    return false;
-  }
-
-  if (!SdMan.exists(getCoverBmpPath().c_str()) && !generateCoverBmp()) {
+  const xtc::CoverResult generated = xtc::generateCoverBmpFromParser(parser, coverPath, shouldAbort);
+  const bool cancelled = shouldAbort && shouldAbort();
+  const bool valid = generated == xtc::CoverResult::Generated && !cancelled && home_thumbnail::validateCover(coverPath);
+  if (cancelled) {
+    SdMan.remove(coverPath.c_str());
+  } else if (valid) {
+    SdMan.remove(failedMarkerPath.c_str());
+  } else if (generated == xtc::CoverResult::InvalidFile) {
     FsFile marker;
-    if (SdMan.openFileForWrite("XTC", failedMarkerPath, marker)) {
-      marker.close();
-    }
-    return false;
+    if (SdMan.openFileForWrite("XTC", failedMarkerPath, marker)) marker.close();
+  } else {
+    // Transient failure (heap/IO): no marker so a later attempt can retry.
+    SdMan.remove(coverPath.c_str());
   }
-
-  const bool success = CoverHelpers::generateThumbFromCover(getCoverBmpPath(), thumbPath, "XTC");
-  if (!success) {
-    FsFile marker;
-    if (SdMan.openFileForWrite("XTC", failedMarkerPath, marker)) {
-      marker.close();
-    }
-  }
-  return success;
+  return valid;
 }
 
 }  // namespace papyrix

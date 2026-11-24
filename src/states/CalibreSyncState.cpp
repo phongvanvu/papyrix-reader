@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <GfxRenderer.h>
+#include <I18n.h>
 #include <Logging.h>
 #include <errno.h>
 #include <unistd.h>
@@ -66,8 +67,8 @@ void CalibreSyncState::initializeCalibre(Core& core) {
   calibre_device_config_t config;
   calibre_device_config_init(&config);
 
-  snprintf(config.device_name, sizeof(config.device_name), "Papyrix Reader");
-  snprintf(config.manufacturer, sizeof(config.manufacturer), "Papyrix");
+  snprintf(config.device_name, sizeof(config.device_name), "PapyriX Reader");
+  snprintf(config.manufacturer, sizeof(config.manufacturer), "PapyriX");
   snprintf(config.model, sizeof(config.model), "X4");
 
   // Add supported formats (Xteink: epub, txt, md, xtc, xtch)
@@ -100,7 +101,7 @@ void CalibreSyncState::initializeCalibre(Core& core) {
 
   // Get IP address to display with help text
   char ip[46];
-  core.network.getIpAddress(ip, sizeof(ip));
+  core.wifi.getIpAddress(ip, sizeof(ip));
   calibreView_.setWaitingWithIP(ip);
 
   // Start discovery (broadcast to find Calibre server)
@@ -120,7 +121,7 @@ void CalibreSyncState::exit(Core& core) {
   LOG_INF(TAG, "Exiting");
 
   cleanup();
-  core.network.shutdown();
+  core.wifi.shutdown();
 }
 
 StateTransition CalibreSyncState::update(Core& core) {
@@ -159,6 +160,14 @@ StateTransition CalibreSyncState::update(Core& core) {
   // Process button events
   Event e;
   while (core.events.pop(e)) {
+    if (e.type == EventType::Tap) {
+      const auto hit =
+          calibreView_.hitTest({e.touch.x, e.touch.y}, renderer_.getScreenWidth(), renderer_.getScreenHeight(),
+                               core.settings.frontButtonLayout == Settings::FrontLRBC);
+      if (hit == ui::CalibreView::Hit::Back) handleInput(core, Button::Back);
+      if (hit == ui::CalibreView::Hit::Restart) handleInput(core, Button::Center);
+      continue;
+    }
     if (e.type != EventType::ButtonPress) continue;
     handleInput(core, e.button);
   }
@@ -183,7 +192,6 @@ void CalibreSyncState::render(Core& core) {
   ui::render(renderer_, THEME, calibreView_);
   calibreView_.needsRender = false;
   needsRender_ = false;
-  core.display.markDirty();
 }
 
 void CalibreSyncState::handleInput(Core& /* core */, Button button) {
@@ -250,7 +258,7 @@ bool CalibreSyncState::onProgress(void* ctx, uint64_t current, uint64_t total) {
   // Use current statusMsg if it contains a book title, otherwise show generic message
   const char* title = self->calibreView_.statusMsg;
   if (!title[0] || strncmp(title, "IP:", 3) == 0) {
-    title = "Receiving...";
+    title = tr(RECEIVING);
   }
   self->calibreView_.setReceiving(title, saturateToInt32(current), saturateToInt32(total));
 

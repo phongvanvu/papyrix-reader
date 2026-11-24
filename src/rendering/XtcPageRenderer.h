@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 
@@ -15,25 +16,28 @@ namespace papyrix {
 // Supports 1-bit (B&W) and 2-bit (4-level grayscale) formats
 class XtcPageRenderer {
  public:
-  // Result of render operation
   enum class RenderResult { Success, EndOfBook, InvalidDimensions, AllocationFailed, PageLoadFailed };
+  enum class RefreshRequest { Cadenced, GrayscaleBase };
+  using RefreshCallback = std::function<void(RefreshRequest)>;
 
   explicit XtcPageRenderer(GfxRenderer& renderer);
 
-  // Render a page from the parser
-  // refreshCallback is called when display refresh is needed (for pagesUntilFullRefresh logic)
-  RenderResult render(xtc::XtcParser& parser, uint32_t pageNum, std::function<void()> refreshCallback);
+  RenderResult render(xtc::XtcParser& parser, uint32_t pageNum, const RefreshCallback& refreshCallback,
+                      void (*drawOverlay)(const GfxRenderer&, bool));
 
  private:
+  enum class GrayscalePass : uint8_t { Base, Lsb, Msb };
+
   GfxRenderer& renderer_;
 
-  // Render 1-bit B&W page (standard XTC)
-  void render1Bit(const uint8_t* buffer, uint16_t width, uint16_t height);
-
-  // Render 2-bit grayscale page (XTCH format)
-  // Uses 4-pass rendering for e-ink grayscale display
-  // Takes two separate plane buffers to handle heap fragmentation
-  void render2BitGrayscale(const uint8_t* plane1, const uint8_t* plane2, uint16_t width, uint16_t height);
+  RenderResult render1Bit(xtc::XtcParser& parser, uint32_t pageNum, uint16_t width, uint16_t height,
+                          const RefreshCallback& refreshCallback, void (*drawOverlay)(const GfxRenderer&, bool));
+  RenderResult render2Bit(xtc::XtcParser& parser, uint32_t pageNum, uint16_t width, uint16_t height,
+                          const RefreshCallback& refreshCallback, void (*drawOverlay)(const GfxRenderer&, bool));
+  RenderResult compose2BitPass(xtc::XtcParser& parser, uint32_t pageNum, uint16_t width, uint16_t height,
+                               GrayscalePass pass);
+  bool usesNativeXthLayout(uint16_t width, uint16_t height, size_t planeSize) const;
+  void recoverGrayscaleFailure();
 };
 
 }  // namespace papyrix

@@ -1,12 +1,22 @@
 #include "SDCardManager.h"
 
+#include <HardwareIdentity.h>
 #include <Logging.h>
+
+#include <cstdint>
+#include <cstring>
+
+#include "SDPowerControl.h"
+#include "SdFreeSpace.h"
+#include "SdmmcBlockDevice.h"
 
 #define TAG "SD"
 
 namespace {
-constexpr uint8_t SD_CS = 12;
 constexpr uint32_t SPI_FQ = 40000000;
+#if PAPYRIX_CAP_SDMMC
+papyrix::sd::SdmmcBlockDevice sdmmc;
+#endif
 }  // namespace
 
 SDCardManager SDCardManager::instance;
@@ -14,22 +24,31 @@ SDCardManager SDCardManager::instance;
 SDCardManager::SDCardManager() : sd() {}
 
 bool SDCardManager::begin() {
-  if (!sd.begin(SD_CS, SPI_FQ)) {
-    LOG_ERR(TAG, "SD card not detected");
-    initialized = false;
-  } else {
+  if (initialized) return true;
+#if PAPYRIX_CAP_SDMMC
+  const auto& storage = papyrix::board::HardwareIdentity::instance().profile().storage;
+  initialized = sdmmc.begin(storage) && (sd.begin(&sdmmc) || sd.begin(&sdmmc, true, 0));
+#else
+  initialized = sd.begin(papyrix::board::HardwareIdentity::instance().profile().storage.spiCs, SPI_FQ);
+#endif
+  if (initialized) {
     LOG_INF(TAG, "SD card detected");
-    initialized = true;
+  } else {
+    LOG_ERR(TAG, "SD card not detected");
+#if PAPYRIX_CAP_SDMMC
+    sdmmc.end();
+#endif
   }
-
   return initialized;
 }
 
 void SDCardManager::end() {
-  if (initialized) {
-    sd.end();
-    initialized = false;
-  }
+  if (!initialized) return;
+  sd.end();
+#if PAPYRIX_CAP_SDMMC
+  sdmmc.end();
+#endif
+  initialized = false;
 }
 
 bool SDCardManager::ready() const { return initialized; }
@@ -90,7 +109,7 @@ String SDCardManager::readFile(const char* path) {
   String content;
   content.reserve(toRead);
 
-  uint8_t buf[256];
+  uint8_t buf[1024];
   size_t readSize = 0;
   while (f.available() && readSize < toRead) {
     const size_t chunkSize = min(sizeof(buf), toRead - readSize);
@@ -114,7 +133,7 @@ bool SDCardManager::readFileToStream(const char* path, Print& out, const size_t 
     return false;
   }
 
-  constexpr size_t localBufSize = 256;
+  constexpr size_t localBufSize = 1024;
   uint8_t buf[localBufSize];
   const size_t toRead = (chunkSize == 0) ? localBufSize : (chunkSize < localBufSize ? chunkSize : localBufSize);
 
@@ -202,28 +221,120 @@ bool SDCardManager::ensureDirectoryExists(const char* path) {
     dir.close();
   }
 
-  // Create the directory
-  if (sd.mkdir(path)) {
-    LOG_INF(TAG, "Created directory: %s", path);
+  // Retry mkdir on transient failures (FAT directory cluster cache eviction
+  // races with the directory walk under memory pressure).
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) {
+      delay(50);
+      // Short-circuit: a previous attempt may have succeeded but returned false
+      if (sd.exists(path)) {
+        FsFile dir = sd.open(path);
+        if (dir && dir.isDirectory()) {
+          dir.close();
+          return true;
+        }
+        dir.close();
+      }
+    }
+    if (sd.mkdir(path)) {
+      LOG_INF(TAG, "Created directory: %s", path);
+      return true;
+    }
+  }
+
+  LOG_ERR(TAG, "Failed to create directory: %s", path);
+  return false;
+}
+
+FsFile SDCardManager::open(const char* path, oflag_t oflag) {
+  FsFile file = sd.open(path, oflag);
+  if (!file) {
+    openByDirScan(path, oflag, file);
+  }
+  return file;
+}
+
+bool SDCardManager::exists(const char* path) {
+  if (sd.exists(path)) return true;
+  FsFile file;
+  if (openByDirScan(path, O_RDONLY, file)) {
+    file.close();
     return true;
+  }
+  return false;
+}
+
+uint64_t SDCardManager::freeBytes() {
+  if (!initialized) return 0;
+  return papyrix::sd::freeBytesFromClusters(sd.freeClusterCount(), sd.sectorsPerCluster());
+}
+
+bool SDCardManager::openByDirScan(const char* path, oflag_t oflag, FsFile& file) {
+  if (!path || path[0] == '\0') return false;
+
+  // Find the last '/' to split into parent dir + filename
+  const char* lastSlash = strrchr(path, '/');
+  if (!lastSlash) return false;
+
+  const char* filename = lastSlash + 1;
+  // Fast path: only scan when filename starts with a space
+  if (filename[0] != ' ') return false;
+
+  // Build parent directory path
+  char parentDir[512];
+  size_t parentLen = static_cast<size_t>(lastSlash - path);
+  if (parentLen == 0) {
+    parentDir[0] = '/';
+    parentDir[1] = '\0';
   } else {
-    LOG_ERR(TAG, "Failed to create directory: %s", path);
+    if (parentLen >= sizeof(parentDir)) return false;
+    memcpy(parentDir, path, parentLen);
+    parentDir[parentLen] = '\0';
+  }
+
+  FsFile dir = sd.open(parentDir);
+  if (!dir || !dir.isDirectory()) {
+    if (dir) dir.close();
     return false;
   }
+
+  char name[256];
+  FsFile entry;
+  while (entry.openNext(&dir, O_RDONLY)) {
+    entry.getName(name, sizeof(name));
+    if (strcmp(name, filename) == 0) {
+      if (oflag == O_RDONLY) {
+        file = std::move(entry);
+      } else {
+        uint32_t idx = entry.dirIndex();
+        entry.close();
+        file.open(&dir, idx, oflag);
+      }
+      dir.close();
+      return file.isOpen();
+    }
+    entry.close();
+  }
+
+  dir.close();
+  return false;
 }
 
 bool SDCardManager::openFileForRead(const char* moduleName, const char* path, FsFile& file) {
-  if (!sd.exists(path)) {
-    LOG_ERR(moduleName, "File does not exist: %s", path);
-    return false;
+  // SdFat's directory cache occasionally returns false-negatives under memory
+  // pressure — observed moments after a successful write. Drop the redundant
+  // sd.exists() precheck (sd.open() does its own lookup) and retry with a
+  // brief delay to let the FAT cache settle.
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) delay(50);
+    file = sd.open(path, O_RDONLY);
+    if (file) {
+      return true;
+    }
   }
-
-  file = sd.open(path, O_RDONLY);
-  if (!file) {
-    LOG_ERR(moduleName, "Failed to open file for reading: %s", path);
-    return false;
-  }
-  return true;
+  if (openByDirScan(path, O_RDONLY, file)) return true;
+  LOG_DBG(moduleName, "File does not exist: %s", path);
+  return false;
 }
 
 bool SDCardManager::openFileForRead(const char* moduleName, const std::string& path, FsFile& file) {
@@ -235,12 +346,18 @@ bool SDCardManager::openFileForRead(const char* moduleName, const String& path, 
 }
 
 bool SDCardManager::openFileForWrite(const char* moduleName, const char* path, FsFile& file) {
-  file = sd.open(path, O_RDWR | O_CREAT | O_TRUNC);
-  if (!file) {
-    LOG_ERR(moduleName, "Failed to open file for writing: %s", path);
-    return false;
+  // Same defensive retry as openFileForRead — under memory pressure SdFat
+  // occasionally fails to allocate a directory entry slot on the first try.
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) delay(50);
+    file = sd.open(path, O_RDWR | O_CREAT | O_TRUNC);
+    if (file) {
+      return true;
+    }
   }
-  return true;
+  if (openByDirScan(path, O_RDWR | O_CREAT | O_TRUNC, file)) return true;
+  LOG_ERR(moduleName, "Failed to open file for writing: %s", path);
+  return false;
 }
 
 bool SDCardManager::openFileForWrite(const char* moduleName, const std::string& path, FsFile& file) {
@@ -251,43 +368,97 @@ bool SDCardManager::openFileForWrite(const char* moduleName, const String& path,
   return openFileForWrite(moduleName, path.c_str(), file);
 }
 
-bool SDCardManager::removeDir(const char* path) {
-  // 1. Open the directory
-  auto dir = sd.open(path);
-  if (!dir) {
-    return false;
-  }
-  if (!dir.isDirectory()) {
-    dir.close();
-    return false;
-  }
+bool SDCardManager::removeDir(const char* path, RemoveDirProgress progress) {
+  struct Node {
+    String path;
+    Node* next;
+  };
 
-  auto file = dir.openNextFile();
+  auto freeList = [](Node*& head) {
+    while (head) {
+      auto* n = head->next;
+      delete head;
+      head = n;
+    }
+  };
+
+  Node* dirs = nullptr;
+  Node* stack = new (std::nothrow) Node{String(path), nullptr};
+  if (!stack) return false;
+
+  bool allOk = true;
+  int deleted = 0;
   char name[128];
-  while (file) {
-    String filePath = path;
-    if (!filePath.endsWith("/")) {
-      filePath += "/";
-    }
-    file.getName(name, sizeof(name));
-    filePath += name;
+  constexpr int kMaxEntries = 4096;
 
-    if (file.isDirectory()) {
-      file.close();
-      if (!removeDir(filePath.c_str())) {
-        dir.close();
-        return false;
-      }
-    } else {
-      file.close();
-      if (!sd.remove(filePath.c_str())) {
-        dir.close();
-        return false;
-      }
+  while (stack) {
+    Node* top = stack;
+    String dirPath = std::move(top->path);
+    stack = top->next;
+    delete top;
+
+    auto* dirNode = new (std::nothrow) Node{dirPath, dirs};
+    if (!dirNode) {
+      freeList(dirs);
+      freeList(stack);
+      return false;
     }
-    file = dir.openNextFile();
+    dirs = dirNode;
+
+    auto dir = sd.open(dirPath.c_str());
+    if (!dir || !dir.isDirectory()) {
+      if (dir) dir.close();
+      continue;
+    }
+
+    int iterations = 0;
+    auto file = dir.openNextFile();
+    while (file && iterations++ < kMaxEntries) {
+      file.getName(name, sizeof(name));
+      if (name[0] == '\0' || (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))) {
+        file.close();
+        file = dir.openNextFile();
+        continue;
+      }
+
+      String filePath = dirPath;
+      if (!filePath.endsWith("/")) filePath += "/";
+      filePath += name;
+
+      const bool isDir = file.isDirectory();
+      file.close();
+
+      if (isDir) {
+        auto* node = new (std::nothrow) Node{std::move(filePath), stack};
+        if (!node) {
+          dir.close();
+          freeList(dirs);
+          freeList(stack);
+          return false;
+        }
+        stack = node;
+      } else {
+        if (!sd.remove(filePath.c_str())) allOk = false;
+        deleted++;
+        if ((deleted % 10) == 0) {
+          delay(1);
+          if (progress) progress(deleted);
+        }
+      }
+
+      file = dir.openNextFile();
+    }
+    dir.close();
   }
 
-  dir.close();
-  return sd.rmdir(path);
+  if (progress) progress(deleted);
+
+  while (dirs) {
+    if (!sd.rmdir(dirs->path.c_str())) allOk = false;
+    auto* n = dirs->next;
+    delete dirs;
+    dirs = n;
+  }
+
+  return allOk;
 }

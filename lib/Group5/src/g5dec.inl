@@ -53,16 +53,29 @@ static const uint8_t code_table[128]  =
          0x11, 3, 0x11, 3, 0x11, 3, 0x11, 3,
          0x11, 3, 0x11, 3, 0x11, 3, 0x11, 3};
 
+static uint32_t G5ReadWord(const G5DECIMAGE *pImage, size_t offset)
+{
+    uint32_t bits = 0;
+    for (size_t i = 0; i < sizeof(bits); ++i) {
+        bits <<= 8;
+        if (offset < static_cast<size_t>(pImage->iVLCSize)) {
+            bits |= pImage->pSrc[offset];
+        }
+        offset++;
+    }
+    return bits;
+}
+
 static int g5_decode_init(G5DECIMAGE *pImage, int iWidth, int iHeight, uint8_t *pData, int iDataSize)
 {
-    if (pImage == NULL || iWidth < 1 || iHeight < 1 || pData == NULL || iDataSize < 1)
+    if (pImage == NULL || iWidth < 1 || iWidth > INT16_MAX || iHeight < 1 || pData == NULL || iDataSize < 1)
         return G5_INVALID_PARAMETER;
     
     pImage->iVLCSize = iDataSize;
     pImage->pSrc = pData;
     pImage->ulBitOff = 0;
     pImage->y = 0;
-    pImage->ulBits = TIFFMOTOLONG(pData); // preload the first 32 bits of data
+    pImage->ulBits = G5ReadWord(pImage, 0); // preload the first 32 bits of data
     pImage->iWidth = iWidth;
     pImage->iHeight = iHeight;
     return G5_SUCCESS;
@@ -100,8 +113,8 @@ static void G5DrawLine(G5DECIMAGE *pPage, int16_t *pCurFlips, uint8_t *pOut)
             }
             /* Draw this run */
             lBit = 0xff << (8 - (x & 7));
-            rBit = 0xff >> ((x + run) & 7);
-            len = ((x+run)>>3) - (x >> 3);
+            rBit = ((x + run) & 7) == 0 ? 0 : 0xff >> ((x + run) & 7);
+            len = ((x + run - 1)>>3) - (x >> 3);
             p = &pDest[x >> 3];
             if (len == 0) {
                 lBit |= rBit;
@@ -144,7 +157,7 @@ static void Decode_Begin(G5DECIMAGE *pPage)
     pPage->pCur = CurFlips;
     pPage->pRef = RefFlips;
     pPage->pBuf = pPage->pSrc;
-    pPage->ulBits = TIFFMOTOLONG(pPage->pSrc); // load 32 bits to start
+    pPage->ulBits = G5ReadWord(pPage, 0); // load 32 bits to start
     pPage->ulBitOff = 0;
     // Calculate the number of bits needed for a long horizontal code
 #ifdef __AVR__
@@ -164,27 +177,50 @@ static int DecodeLine(G5DECIMAGE *pPage)
     int32_t sCode;
     uint32_t lBits;
     uint32_t ulBits, ulBitOff;
-    uint8_t *pBuf/*, *pBufEnd*/;
+    uint8_t *pBuf, *pBufEnd;
     uint32_t u32HMask, u32HLen; // horizontal code mask and length
 
     pCur = CurFlips = pPage->pCur;
     pRef = RefFlips = pPage->pRef;
+    int16_t *pCurEnd = CurFlips + MAX_IMAGE_FLIPS;
+    int16_t *pRefEnd = RefFlips + MAX_IMAGE_FLIPS;
     ulBits = pPage->ulBits;
     ulBitOff = pPage->ulBitOff;
     pBuf = pPage->pBuf;
-    // pBufEnd = &pPage->pSrc[pPage->iVLCSize];
+    pBufEnd = &pPage->pSrc[pPage->iVLCSize];
     u32HLen = pPage->iHLen;
     u32HMask = (1 << u32HLen) - 1;
     a0 = -1;
     xsize = pPage->iWidth;
-    
+
+#define G5_ENSURE_BITS(count)                                                                        \
+    do {                                                                                              \
+        if (ulBitOff > REGISTER_WIDTH - (count)) {                                                   \
+            pBuf += ulBitOff >> 3;                                                                    \
+            ulBitOff &= 7;                                                                            \
+            if (pBuf >= pBufEnd) {                                                                    \
+                pPage->iError = G5_DECODE_ERROR;                                                     \
+                goto pilreadg5z;                                                                      \
+            }                                                                                         \
+            ulBits = G5ReadWord(pPage, static_cast<size_t>(pBuf - pPage->pSrc));                     \
+        }                                                                                              \
+    } while (false)
+
     while (a0 < xsize) {  /* Decode this line */
         if (ulBitOff > (REGISTER_WIDTH-8)) { // need at least 7 unused bits
             pBuf += (ulBitOff >> 3);
             ulBitOff &= 7;
-            ulBits = TIFFMOTOLONG(pBuf);
+            if (pBuf >= pBufEnd) {
+                pPage->iError = G5_DECODE_ERROR;
+                goto pilreadg5z;
+            }
+            ulBits = G5ReadWord(pPage, static_cast<size_t>(pBuf - pPage->pSrc));
         }
         if ((int32_t)(ulBits << ulBitOff) < 0) { /* V(0) code is the most frequent case (1 bit) */
+            if (pRef >= pRefEnd || pCur >= pCurEnd - 2) {
+                pPage->iError = G5_DECODE_ERROR;
+                goto pilreadg5z;
+            }
             a0 = *pRef++;
             ulBitOff++; // length = 1 bit
             *pCur++ = a0;
@@ -196,13 +232,30 @@ static int DecodeLine(G5DECIMAGE *pPage)
                 case 1: /* V(-1) */
                 case 2: /* V(-2) */
                 case 3: /* V(-3) */
+                    if (pRef >= pRefEnd || pCur >= pCurEnd - 2) {
+                        pPage->iError = G5_DECODE_ERROR;
+                        goto pilreadg5z;
+                    }
                     a0 = *pRef - sCode;  /* A0 = B1 - x */
                     *pCur++ = a0;
                     if (pRef == RefFlips) {
+                        if (pRef > pRefEnd - 2) {
+                            pPage->iError = G5_DECODE_ERROR;
+                            goto pilreadg5z;
+                        }
                         pRef += 2;
                     }
                     pRef--;
-                    while (a0 >= *pRef) {
+                    while (true) {
+                        if (pRef >= pRefEnd) {
+                            pPage->iError = G5_DECODE_ERROR;
+                            goto pilreadg5z;
+                        }
+                        if (a0 < *pRef) break;
+                        if (pRef > pRefEnd - 2) {
+                            pPage->iError = G5_DECODE_ERROR;
+                            goto pilreadg5z;
+                        }
                         pRef += 2;
                     }
                     break;
@@ -210,11 +263,24 @@ static int DecodeLine(G5DECIMAGE *pPage)
                 case 0x11: /* V(1) */
                 case 0x12: /* V(2) */
                 case 0x13: /* V(3) */
+                    if (pRef >= pRefEnd || pCur >= pCurEnd - 2) {
+                        pPage->iError = G5_DECODE_ERROR;
+                        goto pilreadg5z;
+                    }
                     a0 = *pRef++;   /* A0 = B1 */
                     b1 = a0;
                     a0 += sCode & 7;      /* A0 = B1 + x */
                     if (b1 != xsize && a0 < xsize) {
-                        while (a0 >= *pRef) {
+                        while (true) {
+                            if (pRef >= pRefEnd) {
+                                pPage->iError = G5_DECODE_ERROR;
+                                goto pilreadg5z;
+                            }
+                            if (a0 < *pRef) break;
+                            if (pRef > pRefEnd - 2) {
+                                pPage->iError = G5_DECODE_ERROR;
+                                goto pilreadg5z;
+                            }
                             pRef += 2;
                         }
                     }
@@ -228,12 +294,17 @@ static int DecodeLine(G5DECIMAGE *pPage)
                     if (ulBitOff > (REGISTER_WIDTH-16)) { // need at least 16 unused bits
                         pBuf += (ulBitOff >> 3);
                         ulBitOff &= 7;
-                        ulBits = TIFFMOTOLONG(pBuf);
+                        if (pBuf >= pBufEnd) {
+                            pPage->iError = G5_DECODE_ERROR;
+                            goto pilreadg5z;
+                        }
+                        ulBits = G5ReadWord(pPage, static_cast<size_t>(pBuf - pPage->pSrc));
                     }
                     a0_p = a0;
                     if (a0 < 0) {
                         a0_p = 0;
                     }
+                    G5_ENSURE_BITS(2);
                     lBits = (ulBits >> ((REGISTER_WIDTH - 2) - ulBitOff)) & 0x3; // get 2-bit prefix for code type
                     // There are 4 possible horizontal cases: short/short, short/long, long/short, long/long
                     // These are encoded in a 2-bit prefix code, followed by 3 bits for short or N bits for long code
@@ -241,47 +312,75 @@ static int DecodeLine(G5DECIMAGE *pPage)
                     ulBitOff += 2;
                     switch (lBits) {
                         case HORIZ_SHORT_SHORT:
+                            G5_ENSURE_BITS(3);
                             tot_run = (ulBits >> ((REGISTER_WIDTH - 3) - ulBitOff)) & 0x7; // get 3-bit short length
                             ulBitOff += 3;
+                            G5_ENSURE_BITS(3);
                             tot_run1 = (ulBits >> ((REGISTER_WIDTH - 3) - ulBitOff)) & 0x7; // get 3-bit short length
                             ulBitOff += 3;
                             break;
                         case HORIZ_SHORT_LONG:
+                            G5_ENSURE_BITS(3);
                             tot_run = (ulBits >> ((REGISTER_WIDTH - 3) - ulBitOff)) & 0x7; // get 3-bit short length
                             ulBitOff += 3;
+                            G5_ENSURE_BITS(u32HLen);
                             tot_run1 = (ulBits >> ((REGISTER_WIDTH - u32HLen) - ulBitOff)) & u32HMask; // get long length
                             ulBitOff += u32HLen;
                             break;
                         case HORIZ_LONG_SHORT:
+                            G5_ENSURE_BITS(u32HLen);
                             tot_run = (ulBits >> ((REGISTER_WIDTH - u32HLen) - ulBitOff)) & u32HMask; // get long length
                             ulBitOff += u32HLen;
+                            G5_ENSURE_BITS(3);
                             tot_run1 = (ulBits >> ((REGISTER_WIDTH - 3) - ulBitOff)) & 0x7; // get 3-bit short length
                             ulBitOff += 3;
                             break;
                         case HORIZ_LONG_LONG:
+                            G5_ENSURE_BITS(u32HLen);
                             tot_run = (ulBits >> ((REGISTER_WIDTH - u32HLen) - ulBitOff)) & u32HMask; // get long length
                             ulBitOff += u32HLen;
-                            if (ulBitOff > (REGISTER_WIDTH-16)) { // need at least 16 unused bits
-                                pBuf += (ulBitOff >> 3);
-                                ulBitOff &= 7;
-                                ulBits = TIFFMOTOLONG(pBuf);
-                            }
+                            G5_ENSURE_BITS(u32HLen);
                             tot_run1 = (ulBits >> ((REGISTER_WIDTH - u32HLen) - ulBitOff)) & u32HMask; // get long length
                             ulBitOff += u32HLen;
                             break;
                     } // switch on lBits
                     a0 = a0_p + tot_run;
+                    if (a0 > xsize || pCur >= pCurEnd - 2) {
+                        pPage->iError = G5_DECODE_ERROR;
+                        goto pilreadg5z;
+                    }
                     *pCur++ = a0;
                     a0 += tot_run1;
+                    if (a0 > xsize) {
+                        pPage->iError = G5_DECODE_ERROR;
+                        goto pilreadg5z;
+                    }
                     if (a0 < xsize) {
-                        while (a0 >= *pRef) {
+                        while (true) {
+                            if (pRef >= pRefEnd) {
+                                pPage->iError = G5_DECODE_ERROR;
+                                goto pilreadg5z;
+                            }
+                            if (a0 < *pRef) break;
+                            if (pRef > pRefEnd - 2) {
+                                pPage->iError = G5_DECODE_ERROR;
+                                goto pilreadg5z;
+                            }
                             pRef += 2;
                         }
+                    }
+                    if (pCur >= pCurEnd - 2) {
+                        pPage->iError = G5_DECODE_ERROR;
+                        goto pilreadg5z;
                     }
                     *pCur++ = a0;
                     break;
 
                 case 0x30: /* Pass code */
+                    if (pRef >= pRefEnd - 1) {
+                        pPage->iError = G5_DECODE_ERROR;
+                        goto pilreadg5z;
+                    }
                     pRef++;         /* A0 = B2, iRef+=2 */
                     a0 = *pRef++;
                 break;
@@ -293,14 +392,19 @@ static int DecodeLine(G5DECIMAGE *pPage)
           } /* Slow climb */
        }
     /*--- Convert flips data into run lengths ---*/
-    *pCur++ = xsize;  /* Terminate the line properly */
-    *pCur++ = xsize;
+    if (pCur <= pCurEnd - 2) {
+        *pCur++ = xsize;  /* Terminate the line properly */
+        *pCur++ = xsize;
+    } else {
+        pPage->iError = G5_DECODE_ERROR;
+    }
 pilreadg5z:
     // Save the current VLC decoder state
     pPage->ulBits = ulBits;
     pPage->ulBitOff = ulBitOff;
     pPage->pBuf = pBuf;
     return pPage->iError;
+#undef G5_ENSURE_BITS
 } /* DecodeLine() */
 //
 // Decompress the VLC data
@@ -344,4 +448,3 @@ static int g5_decode_line(G5DECIMAGE *pPage, uint8_t *pOut)
    }
     return pPage->iError;
 } /* Decode() */
-

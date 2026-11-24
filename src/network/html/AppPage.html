@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Papyrix Reader</title>
+  <title>PapyriX Reader</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#111827;color:#e5e7eb;min-height:100vh;display:flex;flex-direction:column}
@@ -93,7 +93,7 @@
 </head>
 <body>
 <header>
-  <div><h1>Papyrix</h1></div>
+  <div><h1>PapyriX</h1></div>
   <span class="ver" id="hdr-version"></span>
 </header>
 
@@ -102,6 +102,8 @@
   <button data-tab="sleep">Sleep</button>
   <button data-tab="fonts">Fonts</button>
   <button data-tab="themes">Themes</button>
+  <button data-tab="locale">Locale</button>
+  <button data-tab="firmware">Firmware</button>
 </nav>
 
 <div class="container">
@@ -149,6 +151,28 @@
       </div>
     </div>
     <div class="card"><div id="themes-table"><div class="loader-wrap"><div class="loader"></div></div></div></div>
+  </div>
+
+  <!-- Locale Panel -->
+  <div class="panel" id="panel-locale">
+    <div class="toolbar">
+      <div class="toolbar-left"><span class="info-text">Language locale file (.txt). Restart device after changes.</span></div>
+      <div class="toolbar-right">
+        <button class="btn btn-accent" onclick="openLocaleUpload()">Upload</button>
+      </div>
+    </div>
+    <div class="card"><div id="locale-card" style="padding:20px"><div class="loader-wrap"><div class="loader"></div></div></div></div>
+  </div>
+
+  <!-- Firmware Panel -->
+  <div class="panel" id="panel-firmware">
+    <div class="toolbar">
+      <div class="toolbar-left"><span class="info-text">Firmware binary (.bin). Go to Settings > Firmware Update to flash after upload.</span></div>
+      <div class="toolbar-right">
+        <button class="btn btn-accent" onclick="openFirmwareUpload()">Upload</button>
+      </div>
+    </div>
+    <div class="card"><div id="firmware-card" style="padding:20px"><div class="loader-wrap"><div class="loader"></div></div></div></div>
   </div>
 </div>
 
@@ -204,7 +228,37 @@
   </div>
 </div>
 
-<footer><a href="https://github.com/bigbag/papyrix-reader">Papyrix Reader</a></footer>
+<!-- Locale Upload Modal -->
+<div class="overlay" id="localeUploadModal">
+  <div class="modal">
+    <button class="modal-x" onclick="closeModal('localeUploadModal')">&times;</button>
+    <h3>Upload Locale File</h3>
+    <label>Select a .txt locale file</label>
+    <input type="file" id="localeFileInput" accept=".txt" onchange="onLocaleFileSelected()">
+    <button class="btn btn-accent" id="localeUploadBtn" onclick="doLocaleUpload()" disabled>Upload</button>
+    <div class="progress-wrap" id="localeProgress">
+      <div class="progress-bar"><div class="progress-fill" id="localeFill"></div></div>
+      <div class="progress-text" id="localeText"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Firmware Upload Modal -->
+<div class="overlay" id="firmwareUploadModal">
+  <div class="modal">
+    <button class="modal-x" onclick="closeModal('firmwareUploadModal')">&times;</button>
+    <h3>Upload Firmware File</h3>
+    <label>Select a .bin firmware file</label>
+    <input type="file" id="firmwareFileInput" accept=".bin" onchange="onFirmwareFileSelected()">
+    <button class="btn btn-accent" id="firmwareUploadBtn" onclick="doFirmwareUpload()" disabled>Upload</button>
+    <div class="progress-wrap" id="firmwareProgress">
+      <div class="progress-bar"><div class="progress-fill" id="firmwareFill"></div></div>
+      <div class="progress-text" id="firmwareText"></div>
+    </div>
+  </div>
+</div>
+
+<footer><a href="https://github.com/bigbag/papyrix-reader">PapyriX Reader</a></footer>
 
 <script>
 var activeTab = 'books';
@@ -223,6 +277,30 @@ function fmtSize(b){if(!b)return'0 B';var k=1024,u=['B','KB','MB','GB'];var i=Ma
 function post(url,params){return new Promise(function(ok,fail){var fd=new FormData();for(var k in params)fd.append(k,params[k]);var x=new XMLHttpRequest();x.open('POST',url,true);x.onload=function(){x.status<300?ok(x.responseText):fail(x.responseText)};x.onerror=function(){fail('Network error')};x.send(fd)})}
 function getPath(tab){return tab==='books'?booksPath:tab==='fonts'?fontsPath:TAB_CFG[tab].base}
 
+function isUnsupportedCjk(cp){
+  return(cp>=0x4E00&&cp<=0x9FFF)||(cp>=0x3400&&cp<=0x4DBF)||
+    (cp>=0xF900&&cp<=0xFAFF)||(cp>=0x3040&&cp<=0x309F)||
+    (cp>=0x30A0&&cp<=0x30FF)||(cp>=0xAC00&&cp<=0xD7AF)||
+    (cp>=0x20000&&cp<=0x2A6DF)||(cp>=0xFF00&&cp<=0xFFEF);
+}
+
+function validateFileName(name){
+  var normalized=name.normalize?name.normalize('NFC'):name;
+  if(!normalized)return{name:normalized,error:'Enter a name'};
+  if(/[\x00-\x1F"*\/:<>?\\|]/.test(normalized)||normalized.charAt(0)==='.'){
+    return{name:normalized,error:'Invalid characters in name'};
+  }
+  for(var ch of normalized){
+    if(isUnsupportedCjk(ch.codePointAt(0))){
+      return{name:normalized,error:'CJK filenames are not supported'};
+    }
+  }
+  if(new TextEncoder().encode(normalized).length>255){
+    return{name:normalized,error:'Name is too long'};
+  }
+  return{name:normalized,error:''};
+}
+
 // --- Tabs ---
 document.getElementById('tabs').addEventListener('click',function(e){
   if(e.target.tagName==='BUTTON'&&e.target.dataset.tab){switchTab(e.target.dataset.tab)}
@@ -234,7 +312,7 @@ function switchTab(tab){
   fontsPath='/config/fonts';
   document.querySelectorAll('#tabs button').forEach(function(b){b.classList.toggle('active',b.dataset.tab===tab)});
   document.querySelectorAll('.panel').forEach(function(p){p.classList.toggle('active',p.id==='panel-'+tab)});
-  loadTabData(tab);
+  if(tab==='locale'){loadLocale()}else if(tab==='firmware'){loadFirmware()}else{loadTabData(tab)}
 }
 
 // --- Data Loading ---
@@ -426,6 +504,12 @@ function doUpload(){
     }
   }
 
+  var checked=validateFileName(file.name);
+  if(checked.error){alert(checked.error);return}
+  if(checked.name!==file.name){
+    file=new File([file],checked.name,{type:file.type});
+  }
+
   var btn=document.getElementById('uploadBtn');
   var pw=document.getElementById('uploadProgress');
   var pf=document.getElementById('uploadFill');
@@ -467,8 +551,9 @@ function openFolder(tab){
 
 function doCreateFolder(){
   var name=document.getElementById('folderNameInput').value.trim();
-  if(!name){alert('Enter a folder name');return}
-  if(!/^[a-zA-Z0-9_\-. ]+$/.test(name)){alert('Invalid characters in name');return}
+  var checked=validateFileName(name);
+  if(checked.error){alert(checked.error);return}
+  name=checked.name;
   var path=getPath(folderForTab);
 
   var prep=(folderForTab==='fonts')?ensureDirectory(path):Promise.resolve();
@@ -492,8 +577,9 @@ function openRename(name,path){
 function doRename(){
   var path=document.getElementById('renamePath').value;
   var newName=document.getElementById('renameInput').value.trim();
-  if(!newName){alert('Enter a name');return}
-  if(newName.indexOf('/')!==-1||newName.indexOf('..')!==-1){alert('Invalid name');return}
+  var checked=validateFileName(newName);
+  if(checked.error){alert(checked.error);return}
+  newName=checked.name;
   post('/rename',{path:path,newName:newName}).then(function(){
     closeModal('renameModal');loadTabData(activeTab);
   }).catch(function(err){alert('Error: '+err)});
@@ -513,6 +599,156 @@ function doDelete(){
   post('/delete',{path:path,type:type}).then(function(){
     closeModal('deleteModal');loadTabData(activeTab);
   }).catch(function(err){alert('Error: '+err)});
+}
+
+// --- Locale ---
+function loadLocale(){
+  var el=document.getElementById('locale-card');
+  el.textContent='';
+  var lw=document.createElement('div');lw.className='loader-wrap';
+  var ld=document.createElement('div');ld.className='loader';
+  lw.appendChild(ld);el.appendChild(lw);
+  fetch('/api/locale').then(function(r){return r.json()}).then(function(d){
+    el.textContent='';
+    if(d.exists){
+      var lbl=document.createElement('span');lbl.style.cssText='color:#9ca3af;font-size:.85em';lbl.textContent='Current language:';
+      var name=document.createElement('div');name.style.cssText='color:#f3f4f6;font-size:1.1em;font-weight:600;margin:4px 0 12px';name.textContent=d.language||'Unknown';
+      var info=document.createElement('div');info.style.cssText='color:#9ca3af;font-size:.85em;margin-bottom:16px';info.textContent='File: locale.txt ('+fmtSize(d.size)+')';
+      var del=document.createElement('button');del.className='btn btn-danger';del.textContent='Delete';del.onclick=doLocaleDelete;
+      var hint=document.createElement('div');hint.style.cssText='color:#6b7280;font-size:.8em;margin-top:12px;font-style:italic';hint.textContent='Restart device after changes to apply new language.';
+      el.appendChild(lbl);el.appendChild(name);el.appendChild(info);el.appendChild(del);el.appendChild(hint);
+    } else {
+      var w=document.createElement('div');w.style.cssText='color:#9ca3af;text-align:center;padding:20px';
+      var t1=document.createElement('div');t1.style.cssText='font-size:1.1em;margin-bottom:8px';t1.textContent='No locale file installed';
+      var t2=document.createElement('div');t2.style.fontSize='.85em';t2.textContent='Using default language: English';
+      var t3=document.createElement('div');t3.style.cssText='font-size:.8em;margin-top:8px';t3.textContent='Upload a .txt locale file to change the device language.';
+      w.appendChild(t1);w.appendChild(t2);w.appendChild(t3);el.appendChild(w);
+    }
+  }).catch(function(){
+    el.textContent='';
+    var em=document.createElement('div');em.className='empty';em.textContent='Failed to load locale status';
+    el.appendChild(em);
+  });
+}
+
+function openLocaleUpload(){
+  document.getElementById('localeFileInput').value='';
+  document.getElementById('localeUploadBtn').disabled=true;
+  document.getElementById('localeProgress').style.display='none';
+  document.getElementById('localeFill').style.width='0%';
+  document.getElementById('localeFill').style.background='#7c3aed';
+  document.getElementById('localeText').textContent='';
+  document.getElementById('localeUploadModal').classList.add('open');
+}
+
+function onLocaleFileSelected(){
+  var f=document.getElementById('localeFileInput').files[0];
+  document.getElementById('localeUploadBtn').disabled=!f;
+}
+
+function doLocaleUpload(){
+  var inp=document.getElementById('localeFileInput');
+  var file=inp.files[0];
+  if(!file)return;
+  var btn=document.getElementById('localeUploadBtn');
+  var pw=document.getElementById('localeProgress');
+  var pf=document.getElementById('localeFill');
+  var pt=document.getElementById('localeText');
+  btn.disabled=true;
+  pw.style.display='block';
+  pt.textContent='Uploading...';
+  var fd=new FormData();
+  fd.append('file',file);
+  var xhr=new XMLHttpRequest();
+  xhr.open('POST','/api/locale',true);
+  xhr.upload.onprogress=function(e){
+    if(e.lengthComputable){var pct=Math.round(e.loaded/e.total*100);pf.style.width=pct+'%';pt.textContent='Uploading: '+pct+'%'}
+  };
+  xhr.onload=function(){
+    if(xhr.status===200){pt.textContent='Done! Restart device to apply.';setTimeout(function(){closeModal('localeUploadModal');loadLocale()},1500)}
+    else{pt.textContent='Error: '+xhr.responseText;pf.style.background='#991b1b';btn.disabled=false}
+  };
+  xhr.onerror=function(){pt.textContent='Network error';pf.style.background='#991b1b';btn.disabled=false};
+  xhr.send(fd);
+}
+
+function doLocaleDelete(){
+  if(!confirm('Delete locale file and revert to English?'))return;
+  fetch('/api/locale-delete',{method:'POST'}).then(function(r){if(r.ok){loadLocale()}else{r.text().then(function(t){alert('Error: '+t)})}}).catch(function(err){alert('Error: '+err)});
+}
+
+// --- Firmware ---
+function loadFirmware(){
+  var el=document.getElementById('firmware-card');
+  el.textContent='';
+  var lw=document.createElement('div');lw.className='loader-wrap';
+  var ld=document.createElement('div');ld.className='loader';
+  lw.appendChild(ld);el.appendChild(lw);
+  fetch('/api/firmware').then(function(r){return r.json()}).then(function(d){
+    el.textContent='';
+    if(d.exists){
+      var lbl=document.createElement('span');lbl.style.cssText='color:#9ca3af;font-size:.85em';lbl.textContent='Firmware file ready:';
+      var name=document.createElement('div');name.style.cssText='color:#f3f4f6;font-size:1.1em;font-weight:600;margin:4px 0 12px';name.textContent='firmware.bin ('+fmtSize(d.size)+')';
+      var del=document.createElement('button');del.className='btn btn-danger';del.textContent='Delete';del.onclick=doFirmwareDelete;
+      var hint=document.createElement('div');hint.style.cssText='color:#6b7280;font-size:.8em;margin-top:12px;font-style:italic';hint.textContent='Go to Settings > Firmware Update on the device to flash.';
+      el.appendChild(lbl);el.appendChild(name);el.appendChild(del);el.appendChild(hint);
+    } else {
+      var w=document.createElement('div');w.style.cssText='color:#9ca3af;text-align:center;padding:20px';
+      var t1=document.createElement('div');t1.style.cssText='font-size:1.1em;margin-bottom:8px';t1.textContent='No firmware file';
+      var t2=document.createElement('div');t2.style.fontSize='.85em';t2.textContent='Upload a firmware.bin file, then flash it from the device.';
+      w.appendChild(t1);w.appendChild(t2);el.appendChild(w);
+    }
+  }).catch(function(){
+    el.textContent='';
+    var em=document.createElement('div');em.className='empty';em.textContent='Failed to load firmware status';
+    el.appendChild(em);
+  });
+}
+
+function openFirmwareUpload(){
+  document.getElementById('firmwareFileInput').value='';
+  document.getElementById('firmwareUploadBtn').disabled=true;
+  document.getElementById('firmwareProgress').style.display='none';
+  document.getElementById('firmwareFill').style.width='0%';
+  document.getElementById('firmwareFill').style.background='#7c3aed';
+  document.getElementById('firmwareText').textContent='';
+  document.getElementById('firmwareUploadModal').classList.add('open');
+}
+
+function onFirmwareFileSelected(){
+  var f=document.getElementById('firmwareFileInput').files[0];
+  document.getElementById('firmwareUploadBtn').disabled=!f;
+}
+
+function doFirmwareUpload(){
+  var inp=document.getElementById('firmwareFileInput');
+  var file=inp.files[0];
+  if(!file)return;
+  var btn=document.getElementById('firmwareUploadBtn');
+  var pw=document.getElementById('firmwareProgress');
+  var pf=document.getElementById('firmwareFill');
+  var pt=document.getElementById('firmwareText');
+  btn.disabled=true;
+  pw.style.display='block';
+  pt.textContent='Uploading...';
+  var fd=new FormData();
+  fd.append('file',file);
+  var xhr=new XMLHttpRequest();
+  xhr.open('POST','/api/firmware',true);
+  xhr.upload.onprogress=function(e){
+    if(e.lengthComputable){var pct=Math.round(e.loaded/e.total*100);pf.style.width=pct+'%';pt.textContent='Uploading: '+pct+'%'}
+  };
+  xhr.onload=function(){
+    if(xhr.status===200){pt.textContent='Done!';setTimeout(function(){closeModal('firmwareUploadModal');loadFirmware()},800)}
+    else{pt.textContent='Error: '+xhr.responseText;pf.style.background='#991b1b';btn.disabled=false}
+  };
+  xhr.onerror=function(){pt.textContent='Network error';pf.style.background='#991b1b';btn.disabled=false};
+  xhr.send(fd);
+}
+
+function doFirmwareDelete(){
+  if(!confirm('Delete firmware.bin from SD card?'))return;
+  fetch('/api/firmware-delete',{method:'POST'}).then(function(r){if(r.ok){loadFirmware()}else{r.text().then(function(t){alert('Error: '+t)})}}).catch(function(err){alert('Error: '+err)});
 }
 
 // --- Init ---

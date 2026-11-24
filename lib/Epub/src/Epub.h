@@ -1,49 +1,65 @@
 #pragma once
 
+#include <HomeThumbnail.h>
 #include <Print.h>
 
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "Epub/BookMetadataCache.h"
 #include "Epub/css/CssParser.h"
 
+class BuildArena;
 class ZipFile;
 
 class Epub {
-  // the ncx file (EPUB 2)
-  std::string tocNcxItem;
-  // the nav file (EPUB 3)
-  std::string tocNavItem;
-  // where is the EPUBfile?
-  std::string filepath;
-  // the base path for items in the EPUB file
-  std::string contentBasePath;
-  // Uniq cache key based on filepath
-  std::string cachePath;
-  // Spine and TOC cache
-  std::unique_ptr<BookMetadataCache> bookMetadataCache;
-  // CSS parser for stylesheet rules
-  std::unique_ptr<CssParser> cssParser_;
-  // CSS file paths from manifest
-  std::vector<std::string> cssFiles_;
+ public:
+  static constexpr size_t MIN_CACHED_CHAPTER_SIZE = 64 * 1024;
+  static constexpr size_t MIN_HEAP_FOR_PREPARE = 48 * 1024;
 
-  bool findContentOpfFile(std::string* contentOpfFile) const;
-  bool parseCssFiles();
-  bool parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata);
+ private:
+  std::string tocNcxItem;
+  std::string tocNavItem;
+  std::string filepath;
+  std::string contentBasePath;
+  std::string cachePath;
+  std::unique_ptr<BookMetadataCache> bookMetadataCache;
+  std::unique_ptr<CssParser> cssParser_;
+  std::vector<std::string> cssFiles_;
+  bool cssFilesKnown_ = false;
+  uint32_t cssFingerprint_ = 0;
+
+  bool findContentOpfFile(std::string* contentOpfFile, uint8_t* decompressBuffer = nullptr,
+                          BuildArena* scratch = nullptr, const std::function<bool()>& shouldAbort = {}) const;
+  bool parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata, bool metadataOnly = false,
+                       uint8_t* decompressBuffer = nullptr, BuildArena* scratch = nullptr,
+                       const std::function<bool()>& shouldAbort = {});
   bool parseTocNcxFile() const;
   bool parseTocNavFile() const;
+  bool parseTocCandidates();
+  void maybeRecoverLostToc();
+  void recoverLostToc();
+
+  home_thumbnail::Result extractCoverSource(const std::string& itemHref,
+                                            const std::function<bool()>& shouldAbort) const;
+  bool generateCoverFromItem(const std::string& itemHref, bool use1BitDithering,
+                             const std::function<bool()>& shouldAbort) const;
 
  public:
   explicit Epub(std::string filepath, const std::string& cacheDir) : filepath(std::move(filepath)) {
-    // create a cache key based on the filepath
     cachePath = cacheDir + "/epub_" + std::to_string(std::hash<std::string>{}(this->filepath));
   }
   ~Epub() = default;
   std::string& getBasePath() { return contentBasePath; }
   bool load(bool buildIfMissing = true);
+  bool loadMetadataOnly();
+  bool prepareChapterHtml(int spineIndex, uint32_t sourceFingerprint, std::string& preparedPath,
+                          uint8_t* decompressBuffer, BuildArena* scratch, const std::function<bool()>& shouldAbort);
+  bool prepareCssStyles(uint32_t sourceFingerprint, uint8_t* decompressBuffer = nullptr, BuildArena* scratch = nullptr,
+                        const std::function<bool()>& shouldAbort = {});
   bool clearCache() const;
   void setupCacheDir() const;
   const std::string& getCachePath() const;
@@ -52,19 +68,18 @@ class Epub {
   const std::string& getAuthor() const;
   const std::string& getLanguage() const;
   std::string getCoverBmpPath() const;
-  std::string getCoverPreviewBmpPath() const;
-  bool generateCoverBmp(bool use1BitDithering = false) const;
-  bool generateCoverPreviewBmp() const;
-  std::string getThumbBmpPath() const;
-  bool generateThumbBmp() const;
-  std::string findCoverImage() const;
+  bool generateCoverBmp(bool use1BitDithering = false, const std::function<bool()>& shouldAbort = nullptr) const;
+  std::string findCoverImage(const std::function<bool()>& shouldAbort = nullptr) const;
   uint8_t* readItemContentsToBytes(const std::string& itemHref, size_t* size = nullptr,
                                    bool trailingNullByte = false) const;
   bool readItemContentsToStream(const std::string& itemHref, Print& out, size_t chunkSize,
-                                uint8_t* dictBuffer = nullptr) const;
+                                uint8_t* dictBuffer = nullptr, BuildArena* scratch = nullptr,
+                                const std::function<bool()>& shouldAbort = nullptr) const;
   bool getItemSize(const std::string& itemHref, size_t* size) const;
+  bool getSpineItemSizes(std::vector<size_t>& sizes) const;
   BookMetadataCache::SpineEntry getSpineItem(int spineIndex) const;
   BookMetadataCache::TocEntry getTocItem(int tocIndex) const;
+  bool getTocItems(std::vector<BookMetadataCache::TocEntry>& entries, int maxCount) const;
   int getSpineItemsCount() const;
   int getTocItemsCount() const;
   int getSpineIndexForTocIndex(int tocIndex) const;

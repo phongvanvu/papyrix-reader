@@ -2,11 +2,15 @@
 
 #include <Arduino.h>
 #include <GfxRenderer.h>
+#include <I18n.h>
 #include <Logging.h>
 
 #include <cstring>
 
+#include "../core/BootMode.h"
 #include "../core/Core.h"
+#include "../core/EmergencyBootTransition.h"
+#include "../ui/WrappedText.h"
 #include "ThemeManager.h"
 
 #define TAG "ERROR"
@@ -45,7 +49,22 @@ StateTransition ErrorState::update(Core& core) {
   Event e;
   while (core.events.pop(e)) {
     if (e.type == EventType::ButtonPress) {
-      // Any button press goes back to file list
+      if ((!core.display.isInitialized() || !core.display.lastRefreshSucceeded()) &&
+          core.display.recover() != hal::Display::InitResult::Ok) {
+        needsRender_ = true;
+        return StateTransition::stay(StateId::Error);
+      }
+      // In Reader boot mode, FileList isn't a registered state — the only way
+      // back is to reboot into UI mode. Mirrors ReaderState's exit pattern.
+      if (core.bootMode == BootMode::READER) {
+        LOG_INF(TAG, "Reader-mode error dismissed — rebooting to UI");
+        showTransitionNotification(tr(RETURNING_TO_LIBRARY));
+        // RTC first: settings save needs SD writes and fails on a full card.
+        saveEmergencyUiTransition(ReturnTo::FILE_MANAGER);
+        saveTransition(BootMode::UI, nullptr, ReturnTo::FILE_MANAGER);
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+        ESP.restart();
+      }
       return StateTransition::to(StateId::FileList);
     }
   }
@@ -57,23 +76,24 @@ void ErrorState::render(Core& core) {
   if (!needsRender_) {
     return;
   }
+  if (!core.display.isInitialized() || !core.display.getFrameBuffer()) return;
 
   const Theme& theme = THEME_MANAGER.current();
 
   renderer_.clearScreen(theme.backgroundColor);
 
   // Error title
-  renderer_.drawCenteredText(theme.readerFontId, 100, "Error", theme.primaryTextBlack, BOLD);
+  renderer_.drawCenteredText(theme.readerFontId, 100, tr(ERROR), theme.primaryTextBlack, BOLD);
 
   // Error message
-  renderer_.drawCenteredText(theme.uiFontId, 200, message_, theme.primaryTextBlack, REGULAR);
+  const int maxTextWidth = renderer_.getScreenWidth() - 2 * (theme.screenMarginSide + theme.itemPaddingX);
+  ui::centeredTextWrapped(renderer_, theme.uiFontId, 200, message_, maxTextWidth, 3, theme.primaryTextBlack);
 
   // Instructions
-  renderer_.drawCenteredText(theme.uiFontId, 350, "Press any button to continue", theme.primaryTextBlack, REGULAR);
+  renderer_.drawCenteredText(theme.uiFontId, 350, tr(PRESS_ANY_BUTTON), theme.primaryTextBlack, REGULAR);
 
   renderer_.displayBuffer();
   needsRender_ = false;
-  core.display.markDirty();
 }
 
 }  // namespace papyrix

@@ -1,7 +1,10 @@
 #include "Bitmap.h"
 
+#include <esp_heap_caps.h>
+
 #include <cstdlib>
 #include <cstring>
+#include <new>
 
 // ============================================================================
 // IMAGE PROCESSING OPTIONS - Toggle these to test different configurations
@@ -12,31 +15,12 @@ constexpr bool USE_ATKINSON = true;  // Use Atkinson dithering instead of Floyd-
 // ============================================================================
 
 Bitmap::~Bitmap() {
+  if (preloadedInPsram_)
+    heap_caps_free(preloadedRows_);
+  else
+    delete[] preloadedRows_;
   delete atkinsonDitherer;
   delete fsDitherer;
-}
-
-uint16_t Bitmap::readLE16(FsFile& f) {
-  const int c0 = f.read();
-  const int c1 = f.read();
-  const auto b0 = static_cast<uint8_t>(c0 < 0 ? 0 : c0);
-  const auto b1 = static_cast<uint8_t>(c1 < 0 ? 0 : c1);
-  return static_cast<uint16_t>(b0) | (static_cast<uint16_t>(b1) << 8);
-}
-
-uint32_t Bitmap::readLE32(FsFile& f) {
-  const int c0 = f.read();
-  const int c1 = f.read();
-  const int c2 = f.read();
-  const int c3 = f.read();
-
-  const auto b0 = static_cast<uint8_t>(c0 < 0 ? 0 : c0);
-  const auto b1 = static_cast<uint8_t>(c1 < 0 ? 0 : c1);
-  const auto b2 = static_cast<uint8_t>(c2 < 0 ? 0 : c2);
-  const auto b3 = static_cast<uint8_t>(c3 < 0 ? 0 : c3);
-
-  return static_cast<uint32_t>(b0) | (static_cast<uint32_t>(b1) << 8) | (static_cast<uint32_t>(b2) << 16) |
-         (static_cast<uint32_t>(b3) << 24);
 }
 
 const char* Bitmap::errorToString(BmpReaderError err) {
@@ -81,87 +65,127 @@ BmpReaderError Bitmap::parseHeaders() {
   if (!file) return BmpReaderError::FileInvalid;
   if (!file.seek(0)) return BmpReaderError::SeekStartFailed;
 
-  // --- BMP FILE HEADER ---
-  const uint16_t bfType = readLE16(file);
-  if (bfType != 0x4D42) return BmpReaderError::NotBMP;
+  uint8_t hdr[54];
+  if (file.read(hdr, sizeof(hdr)) != static_cast<int>(sizeof(hdr))) {
+    return BmpReaderError::FileInvalid;
+  }
 
-  file.seekCur(8);
-  bfOffBits = readLE32(file);
+  auto leU16 = [](const uint8_t* p) -> uint16_t { return static_cast<uint16_t>(p[0] | (uint16_t(p[1]) << 8)); };
+  auto leU32 = [](const uint8_t* p) -> uint32_t {
+    return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+  };
 
-  // --- DIB HEADER ---
-  const uint32_t biSize = readLE32(file);
+  if (leU16(hdr + 0) != 0x4D42) return BmpReaderError::NotBMP;
+  bfOffBits = leU32(hdr + 10);
+  const uint32_t biSize = leU32(hdr + 14);
   if (biSize < 40) return BmpReaderError::DIBTooSmall;
 
-  width = static_cast<int32_t>(readLE32(file));
-  const auto rawHeight = static_cast<int32_t>(readLE32(file));
+  width = static_cast<int32_t>(leU32(hdr + 18));
+  const auto rawHeight = static_cast<int32_t>(leU32(hdr + 22));
   topDown = rawHeight < 0;
   height = topDown ? -rawHeight : rawHeight;
 
-  const uint16_t planes = readLE16(file);
-  bpp = readLE16(file);
-  const uint32_t comp = readLE32(file);
+  const uint16_t planes = leU16(hdr + 26);
+  bpp = leU16(hdr + 28);
+  const uint32_t comp = leU32(hdr + 30);
+  const uint32_t colorsUsed = leU32(hdr + 46);
   const bool validBpp = bpp == 1 || bpp == 2 || bpp == 8 || bpp == 24 || bpp == 32;
 
   if (planes != 1) return BmpReaderError::BadPlanes;
   if (!validBpp) return BmpReaderError::UnsupportedBpp;
-  // Allow BI_RGB (0) for all, and BI_BITFIELDS (3) for 32bpp which is common for BGRA masks.
   if (!(comp == 0 || (bpp == 32 && comp == 3))) return BmpReaderError::UnsupportedCompression;
-
-  file.seekCur(12);  // biSizeImage, biXPelsPerMeter, biYPelsPerMeter
-  const uint32_t colorsUsed = readLE32(file);
-  if (colorsUsed > 256u) return BmpReaderError::PaletteTooLarge;
-  file.seekCur(4);  // biClrImportant
-
+  const uint32_t paletteEntries = colorsUsed == 0 && bpp <= 8 ? 1U << bpp : colorsUsed;
+  if (paletteEntries > 256u) return BmpReaderError::PaletteTooLarge;
   if (width <= 0 || height <= 0) return BmpReaderError::BadDimensions;
 
-  // Safety limits to prevent memory issues on ESP32
   constexpr int MAX_IMAGE_WIDTH = 2048;
   constexpr int MAX_IMAGE_HEIGHT = 3072;
   if (width > MAX_IMAGE_WIDTH || height > MAX_IMAGE_HEIGHT) {
     return BmpReaderError::ImageTooLarge;
   }
 
-  // Pre-calculate Row Bytes to avoid doing this every row
   rowBytes = (width * bpp + 31) / 32 * 4;
 
   for (int i = 0; i < 256; i++) paletteLum[i] = static_cast<uint8_t>(i);
-  if (colorsUsed > 0) {
-    for (uint32_t i = 0; i < colorsUsed; i++) {
+  if (bpp == 1) {
+    paletteLum[0] = 0;
+    paletteLum[1] = 255;
+  } else if (bpp == 2) {
+    paletteLum[0] = 0;
+    paletteLum[1] = 85;
+    paletteLum[2] = 170;
+    paletteLum[3] = 255;
+  }
+  if (paletteEntries > 0) {
+    const uint64_t paletteOffset = 14U + static_cast<uint64_t>(biSize);
+    const uint64_t paletteSize = static_cast<uint64_t>(paletteEntries) * 4U;
+    if (paletteOffset > bfOffBits || paletteSize > static_cast<uint64_t>(bfOffBits) - paletteOffset ||
+        !file.seek(paletteOffset)) {
+      return BmpReaderError::FileInvalid;
+    }
+    for (uint32_t i = 0; i < paletteEntries; i++) {
       uint8_t rgb[4];
-      file.read(rgb, 4);  // Read B, G, R, Reserved in one go
+      if (file.read(rgb, sizeof(rgb)) != sizeof(rgb)) return BmpReaderError::FileInvalid;
       paletteLum[i] = (77u * rgb[2] + 150u * rgb[1] + 29u * rgb[0]) >> 8;
     }
   }
+
+  isIdentityPalette_ = (bpp == 2 && paletteEntries >= 4 && paletteLum[0] == 0x00 && paletteLum[1] == 0x55 &&
+                        paletteLum[2] == 0xAA && paletteLum[3] == 0xFF);
 
   if (!file.seek(bfOffBits)) {
     return BmpReaderError::SeekPixelDataFailed;
   }
 
-  // Clean up existing ditherers (safe if nullptr)
   delete atkinsonDitherer;
   atkinsonDitherer = nullptr;
   delete fsDitherer;
   fsDitherer = nullptr;
 
-  // Create ditherer if enabled (only for 2-bit output)
-  // Use OUTPUT dimensions for dithering (after prescaling)
   if (bpp > 2 && dithering) {
+    // OOM-safe: fall back to non-dithered output if row buffers can't be allocated.
     if (USE_ATKINSON) {
-      atkinsonDitherer = new AtkinsonDitherer(width);
+      atkinsonDitherer = new (std::nothrow) AtkinsonDitherer(width);
+      if (atkinsonDitherer && !atkinsonDitherer->valid()) {
+        delete atkinsonDitherer;
+        atkinsonDitherer = nullptr;
+      }
     } else {
-      fsDitherer = new FloydSteinbergDitherer(width);
+      fsDitherer = new (std::nothrow) FloydSteinbergDitherer(width);
+      if (fsDitherer && !fsDitherer->valid()) {
+        delete fsDitherer;
+        fsDitherer = nullptr;
+      }
     }
   }
 
   return BmpReaderError::Ok;
 }
 
+BmpReaderError Bitmap::loadRawRow(uint8_t* rowBuffer, const int storageRowY) const {
+  if (!rowBuffer || storageRowY < 0 || storageRowY >= height) return BmpReaderError::ShortReadRow;
+
+  if (preloadedRows_) {
+    const uint8_t* source = preloadedRow(storageRowY);
+    if (!source) return BmpReaderError::ShortReadRow;
+    memcpy(rowBuffer, source, rowBytes);
+  } else {
+    if (storageRowY != prevRowY + 1) {
+      const uint64_t offset =
+          static_cast<uint64_t>(bfOffBits) + static_cast<uint64_t>(storageRowY) * static_cast<uint64_t>(rowBytes);
+      if (offset > UINT32_MAX || !file.seek(static_cast<uint32_t>(offset))) return BmpReaderError::ShortReadRow;
+    }
+    if (file.read(rowBuffer, rowBytes) != rowBytes) return BmpReaderError::ShortReadRow;
+  }
+
+  prevRowY = storageRowY;
+  return BmpReaderError::Ok;
+}
+
 // packed 2bpp output, 0 = black, 1 = dark gray, 2 = light gray, 3 = white
 BmpReaderError Bitmap::readRow(uint8_t* data, uint8_t* rowBuffer, int rowY) const {
-  // Note: rowBuffer should be pre-allocated by the caller to size 'rowBytes'
-  if (file.read(rowBuffer, rowBytes) != rowBytes) return BmpReaderError::ShortReadRow;
-
-  prevRowY += 1;
+  const BmpReaderError loadResult = loadRawRow(rowBuffer, rowY);
+  if (loadResult != BmpReaderError::Ok) return loadResult;
 
   uint8_t* outPtr = data;
   uint8_t currentOutByte = 0;
@@ -223,8 +247,13 @@ BmpReaderError Bitmap::readRow(uint8_t* data, uint8_t* rowBuffer, int rowY) cons
       break;
     }
     case 2: {
+      if (isIdentityPalette_ && !atkinsonDitherer && !fsDitherer) {
+        const int bytesIn = (width * 2 + 7) / 8;
+        memcpy(data, rowBuffer, bytesIn);
+        return BmpReaderError::Ok;
+      }
       for (int x = 0; x < width; x++) {
-        lum = paletteLum[(rowBuffer[x >> 2] >> (6 - ((x & 3) * 2))) & 0x03];
+        lum = paletteLum[(rowBuffer[x >> 2] >> (6 - ((x & 3) << 1))) & 0x03];
         packPixel(lum);
       }
       break;
@@ -251,12 +280,116 @@ BmpReaderError Bitmap::readRow(uint8_t* data, uint8_t* rowBuffer, int rowY) cons
   return BmpReaderError::Ok;
 }
 
-BmpReaderError Bitmap::rewindToData() const {
-  if (!file.seek(bfOffBits)) {
-    return BmpReaderError::SeekPixelDataFailed;
+BmpReaderError Bitmap::readRawRow(uint8_t* rowBuffer, const size_t rowBufferSize, const int logicalRowY) const {
+  if (!rowBuffer || rowBufferSize < static_cast<size_t>(rowBytes) || logicalRowY < 0 || logicalRowY >= height) {
+    return BmpReaderError::BufferTooSmall;
   }
 
-  // Reset dithering state when rewinding
+  const int storageRowY = topDown ? logicalRowY : height - 1 - logicalRowY;
+  return loadRawRow(rowBuffer, storageRowY);
+}
+
+BmpReaderError Bitmap::readGrayscaleRow(uint8_t* gray, const size_t graySize, uint8_t* rowBuffer,
+                                        const size_t rowBufferSize, const int logicalRowY) const {
+  if (!gray || graySize < static_cast<size_t>(width) || !rowBuffer || rowBufferSize < static_cast<size_t>(rowBytes) ||
+      logicalRowY < 0 || logicalRowY >= height) {
+    return BmpReaderError::BufferTooSmall;
+  }
+
+  const int storageRowY = topDown ? logicalRowY : height - 1 - logicalRowY;
+  const BmpReaderError loadResult = loadRawRow(rowBuffer, storageRowY);
+  if (loadResult != BmpReaderError::Ok) return loadResult;
+
+  switch (bpp) {
+    case 32:
+      for (int x = 0; x < width; ++x) {
+        const uint8_t* pixel = rowBuffer + static_cast<size_t>(x) * 4;
+        gray[x] = static_cast<uint8_t>((77U * pixel[2] + 150U * pixel[1] + 29U * pixel[0]) >> 8);
+      }
+      break;
+    case 24:
+      for (int x = 0; x < width; ++x) {
+        const uint8_t* pixel = rowBuffer + static_cast<size_t>(x) * 3;
+        gray[x] = static_cast<uint8_t>((77U * pixel[2] + 150U * pixel[1] + 29U * pixel[0]) >> 8);
+      }
+      break;
+    case 8:
+      for (int x = 0; x < width; ++x) gray[x] = paletteLum[rowBuffer[x]];
+      break;
+    case 2:
+      for (int x = 0; x < width; ++x) {
+        const uint8_t index = (rowBuffer[x >> 2] >> (6 - ((x & 3) << 1))) & 0x03;
+        gray[x] = paletteLum[index];
+      }
+      break;
+    case 1:
+      for (int x = 0; x < width; ++x) {
+        const uint8_t index = (rowBuffer[x >> 3] >> (7 - (x & 7))) & 0x01;
+        gray[x] = paletteLum[index];
+      }
+      break;
+    default:
+      return BmpReaderError::UnsupportedBpp;
+  }
+
+  return BmpReaderError::Ok;
+}
+
+bool Bitmap::hasCompletePixelData() const {
+  if (width <= 0 || height <= 0 || rowBytes <= 0) return false;
+  const uint64_t required =
+      static_cast<uint64_t>(bfOffBits) + static_cast<uint64_t>(rowBytes) * static_cast<uint64_t>(height);
+  return required <= static_cast<uint64_t>(file.size());
+}
+
+bool Bitmap::preloadAllRows() const {
+#if PAPYRIX_TARGET_X4PRO || PAPYRIX_TARGET_X4CLASSIC || PAPYRIX_TARGET_STICKY || PAPYRIX_TARGET_MURPHY_M4
+  return preloadRows(true);
+#else
+  return preloadRows(false);
+#endif
+}
+
+bool Bitmap::preloadRowsInPsram() const { return preloadRows(true); }
+
+bool Bitmap::preloadRows(bool inPsram) const {
+  if (preloadedRows_) return true;
+  if (preloadDisabled_ || rowBytes <= 0 || height <= 0) return false;
+
+  if (static_cast<size_t>(rowBytes) > SIZE_MAX / static_cast<size_t>(height)) return false;
+  const size_t total = static_cast<size_t>(rowBytes) * static_cast<size_t>(height);
+  if (total > 256 * 1024) return false;
+  const uint32_t caps = inPsram ? MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT : MALLOC_CAP_8BIT;
+  if (total > 1024 && total > heap_caps_get_largest_free_block(caps) * 80 / 100) return false;
+
+  uint8_t* rows = inPsram ? static_cast<uint8_t*>(heap_caps_malloc(total, caps)) : new (std::nothrow) uint8_t[total];
+  if (!rows) return false;
+
+  if (!file.seek(bfOffBits) || file.read(rows, total) != static_cast<int>(total)) {
+    if (inPsram)
+      heap_caps_free(rows);
+    else
+      delete[] rows;
+    file.seek(bfOffBits);
+    return false;
+  }
+  preloadedRows_ = rows;
+  preloadedInPsram_ = inPsram;
+  return true;
+}
+
+const uint8_t* Bitmap::preloadedRow(int rowIndex) const {
+  if (!preloadedRows_ || rowIndex < 0 || rowIndex >= height) return nullptr;
+  return preloadedRows_ + static_cast<size_t>(rowIndex) * static_cast<size_t>(rowBytes);
+}
+
+BmpReaderError Bitmap::rewindToData() const {
+  if (!preloadedRows_) {
+    if (!file.seek(bfOffBits)) {
+      return BmpReaderError::SeekPixelDataFailed;
+    }
+  }
+
   prevRowY = -1;
   if (fsDitherer) fsDitherer->reset();
   if (atkinsonDitherer) atkinsonDitherer->reset();

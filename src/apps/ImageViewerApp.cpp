@@ -1,22 +1,23 @@
 #include "ImageViewerApp.h"
 
 #include <Arduino.h>
-#include <Bitmap.h>
-#include <CoverHelpers.h>
-#include <EInkDisplay.h>
+#include <Display.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
-#include <ImageConverter.h>
+#include <I18n.h>
 #include <Logging.h>
 #include <SDCardManager.h>
 #include <SdFat.h>
 
 #include <algorithm>
+#include <iterator>
 #include <string>
 #include <vector>
 
 #include "../core/Core.h"
 #include "../ui/Elements.h"
+#include "../ui/ImageFileView.h"
+#include "MiniAppInput.h"
 #include "ThemeManager.h"
 
 #define TAG "IMG_VIEWER"
@@ -27,12 +28,13 @@ namespace papyrix {
 namespace imageviewer_app {
 
 static constexpr const char* IMAGES_DIR = "/images";
+static constexpr const char* PRINTOUTS_DIR = "/printouts";
 static constexpr const char* SETTINGS_PATH = "/.papyrix/apps/image-viewer.txt";
 static constexpr uint32_t SLIDESHOW_INTERVALS[] = {0, 30000, 60000, 300000};
 static constexpr const char* SLIDESHOW_LABELS[] = {"Off", "30s", "60s", "5min"};
-static constexpr int SLIDESHOW_COUNT = 4;
+static constexpr int SLIDESHOW_COUNT = static_cast<int>(std::size(SLIDESHOW_INTERVALS));
+static_assert(std::size(SLIDESHOW_INTERVALS) == std::size(SLIDESHOW_LABELS));
 
-static constexpr int BOTTOM_BAR_HEIGHT = 23;
 static constexpr uint32_t MAX_IMAGE_FILE_SIZE = 10 * 1024 * 1024;  // 10 MB
 
 static struct {
@@ -83,136 +85,73 @@ static void saveSettings(Core& core) {
 static void scanImages() {
   state.files.clear();
 
-  FsFile dir = SdMan.open(IMAGES_DIR);
-  if (!dir || !dir.isDirectory()) {
-    LOG_INF(TAG, "No %s directory found", IMAGES_DIR);
-    if (dir) dir.close();
-    return;
-  }
-
-  char name[256];
-  FsFile entry;
-  while ((entry = dir.openNextFile())) {
-    if (entry.isDirectory()) {
-      entry.close();
+  // /printouts holds the printer output tray next to the user images.
+  for (const char* scanDir : {IMAGES_DIR, PRINTOUTS_DIR}) {
+    FsFile dir = SdMan.open(scanDir);
+    if (!dir || !dir.isDirectory()) {
+      if (dir) dir.close();
       continue;
     }
 
-    entry.getName(name, sizeof(name));
+    char name[256];
+    FsFile entry;
+    while ((entry = dir.openNextFile())) {
+      if (entry.isDirectory()) {
+        entry.close();
+        continue;
+      }
 
-    if (name[0] == '.') {
+      entry.getName(name, sizeof(name));
+
+      if (name[0] == '.') {
+        entry.close();
+        continue;
+      }
+
+      if (FsHelpers::isImageFile(name) && entry.fileSize() <= MAX_IMAGE_FILE_SIZE) {
+        std::string path = std::string(scanDir) + "/" + name;
+        state.files.push_back(path);
+      }
+
       entry.close();
-      continue;
     }
-
-    if (FsHelpers::isImageFile(name) && entry.fileSize() <= MAX_IMAGE_FILE_SIZE) {
-      std::string path = std::string(IMAGES_DIR) + "/" + name;
-      state.files.push_back(path);
-    }
-
-    entry.close();
+    dir.close();
   }
-  dir.close();
 
   std::sort(state.files.begin(), state.files.end());
 
   LOG_INF(TAG, "Found %zu images", state.files.size());
 }
 
-// Convert JPEG/PNG to BMP in-place (same directory, replace original).
-// Returns the new BMP path, or empty string on failure.
-static std::string convertToBmpInPlace(const std::string& path) {
-  std::string bmpPath = path.substr(0, path.rfind('.')) + ".bmp";
-
-  // If target BMP already exists, just remove the original
-  if (SdMan.exists(bmpPath.c_str())) {
-    SdMan.remove(path.c_str());
-    return bmpPath;
-  }
-
-  const int maxW = renderer.getScreenWidth();
-  const int maxH = renderer.getScreenHeight() - BOTTOM_BAR_HEIGHT;
-
-  ImageConvertConfig config;
-  config.maxWidth = maxW;
-  config.maxHeight = maxH;
-  config.oneBit = false;
-  config.logTag = TAG;
-
-  if (!ImageConverterFactory::convertToBmp(path, bmpPath, config)) {
-    return "";
-  }
-
-  SdMan.remove(path.c_str());
-  LOG_INF(TAG, "Converted: %s -> %s", path.c_str(), bmpPath.c_str());
-  return bmpPath;
-}
-
 static bool renderImage() {
   const Theme& theme = THEME;
-  const int screenW = renderer.getScreenWidth();
-  const int screenH = renderer.getScreenHeight();
+  const int viewportH = renderer.getScreenHeight() - ui::IMAGE_VIEW_BUTTON_BAR_HEIGHT;
 
   renderer.clearScreen(theme.backgroundColor);
 
   if (state.files.empty()) {
-    ui::centeredMessage(renderer, theme, theme.uiFontId, "No images in /images/");
     ui::ButtonBar buttons("Back", "Menu", "", "");
-    ui::buttonBar(renderer, theme, buttons);
+    ui::drawImageError(renderer, theme, "No images in /images/", buttons);
     return false;
   }
 
   const std::string& path = state.files[state.currentIndex];
 
-  // Convert non-BMP images to BMP in-place (replaces original file)
-  if (!FsHelpers::isBmpFile(path)) {
-    ui::centeredMessage(renderer, theme, theme.uiFontId, "Converting...");
-    renderer.displayBuffer();
+  // Convert non-BMP images to a hidden cache BMP (original file kept)
+  if (ui::needsBmpConversion(path)) {
+    ui::centeredMessage(renderer, theme, theme.uiFontId, tr(CONVERTING));
+  }
 
-    std::string bmpPath = convertToBmpInPlace(path);
-    if (bmpPath.empty()) {
-      renderer.clearScreen(theme.backgroundColor);
-      ui::centeredMessage(renderer, theme, theme.uiFontId, "Conversion failed");
-      ui::ButtonBar buttons("Back", "Menu", "<", ">");
-      ui::buttonBar(renderer, theme, buttons);
-      return false;
-    }
-
-    state.files[state.currentIndex] = bmpPath;
+  const std::string bmpPath = ui::ensureRenderableBmp(path, renderer.getScreenWidth(), viewportH, TAG);
+  if (bmpPath.empty()) {
     renderer.clearScreen(theme.backgroundColor);
-  }
-
-  const std::string& bmpPath = state.files[state.currentIndex];
-
-  FsFile file;
-  if (!SdMan.openFileForRead(TAG, bmpPath, file)) {
-    LOG_ERR(TAG, "Failed to open: %s", bmpPath.c_str());
-    ui::centeredMessage(renderer, theme, theme.uiFontId, "Failed to open image");
     ui::ButtonBar buttons("Back", "Menu", "<", ">");
-    ui::buttonBar(renderer, theme, buttons);
+    ui::drawImageError(renderer, theme, tr(CONVERSION_FAILED), buttons);
     return false;
   }
-
-  Bitmap bitmap(file);
-  if (bitmap.parseHeaders() != BmpReaderError::Ok) {
-    LOG_ERR(TAG, "Invalid BMP: %s", bmpPath.c_str());
-    file.close();
-    ui::centeredMessage(renderer, theme, theme.uiFontId, "Invalid image file");
-    ui::ButtonBar buttons("Back", "Menu", "<", ">");
-    ui::buttonBar(renderer, theme, buttons);
-    return false;
-  }
-
-  const int viewportH = screenH - BOTTOM_BAR_HEIGHT;
-  auto rect = CoverHelpers::calculateCenteredRect(bitmap.getWidth(), bitmap.getHeight(), 0, 0, screenW, viewportH);
-  renderer.drawBitmap(bitmap, rect.x, rect.y, rect.width, rect.height);
-
-  file.close();
 
   ui::ButtonBar buttons("Back", "Menu", "<", ">");
-  ui::buttonBar(renderer, theme, buttons);
-
-  return false;
+  return ui::renderImageFile(renderer, theme, bmpPath, viewportH, buttons);
 }
 
 void enter(Core& core) {
@@ -240,7 +179,7 @@ bool update(Core& core) {
   return false;
 }
 
-void onButton(Core& core, Button btn) {
+static void onButton(Core& core, Button btn) {
   (void)core;
 
   if (state.files.empty()) return;
@@ -263,9 +202,14 @@ void onButton(Core& core, Button btn) {
   }
 }
 
-bool render(Core& core) {
-  (void)core;
-  return renderImage();
+static void renderMenu(Core& core);
+
+miniapps::Frame render(Core& core, bool menuOpen) {
+  if (menuOpen) {
+    renderMenu(core);
+    return {miniapps::Refresh::Fast, false};
+  }
+  return {renderImage() ? miniapps::Refresh::None : miniapps::Refresh::Fast, false};
 }
 
 void exit(Core& core) {
@@ -275,17 +219,20 @@ void exit(Core& core) {
   state.files.shrink_to_fit();
 }
 
-void renderMenu(Core& core) {
+static void renderMenu(Core& core) {
   (void)core;
-
+  renderer.clearScreen(THEME.backgroundColor);
   char label[32];
   snprintf(label, sizeof(label), "Slideshow: %s", SLIDESHOW_LABELS[state.slideshowSetting]);
 
   const char* items[] = {label};
   ui::popupMenu(renderer, THEME, "Image Viewer", items, 1, state.menuSelected);
+  const int btnY = renderer.getScreenHeight() - 50;
+  renderer.clearArea(0, btnY, renderer.getScreenWidth(), 50, THEME.backgroundColor);
+  ui::buttonBar(renderer, THEME, ui::ButtonBar(tr(BACK), tr(CONFIRM), "<", ">"));
 }
 
-void onMenuButton(Core& core, Button btn) {
+static void onMenuButton(Core& core, Button btn) {
   switch (btn) {
     case Button::Left:
     case Button::Right: {
@@ -299,6 +246,10 @@ void onMenuButton(Core& core, Button btn) {
     default:
       break;
   }
+}
+
+miniapps::Action handleEvent(Core& core, const Event& event, bool menuOpen) {
+  return handleAppButtons(core, event, menuOpen, onButton, onMenuButton);
 }
 
 }  // namespace imageviewer_app

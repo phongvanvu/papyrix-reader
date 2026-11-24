@@ -9,12 +9,14 @@
 
 #define TAG "TXT_PARSE"
 
+#include <memory>
+#include <new>
 #include <utility>
 
 namespace {
 constexpr size_t READ_CHUNK_SIZE = 4096;
 
-bool isWhitespace(char c) { return c == ' ' || c == '\r' || c == '\n' || c == '\t'; }
+bool isWhitespace(char c) { return c == ' ' || c == '\t'; }
 }  // namespace
 
 PlainTextParser::PlainTextParser(std::string filepath, GfxRenderer& renderer, const RenderConfig& config)
@@ -28,9 +30,14 @@ void PlainTextParser::reset() {
   encodingTable_ = nullptr;
   bomSkipBytes_ = 0;
   pendingBlock_.reset();
+  pendingSpacing_ = 0;
+  pendingSawNewline_ = false;
+  pendingPartialWord_.clear();
+  pendingPage_.reset();
+  pendingPageY_ = 0;
 }
 
-bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)>& onPageComplete, uint16_t maxPages,
+bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)>& onPageComplete, uint32_t maxPages,
                                  const AbortCallback& shouldAbort) {
   FsFile file;
   if (!SdMan.openFileForRead("TXT", filepath_, file)) {
@@ -46,13 +53,23 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
   const int lineHeight = static_cast<int>(renderer_.getEffectiveLineHeight(config_.fontId) * config_.lineCompression);
   const int maxLinesPerPage = config_.viewportHeight / lineHeight;
 
-  uint8_t buffer[READ_CHUNK_SIZE + 1];
+  // Keep the 4 KB read buffer off the stack: the foreground "page not cached"
+  // render runs this whole parse -> layout -> font-render chain on the 8 KB
+  // loopTask stack, where an on-stack buffer this size overflows it (Issue #137).
+  auto buffer = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[READ_CHUNK_SIZE + 1]);
+  if (!buffer) {
+    LOG_ERR(TAG, "Failed to allocate read buffer");
+    file.close();
+    return false;
+  }
   std::unique_ptr<ParsedText> currentBlock;
   std::unique_ptr<Page> currentPage;
   int16_t currentPageY = 0;
-  uint16_t pagesCreated = 0;
-  std::string partialWord;
+  uint32_t pagesCreated = 0;
+  std::string partialWord = std::move(pendingPartialWord_);
   uint16_t abortCheckCounter = 0;
+  bool sawNewline = pendingSawNewline_;
+  pendingSawNewline_ = false;
 
   auto startNewPage = [&]() {
     currentPage.reset(new Page());
@@ -70,6 +87,8 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
       startNewPage();
 
       if (maxPages > 0 && pagesCreated >= maxPages) {
+        currentPage->elements.push_back(std::make_shared<PageLine>(line, 0, currentPageY));
+        currentPageY += lineHeight;
         return false;
       }
     }
@@ -91,7 +110,10 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
             continueProcessing = false;
           }
         },
-        true, [&]() -> bool { return !continueProcessing; });
+        true,
+        [&continueProcessing, &shouldAbort]() -> bool {
+          return !continueProcessing || (shouldAbort && shouldAbort());
+        });
 
     if (continueProcessing) {
       currentBlock.reset();
@@ -100,31 +122,73 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
     return continueProcessing;
   };
 
+  // Lay out the current block as a soft (mid-paragraph) break, used to bound the
+  // per-block working set. Returns true if the batch filled up — resume state is
+  // persisted and the caller must return; returns false if the block was fully
+  // laid out and parsing can continue with a fresh block.
+  auto softFlushAtCap = [&](size_t resumeOffset) -> bool {
+    if (flushBlock()) {
+      return false;
+    }
+    pendingBlock_ = std::move(currentBlock);
+    pendingPartialWord_ = std::move(partialWord);
+    pendingSawNewline_ = sawNewline;
+    currentOffset_ = resumeOffset;
+    hasMore_ = true;
+    if (currentPage && !currentPage->elements.empty()) {
+      pendingPage_ = std::move(currentPage);
+      pendingPageY_ = currentPageY;
+    }
+    file.close();
+    return true;
+  };
+
   if (currentOffset_ == 0) {
-    size_t peekBytes = file.read(buffer, READ_CHUNK_SIZE);
+    size_t peekBytes = file.read(buffer.get(), READ_CHUNK_SIZE);
     if (peekBytes > 0) {
       buffer[peekBytes] = '\0';
-      detectedEncoding_ = detectEncoding(buffer, peekBytes, bomSkipBytes_);
+      detectedEncoding_ = detectEncoding(buffer.get(), peekBytes, bomSkipBytes_);
       encodingTable_ = getEncodingTable(detectedEncoding_);
-      isRtl_ = ScriptDetector::containsArabic(reinterpret_cast<const char*>(buffer));
     }
     file.seekSet(bomSkipBytes_);
   }
 
-  startNewPage();
+  auto addWordWithRtlCheck = [&](const std::string& word, EpdFontFamily::Style style) {
+    if (!isRtl_ && ScriptDetector::classify(word.c_str()) == ScriptDetector::Script::ARABIC) {
+      isRtl_ = true;
+      currentBlock->setRtl(true);
+    }
+    currentBlock->addWord(word, style);
+  };
+
+  // Resume: restore partial page from previous batch
+  if (pendingPage_) {
+    currentPage = std::move(pendingPage_);
+    currentPageY = pendingPageY_;
+    pendingPageY_ = 0;
+  } else {
+    startNewPage();
+  }
 
   // Resume: flush any pending block carried over from a previous interrupted batch
   if (pendingBlock_) {
     currentBlock = std::move(pendingBlock_);
     if (!flushBlock()) {
-      // Still can't fit — save pending block and return
       pendingBlock_ = std::move(currentBlock);
+      pendingPartialWord_ = std::move(partialWord);
+      pendingSawNewline_ = sawNewline;
       if (currentPage && !currentPage->elements.empty()) {
-        onPageComplete(std::move(currentPage));
+        pendingPage_ = std::move(currentPage);
+        pendingPageY_ = currentPageY;
       }
       file.close();
       return true;
     }
+  }
+
+  if (pendingSpacing_ > 0) {
+    currentPageY += pendingSpacing_;
+    pendingSpacing_ = 0;
   }
 
   if (!currentBlock) {
@@ -136,56 +200,80 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
     // Check for abort every few iterations
     if (shouldAbort && (++abortCheckCounter % 10 == 0) && shouldAbort()) {
       LOG_INF(TAG, "Aborted by external request");
+      pendingSawNewline_ = sawNewline;
       currentOffset_ = file.position();
       hasMore_ = true;
       file.close();
       return false;
     }
 
-    size_t bytesRead = file.read(buffer, READ_CHUNK_SIZE);
+    size_t bytesRead = file.read(buffer.get(), READ_CHUNK_SIZE);
     if (bytesRead == 0) break;
 
     buffer[bytesRead] = '\0';
 
     for (size_t i = 0; i < bytesRead; i++) {
+      // Bound the working set: split an over-long paragraph mid-stream instead of
+      // accumulating thousands of words into one block (Issue #137).
+      if (currentBlock && currentBlock->size() >= ParsedText::kMaxWordsPerBlock) {
+        if (softFlushAtCap(file.position() - (bytesRead - i))) {
+          return true;
+        }
+        if (!currentBlock) {
+          currentBlock.reset(new ParsedText(static_cast<TextBlock::BLOCK_STYLE>(config_.paragraphAlignment),
+                                            config_.indentLevel, config_.hyphenation, true, isRtl_));
+        }
+      }
+
       char c = static_cast<char>(buffer[i]);
 
-      // Handle newlines as paragraph breaks
+      if (c == '\r') continue;
+
       if (c == '\n') {
-        // Flush partial word
         if (!partialWord.empty()) {
           partialWord.resize(utf8NormalizeNfc(&partialWord[0], partialWord.size()));
-          currentBlock->addWord(partialWord, EpdFontFamily::REGULAR);
+          addWordWithRtlCheck(partialWord, EpdFontFamily::REGULAR);
           partialWord.clear();
         }
 
-        // Flush current block (paragraph)
-        if (!flushBlock()) {
-          // currentBlock still has unconsumed words — save for next call
-          pendingBlock_ = std::move(currentBlock);
-          currentOffset_ = file.position() - (bytesRead - i - 1);
-          hasMore_ = true;
-          file.close();
+        if (sawNewline) {
+          if (!flushBlock()) {
+            switch (config_.spacingLevel) {
+              case 1:
+                pendingSpacing_ = lineHeight / 4;
+                break;
+              case 3:
+                pendingSpacing_ = lineHeight;
+                break;
+            }
+            pendingBlock_ = std::move(currentBlock);
+            pendingSawNewline_ = true;
+            currentOffset_ = file.position() - (bytesRead - i - 1);
+            hasMore_ = true;
+            file.close();
 
-          // Complete final page if it has content
-          if (currentPage && !currentPage->elements.empty()) {
-            onPageComplete(std::move(currentPage));
+            if (currentPage && !currentPage->elements.empty()) {
+              pendingPage_ = std::move(currentPage);
+              pendingPageY_ = currentPageY;
+            }
+            return true;
           }
-          return true;
-        }
 
-        // Start new paragraph
-        currentBlock.reset(new ParsedText(static_cast<TextBlock::BLOCK_STYLE>(config_.paragraphAlignment),
-                                          config_.indentLevel, config_.hyphenation, true, isRtl_));
+          if (!currentBlock) {
+            currentBlock.reset(new ParsedText(static_cast<TextBlock::BLOCK_STYLE>(config_.paragraphAlignment),
+                                              config_.indentLevel, config_.hyphenation, true, isRtl_));
 
-        // Add paragraph spacing
-        switch (config_.spacingLevel) {
-          case 1:
-            currentPageY += lineHeight / 4;
-            break;
-          case 3:
-            currentPageY += lineHeight;
-            break;
+            switch (config_.spacingLevel) {
+              case 1:
+                currentPageY += lineHeight / 4;
+                break;
+              case 3:
+                currentPageY += lineHeight;
+                break;
+            }
+          }
+        } else {
+          sawNewline = true;
         }
         continue;
       }
@@ -193,11 +281,13 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
       if (isWhitespace(c)) {
         if (!partialWord.empty()) {
           partialWord.resize(utf8NormalizeNfc(&partialWord[0], partialWord.size()));
-          currentBlock->addWord(partialWord, EpdFontFamily::REGULAR);
+          addWordWithRtlCheck(partialWord, EpdFontFamily::REGULAR);
           partialWord.clear();
         }
         continue;
       }
+
+      sawNewline = false;
 
       if (encodingTable_ && static_cast<uint8_t>(c) >= 0x80) {
         int cp = encodingTable_[static_cast<uint8_t>(c) - 128];
@@ -225,11 +315,11 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
           std::string overflow = partialWord.substr(safeLen);
           partialWord.resize(safeLen);
           partialWord.resize(utf8NormalizeNfc(&partialWord[0], partialWord.size()));
-          currentBlock->addWord(partialWord, EpdFontFamily::REGULAR);
+          addWordWithRtlCheck(partialWord, EpdFontFamily::REGULAR);
           partialWord = std::move(overflow);
         } else {
           partialWord.resize(utf8NormalizeNfc(&partialWord[0], partialWord.size()));
-          currentBlock->addWord(partialWord, EpdFontFamily::REGULAR);
+          addWordWithRtlCheck(partialWord, EpdFontFamily::REGULAR);
           partialWord.clear();
         }
       }
@@ -237,6 +327,15 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
 
     // Check if we hit max pages
     if (maxPages > 0 && pagesCreated >= maxPages) {
+      pendingSawNewline_ = sawNewline;
+      pendingPartialWord_ = std::move(partialWord);
+      if (currentBlock && !currentBlock->isEmpty()) {
+        pendingBlock_ = std::move(currentBlock);
+      }
+      if (currentPage && !currentPage->elements.empty()) {
+        pendingPage_ = std::move(currentPage);
+        pendingPageY_ = currentPageY;
+      }
       currentOffset_ = file.position();
       hasMore_ = (currentOffset_ < fileSize_);
       file.close();
@@ -247,9 +346,22 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
   // Flush remaining content
   if (!partialWord.empty()) {
     partialWord.resize(utf8NormalizeNfc(&partialWord[0], partialWord.size()));
-    currentBlock->addWord(partialWord, EpdFontFamily::REGULAR);
+    addWordWithRtlCheck(partialWord, EpdFontFamily::REGULAR);
   }
-  flushBlock();
+  if (!flushBlock()) {
+    // The trailing block exceeded this batch — all bytes are consumed, but the
+    // remaining lines must be emitted on a later call from the preserved block.
+    pendingBlock_ = std::move(currentBlock);
+    pendingSawNewline_ = sawNewline;
+    if (currentPage && !currentPage->elements.empty()) {
+      pendingPage_ = std::move(currentPage);
+      pendingPageY_ = currentPageY;
+    }
+    currentOffset_ = fileSize_;
+    hasMore_ = true;
+    file.close();
+    return true;
+  }
 
   // Complete final page
   if (currentPage && !currentPage->elements.empty()) {
@@ -261,6 +373,6 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
   currentOffset_ = fileSize_;
   hasMore_ = false;
 
-  LOG_INF(TAG, "Parsed %d pages from %s", pagesCreated, filepath_.c_str());
+  LOG_INF(TAG, "Parsed %u pages from %s", pagesCreated, filepath_.c_str());
   return true;
 }

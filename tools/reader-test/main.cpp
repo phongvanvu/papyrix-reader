@@ -10,6 +10,8 @@
 
 #include <EInkDisplay.h>
 #include <EpdFont.h>
+#include <HomeThumbnail.h>
+#include <EpdFontLoader.h>
 #include <ExternalFont.h>
 #include <Epub.h>
 #include <EpubChapterParser.h>
@@ -18,6 +20,7 @@
 #include <Html.h>
 #include <HtmlParser.h>
 #include <Page.h>
+#include <ParsedText.h>
 #include <GfxRenderer.h>
 #include <Markdown.h>
 #include <MarkdownParser.h>
@@ -39,6 +42,9 @@ MockLittleFS LittleFS;
 
 // GfxRenderer static frame buffer
 uint8_t GfxRenderer::frameBuffer_[EInkDisplay::BUFFER_SIZE];
+
+// Simulation globals (set via --sim-heap / --fail-serialize)
+size_t g_simHeapSize = 0;
 
 enum ContentType { EPUB, MARKDOWN, TXT_FILE, FB2_FILE, HTML_FILE, UNKNOWN };
 
@@ -146,15 +152,63 @@ static void dumpCacheDir(const std::string& dir, const GfxRenderer& gfx, int fon
   fprintf(stderr, "Total: %d pages\n", totalPages);
 }
 
+// Drives the configurable HomeThumbnail mock through the Home selection
+// order (thumbnail first, cover fallback, disabled images) so the tool's
+// selection behavior stays observable and locked to the real pipeline.
+static int checkThumbnailMockScenarios() {
+  int failures = 0;
+  auto check = [&failures](const char* name, bool ok) {
+    printf("%s %s\n", ok ? "ok:" : "FAIL:", name);
+    if (!ok) failures++;
+  };
+
+  home_thumbnail::resetMockState();
+  home_thumbnail::g_mockState.thumbnailValid = true;
+  home_thumbnail::g_mockState.coverValid = true;
+  auto selection = home_thumbnail::selectForHome(true, "/cache/thumb.bmp", "/cache/cover.bmp");
+  check("thumbnail preferred when valid", selection.type == home_thumbnail::HomeImageType::Thumbnail);
+
+  home_thumbnail::g_mockState.thumbnailValid = false;
+  selection = home_thumbnail::selectForHome(true, "/cache/thumb.bmp", "/cache/cover.bmp");
+  check("cover used as fallback", selection.type == home_thumbnail::HomeImageType::Cover);
+
+  home_thumbnail::g_mockState.coverValid = false;
+  selection = home_thumbnail::selectForHome(true, "/cache/thumb.bmp", "/cache/cover.bmp");
+  check("no image when nothing valid", selection.type == home_thumbnail::HomeImageType::None);
+
+  home_thumbnail::g_mockState.thumbnailValid = true;
+  selection = home_thumbnail::selectForHome(false, "/cache/thumb.bmp", "/cache/cover.bmp");
+  check("disabled images select nothing", selection.type == home_thumbnail::HomeImageType::None);
+
+  home_thumbnail::resetMockState();
+  home_thumbnail::g_mockState.generateResult = home_thumbnail::Result::Ready;
+  const auto generated = home_thumbnail::generateFromCover("/cache/cover.bmp", "/cache/thumb.bmp");
+  check("generation result is configurable", generated == home_thumbnail::Result::Ready);
+  check("generation was called", home_thumbnail::g_mockState.generateWasCalled);
+
+  home_thumbnail::resetMockState();
+  if (failures == 0) {
+    printf("all thumbnail mock scenarios passed\n");
+  } else {
+    printf("%d scenario(s) failed\n", failures);
+  }
+  return failures == 0 ? 0 : 1;
+}
+
 static void usage() {
-  fprintf(stderr, "Usage: reader-test [--dump] [--batch N] [--no-statusbar] [--cjk-font PATH] <file.epub|.md|.txt|.fb2|.html|.htm> [output_dir]\n");
+  fprintf(stderr, "Usage: reader-test [--dump] [--batch N] [--cold-extend] [--no-statusbar] [--font DIR] [--cjk-font PATH] <file.epub|.md|.txt|.fb2|.html|.htm> [output_dir]\n");
   fprintf(stderr, "       reader-test --cache-dump <cache_dir>\n");
   fprintf(stderr, "  --dump           Print parsed text content of each page\n");
   fprintf(stderr, "  --batch N        Cache N pages per batch (default: 5, matching device)\n");
   fprintf(stderr, "                   Use 0 for unlimited (no suspend/resume)\n");
+  fprintf(stderr, "  --cold-extend    Destroy parser between batches (simulates device cold extend)\n");
   fprintf(stderr, "  --no-statusbar   Use full viewport height (no status bar margin)\n");
-  fprintf(stderr, "  --cjk-font PATH  Load external CJK font (.bin) for text width measurement\n");
-  fprintf(stderr, "  --cache-dump     Dump text from existing device cache directory\n");
+  fprintf(stderr, "  --font DIR          Load .epdfont font family from DIR (regular.epdfont, bold.epdfont, italic.epdfont)\n");
+  fprintf(stderr, "  --cjk-font PATH     Load external CJK font (.bin) for text width measurement\n");
+  fprintf(stderr, "  --cache-dump        Dump text from existing device cache directory\n");
+  fprintf(stderr, "  --check-thumb-mock  Run Home selection scenario checks and exit\n");
+  fprintf(stderr, "  --fail-serialize N  Simulate serialize failure every N pages\n");
+  fprintf(stderr, "  --sim-heap SIZE     Simulate device heap size in bytes\n");
   fprintf(stderr, "  output_dir defaults to /tmp/papyrix-cache/\n");
 }
 
@@ -164,14 +218,23 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
+  if (strcmp(argv[1], "--check-thumb-mock") == 0) {
+    return checkThumbnailMockScenarios();
+  }
+
   bool dump = false;
   bool showStatusBar = true;
+  bool coldExtend = false;
   uint16_t batchSize = 5;
   std::string cjkFontPath;
+  std::string fontDir;
   int argIdx = 1;
   while (argIdx < argc && argv[argIdx][0] == '-') {
     if (strcmp(argv[argIdx], "--dump") == 0) {
       dump = true;
+      argIdx++;
+    } else if (strcmp(argv[argIdx], "--cold-extend") == 0) {
+      coldExtend = true;
       argIdx++;
     } else if (strcmp(argv[argIdx], "--no-statusbar") == 0) {
       showStatusBar = false;
@@ -179,8 +242,17 @@ int main(int argc, char* argv[]) {
     } else if (strcmp(argv[argIdx], "--batch") == 0 && argIdx + 1 < argc) {
       batchSize = static_cast<uint16_t>(atoi(argv[argIdx + 1]));
       argIdx += 2;
+    } else if (strcmp(argv[argIdx], "--font") == 0 && argIdx + 1 < argc) {
+      fontDir = argv[argIdx + 1];
+      argIdx += 2;
     } else if (strcmp(argv[argIdx], "--cjk-font") == 0 && argIdx + 1 < argc) {
       cjkFontPath = argv[argIdx + 1];
+      argIdx += 2;
+    } else if (strcmp(argv[argIdx], "--fail-serialize") == 0 && argIdx + 1 < argc) {
+      PageCache::setFailSerializeInterval(static_cast<uint16_t>(atoi(argv[argIdx + 1])));
+      argIdx += 2;
+    } else if (strcmp(argv[argIdx], "--sim-heap") == 0 && argIdx + 1 < argc) {
+      g_simHeapSize = static_cast<size_t>(atol(argv[argIdx + 1]));
       argIdx += 2;
     } else if (strcmp(argv[argIdx], "--cache-dump") == 0) {
       // Handled after renderer setup
@@ -195,10 +267,52 @@ int main(int argc, char* argv[]) {
   GfxRenderer gfx(display);
   gfx.begin();
 
-  EpdFont readerFont(&reader_2b);
-  EpdFont readerBoldFont(&reader_bold_2b);
-  EpdFont readerItalicFont(&reader_italic_2b);
-  EpdFontFamily readerFontFamily(&readerFont, &readerBoldFont, &readerItalicFont, &readerBoldFont);
+  // External font data (must outlive gfx)
+  EpdFontLoader::LoadResult extRegular = {}, extBold = {}, extItalic = {};
+  std::unique_ptr<EpdFont> extRegularFont, extBoldFont, extItalicFont;
+
+  EpdFont builtinRegular(&reader_2b);
+  EpdFont builtinBold(&reader_bold_2b);
+  EpdFont builtinItalic(&reader_italic_2b);
+
+  EpdFont* regularPtr = &builtinRegular;
+  EpdFont* boldPtr = &builtinBold;
+  EpdFont* italicPtr = &builtinItalic;
+
+  if (!fontDir.empty()) {
+    std::string regPath = fontDir + "/regular.epdfont";
+    extRegular = EpdFontLoader::loadFromFile(regPath.c_str());
+    if (!extRegular.success) {
+      fprintf(stderr, "Failed to load font: %s\n", regPath.c_str());
+      return 1;
+    }
+    extRegularFont = std::make_unique<EpdFont>(extRegular.fontData);
+    regularPtr = extRegularFont.get();
+
+    std::string boldPath = fontDir + "/bold.epdfont";
+    extBold = EpdFontLoader::loadFromFile(boldPath.c_str());
+    if (extBold.success) {
+      extBoldFont = std::make_unique<EpdFont>(extBold.fontData);
+      boldPtr = extBoldFont.get();
+    } else {
+      boldPtr = regularPtr;
+    }
+
+    std::string italicPath = fontDir + "/italic.epdfont";
+    extItalic = EpdFontLoader::loadFromFile(italicPath.c_str());
+    if (extItalic.success) {
+      extItalicFont = std::make_unique<EpdFont>(extItalic.fontData);
+      italicPtr = extItalicFont.get();
+    } else {
+      italicPtr = regularPtr;
+    }
+
+    fprintf(stderr, "Font: %s (regular=%zu bold=%zu italic=%zu bytes)\n", fontDir.c_str(),
+            extRegular.totalSize(), extBold.success ? extBold.totalSize() : 0,
+            extItalic.success ? extItalic.totalSize() : 0);
+  }
+
+  EpdFontFamily readerFontFamily(regularPtr, boldPtr, italicPtr, boldPtr);
   constexpr int FONT_ID = 1818981670;
   gfx.insertFont(FONT_ID, readerFontFamily);  // READER_FONT_ID
 
@@ -269,9 +383,16 @@ int main(int argc, char* argv[]) {
       EpubChapterParser parser(epub, i, gfx, config, imageCachePath);
       PageCache cache(cachePath);
       cache.create(parser, config, batchSize);
-      // Extend in batches until all pages are cached, matching device behavior
       while (batchSize > 0 && cache.isPartial()) {
-        cache.extend(parser, batchSize);
+        uint16_t before = cache.pageCount();
+        if (coldExtend) {
+          parser.reset();
+          EpubChapterParser freshParser(epub, i, gfx, config, imageCachePath);
+          cache.extend(freshParser, batchSize);
+        } else {
+          cache.extend(parser, batchSize);
+        }
+        if (cache.pageCount() == before) break;
       }
       printf("  Spine %d: %d pages -> %s\n", i, cache.pageCount(), cachePath.c_str());
       if (dump) dumpPages(cache, gfx, FONT_ID);
@@ -290,7 +411,12 @@ int main(int argc, char* argv[]) {
     MarkdownParser parser(filepath, gfx, config);
     std::string cachePath = outputDir + "/pages_0.bin";
     PageCache cache(cachePath);
-    cache.create(parser, config, 0);
+    cache.create(parser, config, batchSize);
+    while (batchSize > 0 && cache.isPartial()) {
+      uint16_t before = cache.pageCount();
+      cache.extend(parser, batchSize);
+      if (cache.pageCount() == before) break;
+    }
     printf("Markdown: %d pages -> %s\n", cache.pageCount(), cachePath.c_str());
     if (dump) dumpPages(cache, gfx, FONT_ID);
 
@@ -301,18 +427,26 @@ int main(int argc, char* argv[]) {
       return 1;
     }
     fb2file.setupCacheDir();
-    printf("FB2: \"%s\" by %s (%d TOC entries)\n", fb2file.getTitle().c_str(), fb2file.getAuthor().c_str(),
-           fb2file.tocCount());
+    const uint16_t sectionCount = fb2file.getSectionCount();
+    printf("FB2: \"%s\" by %s (%u sections, %d TOC entries)\n", fb2file.getTitle().c_str(),
+           fb2file.getAuthor().c_str(), static_cast<unsigned>(sectionCount), fb2file.tocCount());
 
-    Fb2Parser parser(filepath, gfx, config, fb2file.getLanguage());
-    std::string cachePath = outputDir + "/pages_0.bin";
-    PageCache cache(cachePath);
-    cache.create(parser, config, batchSize);
-    while (batchSize > 0 && cache.isPartial()) {
-      cache.extend(parser, batchSize);
+    int totalPages = 0;
+    for (uint16_t s = 0; s < sectionCount; s++) {
+      Fb2Parser parser(fb2file.getSectionPath(static_cast<int>(s)), gfx, config, fb2file.getLanguage());
+      std::string cachePath = outputDir + "/pages_" + std::to_string(s) + ".bin";
+      PageCache cache(cachePath);
+      cache.create(parser, config, batchSize);
+      while (batchSize > 0 && cache.isPartial()) {
+        uint16_t before = cache.pageCount();
+        cache.extend(parser, batchSize);
+        if (cache.pageCount() == before) break;
+      }
+      totalPages += cache.pageCount();
+      if (dump) dumpPages(cache, gfx, FONT_ID);
     }
-    printf("FB2: %d pages -> %s\n", cache.pageCount(), cachePath.c_str());
-    if (dump) dumpPages(cache, gfx, FONT_ID);
+    printf("FB2: %d pages across %u sections -> %s/pages_*.bin\n", totalPages,
+           static_cast<unsigned>(sectionCount), outputDir.c_str());
 
   } else if (type == HTML_FILE) {
     Html htmlFile(filepath, outputDir);
@@ -328,7 +462,9 @@ int main(int argc, char* argv[]) {
     PageCache cache(cachePath);
     cache.create(parser, config, batchSize);
     while (batchSize > 0 && cache.isPartial()) {
+      uint16_t before = cache.pageCount();
       cache.extend(parser, batchSize);
+      if (cache.pageCount() == before) break;
     }
     printf("HTML: %d pages -> %s\n", cache.pageCount(), cachePath.c_str());
     if (dump) dumpPages(cache, gfx, FONT_ID);
@@ -344,10 +480,19 @@ int main(int argc, char* argv[]) {
     PlainTextParser parser(filepath, gfx, config);
     std::string cachePath = outputDir + "/pages_0.bin";
     PageCache cache(cachePath);
-    cache.create(parser, config, 0);
+    cache.create(parser, config, batchSize);
+    while (batchSize > 0 && cache.isPartial()) {
+      uint16_t before = cache.pageCount();
+      cache.extend(parser, batchSize);
+      if (cache.pageCount() == before) break;
+    }
     printf("TXT: %d pages -> %s\n", cache.pageCount(), cachePath.c_str());
     if (dump) dumpPages(cache, gfx, FONT_ID);
   }
+
+  if (extRegular.success) EpdFontLoader::freeLoadResult(extRegular);
+  if (extBold.success) EpdFontLoader::freeLoadResult(extBold);
+  if (extItalic.success) EpdFontLoader::freeLoadResult(extItalic);
 
   return 0;
 }

@@ -4,9 +4,14 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "../content/BookmarkManager.h"
+#include "../content/GlobalPageMetrics.h"
 #include "../content/ReaderNavigation.h"
+#include "../content/ReadingSessionTracker.h"
+#include "../content/ReadingStatsStore.h"
+#include "../core/ReaderButtonDispatcher.h"
 #include "../core/Types.h"
 #include "../rendering/XtcPageRenderer.h"
 #include "../ui/views/HomeView.h"
@@ -18,6 +23,7 @@ class GfxRenderer;
 class PageCache;
 class Page;
 struct RenderConfig;
+struct Theme;
 
 namespace papyrix {
 
@@ -51,9 +57,12 @@ class ReaderState : public State {
  private:
   GfxRenderer& renderer_;
   XtcPageRenderer xtcRenderer_;
-  char contentPath_[256];
+  char contentPath_[BufferSize::FilePath];
+  uint32_t sourceFingerprint_ = 0;
   uint32_t currentPage_;
   bool needsRender_;
+  bool suppressRender_ = false;
+  bool cacheWaitActive_ = false;
   bool contentLoaded_;
   bool loadFailed_ = false;  // Track if content loading failed (for error state transition)
 
@@ -64,6 +73,9 @@ class ReaderState : public State {
   // Last successfully rendered position (for accurate progress saving)
   int lastRenderedSpineIndex_ = 0;
   int lastRenderedSectionPage_ = 0;
+  uint32_t lastRenderedPage_ = 0;
+  bool hasRenderedPage_ = false;
+  bool resumeRegistered_ = false;
 
   // Whether book has a valid cover image
   bool hasCover_ = false;
@@ -82,13 +94,15 @@ class ReaderState : public State {
   std::unique_ptr<ContentParser> parser_;
   int parserSpineIndex_ = -1;
   uint8_t pagesUntilFullRefresh_;
+  bool forceDoubleRefresh_ = false;
 
   // Background caching (uses BackgroundTask for proper lifecycle management)
   BackgroundTask cacheTask_;
   Core* coreForCacheTask_ = nullptr;
   bool thumbnailDone_ = false;
+  bool coverDone_ = false;
   void startBackgroundCaching(Core& core);
-  void stopBackgroundCaching();
+  bool stopBackgroundCaching(bool waitForever = false);
 
   // Navigation helpers (delegates to ReaderNavigation)
   void navigateNext(Core& core);
@@ -97,34 +111,58 @@ class ReaderState : public State {
   void navigatePrevChapter(Core& core);
   void applyNavResult(const ReaderNavigation::NavResult& result, Core& core);
 
-  // Track whether a chapter jump already fired during a button hold
-  bool holdNavigated_ = false;
+  // Decision-only input dispatchers (own hold tracking and power-press timing)
+  ReaderButtonDispatcher readerButtons_;
+  TocInputDispatcher tocInput_;
 
-  // Track power press start when short power action is mapped to page turn.
-  // This lets us execute page turn only on short release and avoid accidental
-  // turns when the same press is held to enter sleep.
-  uint32_t powerPressStartedMs_ = 0;
+  // Bookmark notification auto-dismiss timer
+  uint32_t bookmarkNotifyMs_ = 0;
+  void showBookmarkNotification(Core& core);
 
   // Rendering
   void renderCurrentPage(Core& core);
   void renderCachedPage(Core& core);
   void renderXtcPage(Core& core);
   bool renderCoverPage(Core& core);
+  void onPageRendered(Core& core);
 
   // Helpers
   void renderPageContents(Core& core, Page& page, int marginTop, int marginRight, int marginBottom, int marginLeft);
   void renderStatusBar(Core& core, int marginRight, int marginBottom, int marginLeft);
 
+  // Global page metrics — whole-book page counting for EPUB/FB2
+  using GlobalPageMetrics = page_metrics::Display;
+  using SectionPageMetric = page_metrics::Section;
+  void invalidateGlobalPageMetrics();
+  void initializeGlobalPageMetrics(Core& core);
+  void updateGlobalPageMetrics(Core& core);
+  GlobalPageMetrics resolveGlobalPageMetrics(Core& core);
+  bool saveMetricsIndex(const std::string& sectionsDir, const RenderConfig& config);
+  bool loadMetricsIndex(const std::string& sectionsDir, const RenderConfig& config, int spineCount);
+  void deleteMetricsIndex(Core& core);
+
+  std::vector<SectionPageMetric> globalSectionPageMetrics_;
+  bool globalSectionPageMetricsInitialized_ = false;
+
+  ReadingSessionTracker readingSession_;
+  void recordReadingActivityIfMoved(int oldSpine, int oldSection, uint32_t oldPage);
+  void updateReadingProgress(const GlobalPageMetrics& metrics);
+  void flushReadingSession();
+
   // Cache management
-  bool ensurePageCached(Core& core, uint16_t pageNum);
+  bool ensurePageCached(Core& core, uint32_t pageNum);
   void loadCacheFromDisk(Core& core);
   void createOrExtendCache(Core& core);
+  void beginCacheWait(Core& core);
+  void endCacheWait(Core& core);
 
   void createOrExtendCacheImpl(ContentParser& parser, const std::string& cachePath, const RenderConfig& config);
-  void backgroundCacheImpl(ContentParser& parser, const std::string& cachePath, const RenderConfig& config);
+  void backgroundCacheImpl(ContentParser& parser, const std::string& cachePath, const RenderConfig& config,
+                           uint32_t currentPage);
 
   // Display helpers
   void displayWithRefresh(Core& core);
+  void displayGrayscaleBase(const Core& core);
 
   // Viewport calculation
   struct Viewport {
@@ -136,22 +174,27 @@ class ReaderState : public State {
     int height;
   };
   Viewport getReaderViewport(bool showStatusBar) const;
+  RenderConfig makeRenderConfig(Core& core, const Theme& theme, const Viewport& viewport) const;
 
   // Get first content spine index (skips cover document when appropriate)
   static int calcFirstContentSpine(bool hasCover, int textStartIndex, size_t spineCount);
 
   // Anchor-to-page persistence for intra-spine TOC navigation
   static void saveAnchorMap(const ContentParser& parser, const std::string& cachePath);
+  static bool anchorMapCurrent(const std::string& cachePath);
   static int loadAnchorPage(const std::string& cachePath, const std::string& anchor);
-  static std::vector<std::pair<std::string, uint16_t>> loadAnchorMap(const std::string& cachePath);
+  static std::vector<std::pair<std::string, uint32_t>> loadAnchorMap(const std::string& cachePath);
 
   // Source state (where reader was opened from)
   StateId sourceState_ = StateId::Home;
 
-  // Cached chapter title for StatusChapter mode (avoids SD I/O on every render)
+  // Cached chapter title for StatusChapter mode (avoids SD I/O on every render).
+  // Valid while currentSpineIndex_ == cachedChapterSpine_ and
+  // cachedChapterStartPage_ <= currentSectionPage_ < cachedChapterEndPage_.
   char cachedChapterTitle_[64] = "";
   int cachedChapterSpine_ = -1;
-  int cachedChapterPage_ = -1;
+  int cachedChapterStartPage_ = 0;
+  int cachedChapterEndPage_ = 0;
 
   // TOC overlay mode
   bool tocMode_ = false;
@@ -163,16 +206,25 @@ class ReaderState : public State {
   void renderTocOverlay(Core& core);
   int tocVisibleCount() const;
   void populateTocView(Core& core);
-  int findCurrentTocEntry(Core& core);
+  int findCurrentTocEntry(Core& core, int* outRangeStart = nullptr, int* outRangeEnd = nullptr);
   void jumpToTocEntry(Core& core, int tocIndex);
 
   // Menu overlay mode
   bool menuMode_ = false;
   ui::ReaderMenuView menuView_;
+  ui::OverlayTapGuard overlayTapGuard_;
   void enterMenuMode(Core& core);
   void exitMenuMode();
   void handleMenuInput(Core& core, const Event& e);
-  void handleMenuAction(Core& core, int action);
+  void handleMenuAction(Core& core, ui::ReaderMenuView::Item action);
+
+  // Book statistics overlay mode
+  bool bookStatsMode_ = false;
+  ui::BookStatsView bookStatsView_;
+  void enterBookStatsMode(Core& core);
+  void exitBookStatsMode(Core& core);
+  void handleBookStatsInput(Core& core, const Event& e);
+  void populateBookStatsView(Core& core);
 
   // Bookmark overlay mode
   Bookmark bookmarks_[BookmarkManager::MAX_BOOKMARKS];
@@ -192,6 +244,21 @@ class ReaderState : public State {
 
   // Boot mode transition - exit to UI via restart
   void exitToUI(Core& core);
+
+  // Full book pre-processing
+  bool indexingInProgress_ = false;
+  bool indexingCancelled_ = false;
+  bool indexingFailed_ = false;
+  int indexingSpine_ = 0;
+  int indexingTotalSpines_ = 0;
+  std::unique_ptr<PageCache> indexingCache_;
+  std::unique_ptr<ContentParser> indexingParser_;
+  uint32_t indexingLastRenderMs_ = 0;
+
+  void startFullBookIndexing(Core& core);
+  void processIndexingChunk(Core& core);
+  void renderIndexingScreen(Core& core);
+  bool isFullyIndexed(Core& core);
 };
 
 }  // namespace papyrix

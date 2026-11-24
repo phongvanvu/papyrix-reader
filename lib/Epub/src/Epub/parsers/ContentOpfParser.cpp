@@ -6,6 +6,8 @@
 #include <Serialization.h>
 #include <Utf8.h>
 
+#include <string_view>
+
 #include "../BookMetadataCache.h"
 
 #define TAG "OPF"
@@ -13,6 +15,19 @@
 namespace {
 constexpr char MEDIA_TYPE_NCX[] = "application/x-dtbncx+xml";
 constexpr char itemCacheFile[] = "/.items.bin";
+
+bool hasToken(std::string_view values, const std::string_view token) {
+  while (!values.empty()) {
+    const size_t start = values.find_first_not_of(" \t\r\n");
+    if (start == std::string_view::npos) return false;
+    values.remove_prefix(start);
+    const size_t end = values.find_first_of(" \t\r\n");
+    if (values.substr(0, end) == token) return true;
+    if (end == std::string_view::npos) return false;
+    values.remove_prefix(end);
+  }
+  return false;
+}
 
 // Find the last valid UTF-8 boundary within maxLen bytes
 // Returns the safe length to use for truncation (may be less than maxLen)
@@ -79,8 +94,9 @@ ContentOpfParser::~ContentOpfParser() {
   if (tempItemStore) {
     tempItemStore.close();
   }
-  if (SdMan.exists((cachePath + itemCacheFile).c_str())) {
-    SdMan.remove((cachePath + itemCacheFile).c_str());
+  const auto itemCachePath = cachePath + itemCacheFile;
+  if (cache && SdMan.exists(itemCachePath.c_str())) {
+    SdMan.remove(itemCachePath.c_str());
   }
 }
 
@@ -161,28 +177,20 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
 
   if (self->state == IN_PACKAGE && (strcmp(name, "manifest") == 0 || strcmp(name, "opf:manifest") == 0)) {
     self->state = IN_MANIFEST;
-    if (!SdMan.openFileForWrite("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
-      LOG_ERR(TAG, "Couldn't open temp items file for writing. This is probably going to be a fatal error.");
+    if (self->cache) {
+      if (!SdMan.openFileForWrite("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
+        LOG_ERR(TAG, "Couldn't open temp items file for writing. This is probably going to be a fatal error.");
+      }
     }
     return;
   }
 
   if (self->state == IN_PACKAGE && (strcmp(name, "spine") == 0 || strcmp(name, "opf:spine") == 0)) {
     self->state = IN_SPINE;
-    if (!SdMan.openFileForRead("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
-      LOG_ERR(TAG, "Couldn't open temp items file for reading. This is probably going to be a fatal error.");
-    } else {
-      std::string itemId;
-      std::string href;
-      while (self->tempItemStore.available()) {
-        if (!serialization::readString(self->tempItemStore, itemId) ||
-            !serialization::readString(self->tempItemStore, href)) {
-          LOG_ERR(TAG, "Failed to read manifest item from temp store");
-          break;
-        }
-        self->manifestIndex[itemId] = href;
+    if (self->cache) {
+      if (!SdMan.openFileForRead("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
+        LOG_ERR(TAG, "Couldn't open temp items file for reading. This is probably going to be a fatal error.");
       }
-      self->tempItemStore.close();
     }
     return;
   }
@@ -228,12 +236,18 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
       }
     }
 
-    // Write items down to SD card
-    serialization::writeString(self->tempItemStore, itemId);
-    serialization::writeString(self->tempItemStore, href);
+    if (self->cache) {
+      const uint32_t offset = static_cast<uint32_t>(self->tempItemStore.position());
+      serialization::writeString(self->tempItemStore, itemId);
+      serialization::writeString(self->tempItemStore, href);
+      self->manifestCompact_.push_back({fnvHash32(itemId.c_str()), offset});
+    }
 
     if (itemId == self->coverItemId) {
       self->coverItemHref = href;
+    }
+    if (self->coverIdHref.empty() && (itemId == "cover" || itemId == "cover-image" || itemId == "cover_image")) {
+      self->coverIdHref = href;
     }
 
     if (mediaType == MEDIA_TYPE_NCX) {
@@ -253,6 +267,11 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
       }
     }
 
+    if (self->coverImageHref.empty() && hasToken(properties, "cover-image")) {
+      self->coverImageHref = href;
+      if (self->coverItemHref.empty()) self->coverItemHref = href;
+    }
+
     // Collect CSS files
     if (mediaType.find("css") != std::string::npos) {
       self->cssFiles_.push_back(href);
@@ -261,16 +280,23 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
     return;
   }
 
-  // NOTE: This relies on spine appearing after item manifest (which is pretty safe as it's part of the EPUB spec)
-  // Only run the spine parsing if there's a cache to add it to
   if (self->cache) {
     if (self->state == IN_SPINE && (strcmp(name, "itemref") == 0 || strcmp(name, "opf:itemref") == 0)) {
       for (int i = 0; atts[i]; i += 2) {
         if (strcmp(atts[i], "idref") == 0) {
-          const std::string idref = atts[i + 1];
-          auto it = self->manifestIndex.find(idref);
-          if (it != self->manifestIndex.end()) {
-            self->cache->createSpineEntry(it->second);
+          const uint32_t h = fnvHash32(atts[i + 1]);
+          auto it =
+              std::lower_bound(self->manifestCompact_.begin(), self->manifestCompact_.end(), ManifestIndexEntry{h, 0});
+          while (it != self->manifestCompact_.end() && it->idHash == h) {
+            self->tempItemStore.seek(it->fileOffset);
+            std::string storedId;
+            std::string href;
+            if (serialization::readString(self->tempItemStore, storedId) &&
+                serialization::readString(self->tempItemStore, href) && storedId == atts[i + 1]) {
+              self->cache->createSpineEntry(href);
+              break;
+            }
+            ++it;
           }
         }
       }
@@ -280,23 +306,24 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
   // parse the guide
   if (self->state == IN_GUIDE && (strcmp(name, "reference") == 0 || strcmp(name, "opf:reference") == 0)) {
     std::string type;
-    std::string textHref;
+    std::string guideHref;
     for (int i = 0; atts[i]; i += 2) {
       if (strcmp(atts[i], "type") == 0) {
         type = atts[i + 1];
-        if (type == "text" || type == "start") {
-          continue;
-        } else {
-          LOG_DBG(TAG, "Skipping non-text reference in guide: %s", type.c_str());
-          break;
-        }
       } else if (strcmp(atts[i], "href") == 0) {
-        textHref = FsHelpers::normalisePath(self->baseContentPath + atts[i + 1]);
+        guideHref = FsHelpers::normalisePath(self->baseContentPath + atts[i + 1]);
       }
     }
-    if ((type == "text" || (type == "start" && !self->textReferenceHref.empty())) && (textHref.length() > 0)) {
-      LOG_INF(TAG, "Found %s reference in guide: %s", type.c_str(), textHref.c_str());
-      self->textReferenceHref = textHref;
+    if (!guideHref.empty()) {
+      if ((type == "text" || type == "start") && self->textReferenceHref.empty()) {
+        LOG_INF(TAG, "Found %s reference in guide: %s", type.c_str(), guideHref.c_str());
+        self->textReferenceHref = guideHref;
+      } else if ((type == "cover" || type == "cover-page") && self->guideCoverPageHref.empty()) {
+        LOG_INF(TAG, "Found cover reference in guide: %s", guideHref.c_str());
+        self->guideCoverPageHref = guideHref;
+      } else {
+        LOG_DBG(TAG, "Skipping reference in guide of unhandled type: %s", type.c_str());
+      }
     }
     return;
   }
@@ -349,6 +376,13 @@ void XMLCALL ContentOpfParser::endElement(void* userData, const XML_Char* name) 
 
   if (self->state == IN_SPINE && (strcmp(name, "spine") == 0 || strcmp(name, "opf:spine") == 0)) {
     self->state = IN_PACKAGE;
+    if (self->cache) {
+      self->tempItemStore.close();
+      {
+        std::vector<ManifestIndexEntry> tmp;
+        self->manifestCompact_.swap(tmp);
+      }
+    }
     return;
   }
 
@@ -359,7 +393,10 @@ void XMLCALL ContentOpfParser::endElement(void* userData, const XML_Char* name) 
 
   if (self->state == IN_MANIFEST && (strcmp(name, "manifest") == 0 || strcmp(name, "opf:manifest") == 0)) {
     self->state = IN_PACKAGE;
-    self->tempItemStore.close();
+    if (self->cache) {
+      self->tempItemStore.close();
+      std::sort(self->manifestCompact_.begin(), self->manifestCompact_.end());
+    }
     return;
   }
 

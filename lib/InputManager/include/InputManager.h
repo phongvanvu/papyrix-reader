@@ -1,18 +1,30 @@
 #pragma once
 
 #include <Arduino.h>
+#include <BackgroundTask.h>
 #include <driver/gpio.h>
+
+#include <array>
+#include <mutex>
 
 class InputManager {
  public:
   InputManager();
+  ~InputManager();
   void begin();
   uint8_t getState();
+  bool startSampling();
+  void stopSampling();
+  bool isSampling() const { return sampling_; }
 
   /**
    * Updates the button states. Should be called regularly in the main loop.
    */
   void update();
+
+  bool isDebouncePending() const;
+  void setSuppressedButtons(uint8_t mask);
+  bool wasSuppressed(uint8_t buttonIndex) const;
 
   /**
    * Returns true if the button was being held at the time of the last #update() call.
@@ -63,6 +75,8 @@ class InputManager {
    */
   unsigned long getHeldTime() const;
 
+  static constexpr unsigned long IDLE_SAMPLE_INTERVAL_MS = 10;
+
   // Button indices
   static constexpr uint8_t BTN_BACK = 0;
   static constexpr uint8_t BTN_CONFIRM = 1;
@@ -85,6 +99,25 @@ class InputManager {
 
  private:
   int getButtonFromADC(int adcValue, const int ranges[], int numButtons);
+  void sampleButtons();
+
+  struct StateChange {
+    unsigned long time;
+    uint8_t state;
+    uint8_t suppressAfter = 0;
+  };
+  std::array<StateChange, 32> pending_{};
+  size_t readIndex_ = 0;
+  size_t writeIndex_ = 0;
+  size_t pendingCount_ = 0;
+  uint8_t sampledState_ = 0;
+  uint8_t queuedState_ = 0;
+  uint8_t suppressedButtons_ = 0;
+  uint8_t releaseSuppressedButtons_ = 0;
+  uint8_t pendingSuppression_ = 0;
+  uint8_t suppressedEvents_ = 0;
+  bool sampling_ = false;
+  mutable std::mutex samplingMutex_;
 
   uint8_t currentState;
   uint8_t lastState;
@@ -100,20 +133,22 @@ class InputManager {
   static constexpr int NUM_BUTTONS_2 = 2;
   static const int ADC_RANGES_2[];
 
-  static constexpr int ADC_NO_BUTTON = 3800;
-  static constexpr unsigned long DEBOUNCE_DELAY = 5;
+  static constexpr int ADC_NO_BUTTON = 3900;
+  static constexpr unsigned long DEBOUNCE_DELAY = 20;
+  static constexpr unsigned long ACTIVE_SAMPLE_INTERVAL_MS = 5;
 
   static const char* BUTTON_NAMES[];
+  BackgroundTask samplingTask_;
 };
 
-// Disable internal pull-ups/pull-downs on all GPIOs to minimize leakage current during deep sleep.
-// Skips POWER_BUTTON_PIN (wakeup source — needs pull-up to avoid floating/spurious wakeups).
-inline void disableGpioPullsForSleep() {
+// Keep the wake button biased to prevent false wakeups.
+inline void disableGpioPullsForSleep(int8_t powerPin) {
   static constexpr gpio_num_t pins[] = {
       GPIO_NUM_0, GPIO_NUM_1, GPIO_NUM_2,  GPIO_NUM_4,  GPIO_NUM_5,  GPIO_NUM_6,  GPIO_NUM_7,
       GPIO_NUM_8, GPIO_NUM_9, GPIO_NUM_10, GPIO_NUM_13, GPIO_NUM_20, GPIO_NUM_21,
   };
   for (auto pin : pins) {
+    if (pin == powerPin) continue;
     gpio_pullup_dis(pin);
     gpio_pulldown_dis(pin);
   }

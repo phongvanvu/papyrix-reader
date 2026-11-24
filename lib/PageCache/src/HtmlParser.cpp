@@ -34,14 +34,18 @@ void HtmlParser::reset() {
   anchorMap_.clear();
 }
 
-const std::vector<std::pair<std::string, uint16_t>>& HtmlParser::getAnchorMap() const {
+const std::vector<std::pair<std::string, uint32_t>>& HtmlParser::getAnchorMap() const {
   if (liveParser_) {
     return liveParser_->getAnchorMap();
   }
   return anchorMap_;
 }
 
-bool HtmlParser::parsePages(const std::function<void(std::unique_ptr<Page>)>& onPageComplete, uint16_t maxPages,
+uint32_t HtmlParser::bytesConsumed() const { return liveParser_ ? liveParser_->bytesRead() : 0; }
+
+uint32_t HtmlParser::totalBytes() const { return liveParser_ ? liveParser_->totalSize() : 0; }
+
+bool HtmlParser::parsePages(const std::function<void(std::unique_ptr<Page>)>& onPageComplete, uint32_t maxPages,
                             const AbortCallback& shouldAbort) {
   // RESUME PATH
   if (initialized_ && liveParser_ && liveParser_->isSuspended()) {
@@ -79,7 +83,7 @@ bool HtmlParser::parsePages(const std::function<void(std::unique_ptr<Page>)>& on
   std::string parseHtmlPath = filepath_;
   normalizedPath_ = cacheDir_ + "/.norm_tmp.html";
 
-  if (html5::normalizeVoidElements(filepath_, normalizedPath_)) {
+  if (html5::normalizeHtmlForXml(filepath_, normalizedPath_)) {
     parseHtmlPath = normalizedPath_;
   } else {
     normalizedPath_.clear();

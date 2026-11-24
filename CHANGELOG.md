@@ -1,5 +1,473 @@
 
 
+## v1.38.1 (2026-11-19)
+
+*  Update CHANGELOG [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  main: Add USB installation and update commands for Sticky [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.38.0 (2026-11-15)
+
+*  Update changelog [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  main: Add Lights Out with saved games [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add Sokoban game [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.37.2 (2026-11-12)
+
+*  Add chapter jumps on hold. Issue #174 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add settings groups with dashed separators [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Correct WiFi transfer connections and HTTP parsing. Issue #177 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.37.1 (2026-11-09)
+
+*  Correct WiFi transfer stalls and memory leaks. Issue #177 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.37.0 (2026-11-07)
+
+*  Fix docs [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  main: Move mini-app lifecycle into a shared library [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  feature/go-9x9: Add offline 9x9 Go against the device [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Correct RTC pulls for S3 power-button wake [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Update version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.36.0 (2026-11-01)
+
+*  Update changelog [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add Clock power modes on all supported boards [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add a sleep image picker with saved selection. Issue #157 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  feat: Add 2048 game with touch controls and resume [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.35.0 (2026-10-27)
+
+*  Add front-light controls and tap dismiss to Reader Menu [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  main: Add touch reader controls and edge tabs [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  main: Add front light timeout and smooth transitions [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  main: Accept compatible firmware without board tags [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Replace X3 detection with the FreeInk stock probe [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.34.0 (2026-10-26)
+
+*  Keep the last book when another book fails to open [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Stop saves after failed loads to keep reading history [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add recovery for missing EPUB tables of contents [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add browser caching for the web page [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Correct bit depth detection to read legacy XTC books [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add progressive JPEG support on S3 devices [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add EPUB cover discovery with cover page image selection [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add reTerminal Sticky device support [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add Murphy M4 support [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  main: Correct indexing on cached backward chapter jumps [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  fix/epub-continuous-chapters: Replace virtual EPUB sections [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  fix/reader-cache-wait: Keep reader responsive during cache preparation [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  fix/epub-css-rule-cache: Add a cache for parsed EPUB CSS rules [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  main: Correct EPUB bounds and touch reader navigation [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.33.2 (2026-10-21)
+
+*  Refuse to open a book when SD space is low. Issue #171 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add the BQ27220 design-capacity load for X3 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Enable bulk SPI transfers for SD card reads [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Skip HTML hidden attribute content in EPUB parser [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  POWER_ON only after real panel power-off on X3 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Vendor patched SdFat and add cache-invalidation test [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Return no bitmap for glyph with zero bytes [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Stop data loss in uploads and paginated books [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.33.1 (2026-10-05)
+
+*  Add manual removal from recent books. Issue #161 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add PSRAM caches for S3 readers [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add Pomodoro mini app [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add USB port selector for X4 Classic flash target [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Set Pomodoro default startMode to Auto and throttle CPU in overlay [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  USB, input, and Calibre fixes [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.33.0 (2026-09-27)
+
+*  Update changelog [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  fix/upload-memory-compatibility: Stream uploads and limit RAM [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add original filename to the reader status bar. Issue #169 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.32.1 (2026-09-23)
+
+*  Update docs [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.32.0 (2026-09-23)
+
+*  Add X4 v2 Classic support [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fix button presses during display refresh [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Update docs [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add saved Wi-Fi network management with edit, reorder, and forget [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.31.0 (2026-09-18)
+
+*  Set cover size limits for each display [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add driverless network printer app [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add the LocalSend receiver app for file transfer [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add LocalSend and Printer logos [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add image viewing with cached conversion to the file manager [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add a FileManager support on UI for Printer and LocalSend [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  main: Stop ZIP underflow and rejected sleep loops [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Correct FileList Back to select the previous folder [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump bersion [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.30.0 (2026-09-13)
+
+*  Update docs [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Update changelog [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add clock themes [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add new logo and simplify boot/sleep screens [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Correct the Day and Night Moon display [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.29.0 (2026-09-08)
+
+*  Add support for X3 UC8279. Issue #160 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  X3: Add UC8253 half-refresh scrub waveform [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Reader: Block menu on the cover page [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  GfxRenderer: Log render time on grayscale display [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  X3: Use full-frame refresh for window updates [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add shared hardware support for X3, X4, and X4 Pr [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add SDMMC fallback for whole-device FAT16 and reset idle timer on sleep failure [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Defer Clock settings save and NTP sync to Back button [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Use fast refresh for Clock app [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Correct Clock power and sync behavior [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.28.2 (2026-08-25)
+
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.28.1 (2026-08-25)
+
+*  Update CHANGELOG [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bookmarks: Increase per-book limit to 50. Issue 159 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.28.0 (2026-08-21)
+
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fix firmware input and task safety [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fix cache and transition safety. Fix persistence and ZIP validation issues. [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fix parser, cache, and reading-state failure paths [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Files: Restore recursive deletion and add recycle-bin toggle [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Logging: Stabilize USB serial startup [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Reader: Fix page caching and add persistent Home thumbnails [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  XTC: Stream page planes with bounded memory [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  XTC: Stream cover generation with bounded memory and retryable failures [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  ImageConverter: Convert BMP sidecars to canonical 1-bit covers [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Cpu: Serialize throttle transitions with performance locks [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Tests: Harden storage mock and cover ReaderState/ContentHandle paths [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Cleanup: Untrack bytecode and make reader-test thumbnail mock configurable [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  XTC: Balance cover grayscale threshold to keep scanned backgrounds white [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  XTC: Restore original cover threshold and regenerate stale 2-bit artifacts [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Correct decoder, cache and stats file errors [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  fix: check decoder data, web paths, and settings writes [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Rewrite README and guides in STE100 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.27.0 (2026-08-05)
+
+*  Add recycle bin. Issue #151 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fix state registry capacity for error state. Issue #156 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Harden fixed capacities against enum drift [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fix untrusted parsers and clear status-bar ~ for empty sections [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fix XTC parsing and page metric regressions [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add per-book reading statistics [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fix localized text overflow [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add SD-backed indexing for large directories [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Reader: Reuse framebuffer memory for EPUB and FB2 parsing [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Support Unicode filenames in Web UI. Issue #155 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.26.2 (2026-07-21)
+
+*  ImageViewer: Add 2-bit grayscale rendering. Issue #149 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  XTC: Force base refresh before grayscale pages [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.26.0 (2026-07-14)
+
+*  Add Recent Books. Issue #141 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Update version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  HomeView: Fix tr() macro expansion with ternary operator [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Epub: Fix TOC skipped permanently on low heap. Issue #148 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  AppLauncher: Ignore ButtonRepeat in app and overlay modes [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.25.0 (2026-07-13)
+
+*  Add Sleep 'Keep Page' mode. Issue #145 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Update version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.24.4 (2026-07-13)
+
+*  Stability: Atomic SD writes and OOM-safe image paths [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Epub: Apply CSS block-level margins and padding to page layout. Issue #139 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add script for generate test books [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Reader: Bump loopTask stack to 12KB to fix PNG convert crash [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Update version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.24.3 (2026-06-16)
+
+*  Network: Fix Recent auto-connect routing and add regression test [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.24.2 (2026-06-16)
+
+*  Network: Add Recent quick-connect option to WiFi mode select. Issue #123 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.24.1 (2026-06-05)
+
+*  Reader: Fix reboot on large text paragraphs. Issue #137 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Reader: Detect partial spines so full-book process finishes. Issue #136 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.24.0 (2026-05-29)
+
+*  Fix cache corruption when device runs low on memory during parsing. Issue #126 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  TXT: Join lines within paragraphs, break only on blank lines. Issue #129 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fix text loss at batch boundaries in Markdown and TXT parsers. Issue #133 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Epub: Split oversized spine items into smaller sections for constrained RAM. Issue #132 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fix sparse pages at batch boundaries in Markdown and TXT parsers. Issue #133 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Epub: Fix crash when opening books with large chapters. Issue #132 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Epub: Reduce home screen load time by avoiding full book parse for metadata [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Epub: Reduce memory usage and skip metadata on crash recovery. Issue #131 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Reader: Fix cover ghosting with black/white clearing sequence. Issue #125 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Epub: Fix infinite loop in Full Book Process for split-spine books [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fb2: Reduce home screen load time by avoiding full book parse for metadata [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Html5: Expand normalizer for XML safety — escape < in attrs, normalize bare attributes. Issue #130 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  SDCardManager: Add directory scan fallback for filenames with leading spaces. Issue #135 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  HtmlSplitter: Add byte-offset HTML splitting with tag tracking and optimize cache LUT for large books [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Epub: Replace per-section files with single body file and byte-range index [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Home: Add battery-only partial refresh and fix sleep screen ghost artifacts. Issue #134 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  InputManager: Fix ADC crosstalk with dummy reads and increase debounce to 20ms [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.23.4 (2026-05-21)
+
+*  Poll battery state on Home screen to update charging icon. Issue #128. [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fix text loss at page boundaries during cold cache extend. Issue #126. [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.23.3 (2026-05-20)
+
+*  Clear screen after indexing completes or fails to avoid stale display. Issue #125. [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Clear screen before drawing cover to prevent stale content artifacts [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.23.2 (2026-05-16)
+
+*  Add bookmark as short power button action with page-number labels [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.23.1 (2026-05-16)
+
+*  Update changelog [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Apply timezone on clock app entry. Issue #118 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.23.0 (2026-05-16)
+
+*  Update docs [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add firmware update from SD card with validation [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.22.6 (2026-05-16)
+
+*  ReaderState: Save overlay to metrics.bin so next open hits fast path with accurate counts [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  picojpeg: Add grayscale-only decode mode, skip chroma IDCT and RGB conversion [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Epub: Batch spine item size lookups into single ZIP pass [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.22.5 (2026-05-15)
+
+*  Utf8: Add utf8SafeCopy and replace strncpy in all content providers [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add resumable FB2 parsing, chunked indexing, and fix resume indent bug. Issue #106 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  ClockApp: Fix timezone offset using TZ env var. Issue #118 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  ReaderState: Batch monolithic spines and only chunk large ones during full-book indexing. Issue #106 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  SDCardManager: Replace recursive removeDir with iterative and add progress callback [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  ReaderState: Cache page metrics to SD to avoid slow directory scan on book open [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  ReaderState: Bump metrics.bin to v2 with byteSize, skip directory scan on fast-path [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.22.4 (2026-05-12)
+
+*  Increase path buffers to 512 bytes for long UTF-8 file paths: Issue #106 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.22.3 (2026-05-11)
+
+*  Fb2: Filter nested sections to leaf-only, add WDT resets and abort propagation across parsers . Issue #106 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fb2: Detect RTL from word content instead of initial buffer peek [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Markdown, Txt: Detect RTL from word content instead of initial buffer peek [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.22.2 (2026-05-11)
+
+*  PageCache: Preserve partial cache when extend fails instead of deleting it [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Optimize bitmap rendering: bulk I/O, fixed-point scaling, identity palette fast path, downscale-only [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  JpegToBmpConverter: Add heap pre-check and abort support during decode [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fix LRU counter overflow, CSS bold/italic flush, UTF-8-safe TOC truncation, and removeDir safety guards [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  XtcPageRenderer: Sync hardware RAMs after grayscale render to fix stale RED RAM on page turn [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add fsync, SD card retry loops, heap checks before caching, and fix state rollback on LUT write failure [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fb2: Flush word buffer at style tag boundaries to fix last-word style loss. Issue #114 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.22.1 (2026-05-10)
+
+*  Update changelog [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Switch battery percentage to hardware-reported readPercentage(). Issue #100 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add full book pre-processing to index all pages before reading, Issue #106 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.22.0 (2026-05-08)
+
+*  Update changelog [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add I18n localization system with SD card locale overrides, Issue #111 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.21.0 (2026-05-07)
+
+*  PageCache: Estimate total pages while partial via parser byte progress. Issue #106 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  FB2: Add per-section caching with EPUB-style navigation, progress, and bookmarks [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fix memory leaks, optimize font map lookups, and add ISO 639-2 hyphenation mapping [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  ZipFile: early exit in fillUncompressedSizes after all targets matched [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  ZipFile: add poison-trailing-entry test to prove fillUncompressedSizes early exit [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Epub: null-guard currentPage in addLineToPage to prevent crash on 750-word split [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Reader hardening: CSS/hyphenation memory, battery UI, EPUB3 cover [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Reader: EPUB guide cover, image upscaling support, USB cold-boot sleep [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add support for Xteink X3. Issue #100 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fb2: Anchor section copy on tag bytes and paginate per section in reader-test [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  HomeView: Fit longer UTF-8 titles, wrap up to 4 lines [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Epub: Eliminate ~0.5s dead sleep per chapter on first open [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  GfxRenderer: Optimize fillRect with direct framebuffer writes and byte-level memset [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Increase I/O buffer sizes across Epub parser, HTML normalizer, and SD card reads [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  GfxRenderer: Replace per-pixel drawPixel with direct framebuffer writes [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  EInkDisplay: Batch SPI transactions for per-row plane transfers [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add IRAM_ATTR to render-path hot functions, switch to -O2/80MHz flash, and add Off pages-per-refresh option [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add crash debug, optimize text layout, and harden ZIP streaming [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add drive-all refresh mode and NFC-normalize uploaded filenames [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Optimize for size (-Oz), fix WiFi scan and GfxRenderer edge cases, and reduce heap allocations [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Reader: Cache chapter title by page range and re-resolve on unresolved anchors [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add per-page glyph warming to pre-load streaming and CJK font caches before render [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Reader: Show whole-book page numbers for EPUB and FB2 via section cache probing [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  EInkDisplay: Add turbo LUTs and LUT caching for faster X3 page turns [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  GfxRenderer: Compute button bar positions dynamically from screen width [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Update docs [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.20.3 (2026-04-29)
+
+*  Skip RTL detection on non-UTF-8 files to fix false Arabic in CP1251/KOI8-R. Issue #107 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Use PageCache for non-EPUB status bar total pages instead of file-size heuristic. Issue #106 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.20.2 (2026-04-27)
+
+*  FontManager: Log diagnostics when custom font load fail [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fb2Parser: Support poem, stanza, verse, cite, epigraph, and annotation tags. Issue #104 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  EpdFont: Add Letterlike Symbols, Number Forms, Latin Ligatures, and Cyrillic Supplement to font ranges. Issue #105 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.20.1 (2026-04-21)
+
+*  ScriptDetector: Exclude U+FEFF (BOM) from Arabic codepoint range. Issue #99 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  ArabicShaper: Mirror bracket/guillemet glyphs in RTL context and keep Arabic-Indic digits LTR. Issue #103 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.20.0 (2026-04-20)
+
+*  Fb2: Add Windows-1251 and KOI8-R encoding support for Russian FB2 files. Issue #99 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Extract encoding handling into shared lib and add auto-detection to all parsers [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fb2: Auto-detect UTF-8 to override stale encoding declarations and reboot to UI on reader-mode errors. Issue #99 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  EPUB/FB2: Render code/tt/kbd/samp as italic and preserve <pre> whitespace. Issue #94 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.19.1 (2026-04-08)
+
+*  Add IBM Plex Sans Arabic font theme for Arabic readers [[Fouad](mailto:Fouad@hey.com)]
+*  fix: prevent text loss at page boundaries during incremental parsing [[Fouad](mailto:Fouad@hey.com)]
+*  Add ParsedText abort/resume tests and fix Markdown paragraph spacing on page overflow [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fb2: Add embedded cover extraction, language parsing, and hyphenation support. Issue #93 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.19.0 (2026-03-23)
+
+*  Add mini-apps framework with Clock and Image Viewer apps [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Add CPU driver and use it in reader mode and Clock app [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  ImageViewer: Add JPEG/PNG support with auto-conversion to BMP [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.18.0 (2026-03-13)
+
+*  Fix power button page turn on long-press sleep (#88) [[Niklas Arnitz](mailto:niklas.arnitz@icloud.com)]
+*  Add tests for power button timing guard (PR #88) [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  feat: render HTML list items with bullet/number prefixes [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Fix batch suspend during post-XML content flush in EPUB parser. Issue #87 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  TOC: Always reset power button timestamp on release [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
+## v1.17.1 (2026-03-11)
+
+*  Update CHANGELOG [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Input: Prevent auto-sleep while WiFi is active. Issue 86 [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+*  Bump version [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]
+
+
 ## v1.17.0 (2026-03-08)
 
 *  SDCardManager: Fix file descriptor leaks in listFiles and removeDir [[Pavel Liashkov](mailto:pavel.liashkov@protonmail.com)]

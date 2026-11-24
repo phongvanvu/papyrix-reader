@@ -116,6 +116,13 @@ class MockPageCache {
     return result;
   }
 
+  bool loadFromDisk(uint16_t diskPages) {
+    if (diskPages == 0) return false;
+    pageCount_ = diskPages;
+    isPartial_ = true;
+    return true;
+  }
+
   uint16_t pageCount() const { return pageCount_; }
   bool isPartial() const { return isPartial_; }
 
@@ -133,8 +140,7 @@ class MockPageCache {
 };
 
 // ============================================================================
-// Simulates the two key logic patterns from ReaderState::renderCachedPage()
-// that were added in the recent diff:
+// Simulates two key logic patterns from ReaderState::renderCachedPage():
 //   1. Parser reset when background task left parser in inconsistent state
 //   2. Backward navigation: loop createOrExtendCache until chapter is fully cached
 // ============================================================================
@@ -151,6 +157,8 @@ struct ReaderCacheState {
   int currentSectionPage = 0;
 
   int totalPagesForChapter = 25;  // Configurable chapter size
+  uint16_t diskCachePages = 0;    // Simulates pages saved on disk before failure
+  bool failBuild = false;         // Simulates an SD write error / parser OOM
 
   void createOrExtendCache() {
     // Create parser if we don't have one (or if spine changed)
@@ -159,16 +167,31 @@ struct ReaderCacheState {
       parserSpineIndex = currentSpineIndex;
     }
 
+    const AbortCallback abort = failBuild ? AbortCallback([] { return true; }) : nullptr;
+
     // Create or extend the cache
     if (!pageCache) {
       pageCache.reset(new MockPageCache());
-      pageCache->create(*parser, CACHE_CHUNK);
+      if (!pageCache->create(*parser, CACHE_CHUNK, abort)) handleCacheFailure(false);
     } else if (pageCache->isPartial()) {
-      pageCache->extend(*parser, CACHE_CHUNK);
+      if (!pageCache->extend(*parser, CACHE_CHUNK, abort)) handleCacheFailure(true);
     }
   }
 
-  // Simulates the parser reset logic from the diff (lines 562-566)
+  // Mirrors the guard in ReaderState::updateGlobalPageMetrics(): a live cache is
+  // folded into the persisted metrics as exact whenever it reports "not partial".
+  bool metricsWouldRecordExact(uint16_t& pages) const {
+    if (!pageCache || pageCache->isPartial()) return false;
+    pages = pageCache->pageCount();
+    return true;
+  }
+
+  // Mirrors the empty-section skip loop in ReaderState::renderCachedPage().
+  bool wouldSkipAsEmptySection() const {
+    return pageCache && !pageCache->isPartial() && pageCache->pageCount() == 0;
+  }
+
+  // Simulates the parser reset logic in ReaderState::renderCachedPage().
   void resetParserIfInconsistent() {
     if (!pageCache && parser && parserSpineIndex == currentSpineIndex) {
       parser.reset();
@@ -176,7 +199,7 @@ struct ReaderCacheState {
     }
   }
 
-  // Simulates ensurePageCached() from ReaderState (lines 665-699)
+  // Simulates ensurePageCached() from ReaderState.
   bool ensurePageCached(uint16_t pageNum) {
     if (!pageCache) return false;
 
@@ -199,7 +222,19 @@ struct ReaderCacheState {
     return pageNum < pageCount;
   }
 
-  // Simulates the backward navigation loop from the diff (lines 584-593)
+  // Simulates backgroundCacheImpl failure recovery.
+  void handleCacheFailure(bool needsExtend) {
+    if (needsExtend) {
+      pageCache.reset(new MockPageCache());
+      if (!pageCache->loadFromDisk(diskCachePages)) {
+        pageCache.reset();
+      }
+    } else {
+      pageCache.reset();
+    }
+  }
+
+  // Simulates the backward navigation loop in ReaderState::renderCachedPage().
   void cacheEntireChapterForBackwardNav() {
     if (currentSectionPage == INT16_MAX) {
       while (pageCache && pageCache->isPartial()) {
@@ -571,6 +606,128 @@ int main() {
     state.createOrExtendCache();
 
     runner.expectTrue(state.ensurePageCached(0), "ensure_first_page");
+  }
+
+  // ============================================
+  // Extend failure recovery (backgroundCacheImpl)
+  // ============================================
+
+  // Test 22: Extend failure reloads partial cache from disk
+  {
+    ReaderCacheState state;
+    state.totalPagesForChapter = 30;
+    state.createOrExtendCache();
+    uint16_t cachedBefore = state.pageCache->pageCount();
+    runner.expectEq(static_cast<uint16_t>(10), cachedBefore, "extend_fail_initial_chunk");
+
+    state.diskCachePages = cachedBefore;
+    state.pageCache.reset();
+    state.handleCacheFailure(true);
+
+    runner.expectTrue(state.pageCache != nullptr, "extend_fail_cache_reloaded");
+    runner.expectEq(cachedBefore, state.pageCache->pageCount(), "extend_fail_pages_preserved");
+    runner.expectTrue(state.pageCache->isPartial(), "extend_fail_still_partial");
+  }
+
+  // Test 23: Extend failure with no disk cache → pageCache null
+  {
+    ReaderCacheState state;
+    state.diskCachePages = 0;
+    state.handleCacheFailure(true);
+
+    runner.expectTrue(state.pageCache == nullptr, "extend_fail_no_disk_null");
+  }
+
+  // Test 24: Fresh create failure → pageCache destroyed (never reloads)
+  {
+    ReaderCacheState state;
+    state.totalPagesForChapter = 30;
+    state.createOrExtendCache();
+    state.diskCachePages = state.pageCache->pageCount();
+
+    state.handleCacheFailure(false);
+
+    runner.expectTrue(state.pageCache == nullptr, "create_fail_cache_destroyed");
+  }
+
+  // Test 25: Extend failure → reload succeeds with different page count
+  {
+    ReaderCacheState state;
+    state.diskCachePages = 7;
+    state.handleCacheFailure(true);
+
+    runner.expectTrue(state.pageCache != nullptr, "extend_fail_reload_7_pages");
+    runner.expectEq(static_cast<uint16_t>(7), state.pageCache->pageCount(), "extend_fail_reload_count");
+  }
+
+  // ============================================
+  // Regression: a failed build must not look like a complete empty section.
+  // PageCache::create() resets to (0 pages, not partial) when it bails out, which
+  // is byte-identical to a legitimately empty section. Keeping that object made
+  // the reader persist "exact, 0 pages" into metrics.bin and skip the chapter.
+  // ============================================
+
+  // Test 26: fresh create fails -> no cache survives
+  {
+    ReaderCacheState state;
+    state.totalPagesForChapter = 30;
+    state.failBuild = true;
+
+    state.createOrExtendCache();
+
+    runner.expectTrue(state.pageCache == nullptr, "failed_create_drops_cache");
+    runner.expectFalse(state.wouldSkipAsEmptySection(), "failed_create_not_skipped_as_empty");
+    uint16_t pages = 0;
+    runner.expectFalse(state.metricsWouldRecordExact(pages), "failed_create_not_recorded_exact");
+  }
+
+  // Test 27: the same chapter builds normally once the failure clears
+  {
+    ReaderCacheState state;
+    state.totalPagesForChapter = 30;
+    state.failBuild = true;
+    state.createOrExtendCache();
+    runner.expectTrue(state.pageCache == nullptr, "retry_after_failure_starts_clean");
+
+    state.failBuild = false;
+    state.resetParserIfInconsistent();
+    state.createOrExtendCache();
+
+    runner.expectTrue(state.pageCache != nullptr, "retry_after_failure_builds");
+    runner.expectEq(static_cast<uint16_t>(10), state.pageCache->pageCount(), "retry_after_failure_first_chunk");
+    runner.expectTrue(state.pageCache->isPartial(), "retry_after_failure_partial");
+  }
+
+  // Test 28: extend fails -> falls back to the pages already committed to disk
+  {
+    ReaderCacheState state;
+    state.totalPagesForChapter = 30;
+    state.createOrExtendCache();
+    runner.expectEq(static_cast<uint16_t>(10), state.pageCache->pageCount(), "failed_extend_initial_chunk");
+
+    state.diskCachePages = state.pageCache->pageCount();
+    state.failBuild = true;
+    state.createOrExtendCache();
+
+    runner.expectTrue(state.pageCache != nullptr, "failed_extend_keeps_disk_cache");
+    runner.expectEq(static_cast<uint16_t>(10), state.pageCache->pageCount(), "failed_extend_disk_page_count");
+    runner.expectFalse(state.wouldSkipAsEmptySection(), "failed_extend_not_skipped_as_empty");
+  }
+
+  // Test 29: a genuinely empty section is still reported as exact (Issue #136)
+  {
+    ReaderCacheState state;
+    state.totalPagesForChapter = 0;
+
+    state.createOrExtendCache();
+
+    runner.expectTrue(state.pageCache != nullptr, "empty_section_cache_kept");
+    runner.expectEq(static_cast<uint16_t>(0), state.pageCache->pageCount(), "empty_section_zero_pages");
+    runner.expectFalse(state.pageCache->isPartial(), "empty_section_complete");
+    runner.expectTrue(state.wouldSkipAsEmptySection(), "empty_section_is_skipped");
+    uint16_t pages = 1;
+    runner.expectTrue(state.metricsWouldRecordExact(pages), "empty_section_recorded_exact");
+    runner.expectEq(static_cast<uint16_t>(0), pages, "empty_section_recorded_zero_pages");
   }
 
   return runner.allPassed() ? 0 : 1;

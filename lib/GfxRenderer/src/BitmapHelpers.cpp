@@ -1,6 +1,56 @@
 #include "BitmapHelpers.h"
 
+#include <Print.h>
+
+#include <climits>
 #include <cstdint>
+#include <cstring>
+#include <new>
+
+namespace {
+
+void put16(uint8_t* destination, const uint16_t value) {
+  destination[0] = static_cast<uint8_t>(value);
+  destination[1] = static_cast<uint8_t>(value >> 8);
+}
+
+void put32(uint8_t* destination, const uint32_t value) {
+  destination[0] = static_cast<uint8_t>(value);
+  destination[1] = static_cast<uint8_t>(value >> 8);
+  destination[2] = static_cast<uint8_t>(value >> 16);
+  destination[3] = static_cast<uint8_t>(value >> 24);
+}
+
+}  // namespace
+
+bool write1BitBmpHeader(Print& output, const int width, const int height) {
+  if (width <= 0 || height <= 0) return false;
+
+  const uint64_t rowSize = (static_cast<uint64_t>(width) + 31U) / 32U * 4U;
+  const uint64_t imageSize = rowSize * static_cast<uint64_t>(height);
+  const uint64_t fileSize = 62U + imageSize;
+  if (imageSize > UINT32_MAX || fileSize > UINT32_MAX) return false;
+
+  uint8_t header[62] = {};
+  header[0] = 'B';
+  header[1] = 'M';
+  put32(header + 2, static_cast<uint32_t>(fileSize));
+  put32(header + 10, 62);
+  put32(header + 14, 40);
+  put32(header + 18, static_cast<uint32_t>(width));
+  put32(header + 22, static_cast<uint32_t>(-height));
+  put16(header + 26, 1);
+  put16(header + 28, 1);
+  put32(header + 34, static_cast<uint32_t>(imageSize));
+  put32(header + 38, 2835);
+  put32(header + 42, 2835);
+  put32(header + 46, 2);
+  put32(header + 50, 2);
+  header[58] = 0xFF;
+  header[59] = 0xFF;
+  header[60] = 0xFF;
+  return output.write(header, sizeof(header)) == sizeof(header);
+}
 
 // Precomputed RGB to grayscale lookup tables (BT.601 coefficients)
 // gray = LUT_R[r] + LUT_G[g] + LUT_B[b] instead of (77*r + 150*g + 29*b) >> 8
@@ -150,357 +200,123 @@ uint8_t quantize(int gray, int x, int y) {
 // Simple 1-bit quantization (black or white)
 uint8_t quantize1bit(int gray, int x, int y) { return gray < 128 ? 0 : 1; }
 
-// BMP scaling implementation
-#include <Logging.h>
-#include <SdFat.h>
+bool write2BitBmpHeader(Print& output, const int width, const int height) {
+  if (width <= 0 || height <= 0) return false;
 
-#define TAG "BITMAP"
+  const uint64_t rowSize = (static_cast<uint64_t>(width) * 2 + 31U) / 32U * 4U;
+  const uint64_t imageSize = rowSize * static_cast<uint64_t>(height);
+  const uint64_t fileSize = 70U + imageSize;
+  if (imageSize > UINT32_MAX || fileSize > UINT32_MAX) return false;
 
-#include "SDCardManager.h"
+  uint8_t header[70] = {};
+  header[0] = 'B';
+  header[1] = 'M';
+  put32(header + 2, static_cast<uint32_t>(fileSize));
+  put32(header + 10, 70);
+  put32(header + 14, 40);
+  put32(header + 18, static_cast<uint32_t>(width));
+  put32(header + 22, static_cast<uint32_t>(-height));
+  put16(header + 26, 1);
+  put16(header + 28, 2);
+  put32(header + 34, static_cast<uint32_t>(imageSize));
+  put32(header + 38, 2835);
+  put32(header + 42, 2835);
+  put32(header + 46, 4);
+  put32(header + 50, 4);
 
-// Helper functions for BMP I/O
-static uint16_t readLE16(FsFile& f) {
-  const int c0 = f.read();
-  const int c1 = f.read();
-  return static_cast<uint16_t>(c0 & 0xFF) | (static_cast<uint16_t>(c1 & 0xFF) << 8);
-}
-
-static uint32_t readLE32(FsFile& f) {
-  const int c0 = f.read();
-  const int c1 = f.read();
-  const int c2 = f.read();
-  const int c3 = f.read();
-  return static_cast<uint32_t>(c0 & 0xFF) | (static_cast<uint32_t>(c1 & 0xFF) << 8) |
-         (static_cast<uint32_t>(c2 & 0xFF) << 16) | (static_cast<uint32_t>(c3 & 0xFF) << 24);
-}
-
-static void writeLE16(Print& out, uint16_t value) {
-  out.write(value & 0xFF);
-  out.write((value >> 8) & 0xFF);
-}
-
-static void writeLE32(Print& out, uint32_t value) {
-  out.write(value & 0xFF);
-  out.write((value >> 8) & 0xFF);
-  out.write((value >> 16) & 0xFF);
-  out.write((value >> 24) & 0xFF);
-}
-
-static void writeLE32Signed(Print& out, int32_t value) {
-  out.write(value & 0xFF);
-  out.write((value >> 8) & 0xFF);
-  out.write((value >> 16) & 0xFF);
-  out.write((value >> 24) & 0xFF);
-}
-
-static void writeBmpHeader1bit(Print& out, int width, int height) {
-  const int bytesPerRow = (width + 31) / 32 * 4;
-  const int imageSize = bytesPerRow * height;
-  const uint32_t fileSize = 62 + imageSize;
-
-  // BMP File Header (14 bytes)
-  out.write('B');
-  out.write('M');
-  writeLE32(out, fileSize);
-  writeLE32(out, 0);   // Reserved
-  writeLE32(out, 62);  // Offset to pixel data (14 + 40 + 8)
-
-  // DIB Header (40 bytes)
-  writeLE32(out, 40);
-  writeLE32Signed(out, width);
-  writeLE32Signed(out, -height);  // Negative = top-down
-  writeLE16(out, 1);              // Planes
-  writeLE16(out, 1);              // BPP
-  writeLE32(out, 0);              // No compression
-  writeLE32(out, imageSize);
-  writeLE32(out, 2835);  // X pixels/meter
-  writeLE32(out, 2835);  // Y pixels/meter
-  writeLE32(out, 2);     // Colors used
-  writeLE32(out, 2);     // Colors important
-
-  // Palette (8 bytes)
-  const uint8_t palette[8] = {
+  uint8_t palette[16] = {
       0x00, 0x00, 0x00, 0x00,  // Black
+      0x55, 0x55, 0x55, 0x00,  // Dark gray
+      0xAA, 0xAA, 0xAA, 0x00,  // Light gray
       0xFF, 0xFF, 0xFF, 0x00   // White
   };
-  out.write(palette, 8);
+  memcpy(header + 54, palette, sizeof(palette));
+  return output.write(header, sizeof(header)) == sizeof(header);
 }
 
-// Convert 2-bit palette index to grayscale (0-255)
-// Note: The source cover.bmp was already contrast-enhanced during JPEG conversion,
-// so we use the actual palette values without additional adjustment.
-static inline uint8_t palette2bitToGray(uint8_t index) {
-  // 2-bit BMP palette: 0=black(0), 1=dark gray(85), 2=light gray(170), 3=white(255)
-  static const uint8_t lut[4] = {0, 85, 170, 255};
-  return lut[index & 0x03];
+GrayscaleRowScaler::GrayscaleRowScaler(const int srcWidth, const int srcHeight, const int maxW, const int maxH)
+    : srcW_(srcWidth), srcH_(srcHeight), outW_(srcWidth), outH_(srcHeight) {
+  if (srcW_ <= 0 || srcH_ <= 0) {
+    valid_ = false;
+    return;
+  }
+
+  if (maxW > 0 && maxH > 0 && (srcW_ > maxW || srcH_ > maxH)) {
+    const float scaleToFitWidth = static_cast<float>(maxW) / srcW_;
+    const float scaleToFitHeight = static_cast<float>(maxH) / srcH_;
+    const float scale = (scaleToFitWidth < scaleToFitHeight) ? scaleToFitWidth : scaleToFitHeight;
+
+    outW_ = static_cast<int>(srcW_ * scale);
+    outH_ = static_cast<int>(srcH_ * scale);
+    if (outW_ < 1) outW_ = 1;
+    if (outH_ < 1) outH_ = 1;
+
+    scaleX_fp_ = (static_cast<uint32_t>(srcW_) << 16) / outW_;
+    scaleY_fp_ = (static_cast<uint32_t>(srcH_) << 16) / outH_;
+    nextOutY_srcStart_ = scaleY_fp_;
+    needsScaling_ = true;
+
+    rowAccum_.reset(new (std::nothrow) uint32_t[outW_]());
+    rowCount_.reset(new (std::nothrow) uint32_t[outW_]());
+    meanRow_.reset(new (std::nothrow) uint8_t[outW_]());
+    if (!rowAccum_ || !rowCount_ || !meanRow_) {
+      rowAccum_.reset();
+      rowCount_.reset();
+      meanRow_.reset();
+      valid_ = false;
+    }
+  }
 }
 
-static inline uint8_t palette1bitToGray(uint8_t index) { return (index & 0x01) ? 255 : 0; }
+bool GrayscaleRowScaler::accumulate(const uint8_t* grayRow, const std::function<bool(const uint8_t* meanRow)>& emit) {
+  if (!valid_ || currentOutY_ >= static_cast<uint32_t>(outH_)) return false;
 
-// Simple 1-bit Atkinson ditherer without contrast adjustment
-// Used when source is already contrast-enhanced (like cover.bmp)
-class RawAtkinson1BitDitherer {
- public:
-  explicit RawAtkinson1BitDitherer(int width) : width(width) {
-    errorRow0 = new int16_t[width + 4]();
-    errorRow1 = new int16_t[width + 4]();
-    errorRow2 = new int16_t[width + 4]();
+  if (!needsScaling_) {
+    if (!emit(grayRow)) return false;
+    currentOutY_++;
+    return true;
   }
 
-  ~RawAtkinson1BitDitherer() {
-    delete[] errorRow0;
-    delete[] errorRow1;
-    delete[] errorRow2;
-  }
+  for (int outX = 0; outX < outW_; outX++) {
+    const int srcXStart = (static_cast<uint32_t>(outX) * scaleX_fp_) >> 16;
+    const int srcXEnd = (static_cast<uint32_t>(outX + 1) * scaleX_fp_) >> 16;
 
-  RawAtkinson1BitDitherer(const RawAtkinson1BitDitherer&) = delete;
-  RawAtkinson1BitDitherer& operator=(const RawAtkinson1BitDitherer&) = delete;
-
-  uint8_t processPixel(int gray, int x) {
-    // NO adjustPixel() call - source is already contrast-enhanced
-    int adjusted = gray + errorRow0[x + 2];
-    if (adjusted < 0) adjusted = 0;
-    if (adjusted > 255) adjusted = 255;
-
-    uint8_t quantized;
-    int quantizedValue;
-    if (adjusted < 128) {
-      quantized = 0;
-      quantizedValue = 0;
-    } else {
-      quantized = 1;
-      quantizedValue = 255;
+    uint32_t sum = 0;
+    uint16_t count = 0;
+    for (int srcX = srcXStart; srcX < srcXEnd && srcX < srcW_; srcX++) {
+      sum += grayRow[srcX];
+      count++;
     }
-
-    int error = (adjusted - quantizedValue) >> 3;
-    errorRow0[x + 3] += error;
-    errorRow0[x + 4] += error;
-    errorRow1[x + 1] += error;
-    errorRow1[x + 2] += error;
-    errorRow1[x + 3] += error;
-    errorRow2[x + 2] += error;
-
-    return quantized;
-  }
-
-  void nextRow() {
-    int16_t* temp = errorRow0;
-    errorRow0 = errorRow1;
-    errorRow1 = errorRow2;
-    errorRow2 = temp;
-    memset(errorRow2, 0, (width + 4) * sizeof(int16_t));
-  }
-
- private:
-  int width;
-  int16_t* errorRow0;
-  int16_t* errorRow1;
-  int16_t* errorRow2;
-};
-
-bool bmpTo1BitBmpScaled(const char* srcPath, const char* dstPath, int targetMaxWidth, int targetMaxHeight) {
-  FsFile srcFile;
-  if (!SdMan.openFileForRead("BMP", srcPath, srcFile)) {
-    LOG_ERR(TAG, "Failed to open source: %s", srcPath);
-    return false;
-  }
-
-  // Parse BMP header
-  if (readLE16(srcFile) != 0x4D42) {
-    LOG_ERR(TAG, "Not a BMP file");
-    srcFile.close();
-    return false;
-  }
-
-  srcFile.seekCur(8);  // Skip file size and reserved
-  const uint32_t pixelOffset = readLE32(srcFile);
-
-  const uint32_t dibSize = readLE32(srcFile);
-  if (dibSize < 40) {
-    LOG_ERR(TAG, "Unsupported DIB header");
-    srcFile.close();
-    return false;
-  }
-
-  const int srcWidth = static_cast<int32_t>(readLE32(srcFile));
-  const int32_t rawHeight = static_cast<int32_t>(readLE32(srcFile));
-
-  // Negative height = top-down BMP (rows stored top to bottom)
-  // Positive height = bottom-up BMP (rows stored bottom to top)
-  // We only support top-down BMPs since that's what our cover.bmp generator produces
-  if (rawHeight >= 0) {
-    LOG_ERR(TAG, "Bottom-up BMP not supported, expected top-down");
-    srcFile.close();
-    return false;
-  }
-  const int srcHeight = -rawHeight;
-
-  srcFile.seekCur(2);  // Skip planes
-  const uint16_t bpp = readLE16(srcFile);
-
-  if (bpp != 1 && bpp != 2) {
-    LOG_ERR(TAG, "Expected 1 or 2-bit BMP, got %d-bit", bpp);
-    srcFile.close();
-    return false;
-  }
-
-  LOG_DBG(TAG, "Scaling %dx%d %d-bit BMP to 1-bit thumbnail", srcWidth, srcHeight, bpp);
-
-  // Calculate output dimensions (scale to fit target while maintaining aspect)
-  int outWidth = srcWidth;
-  int outHeight = srcHeight;
-
-  if (srcWidth > targetMaxWidth || srcHeight > targetMaxHeight) {
-    const float scaleW = static_cast<float>(targetMaxWidth) / srcWidth;
-    const float scaleH = static_cast<float>(targetMaxHeight) / srcHeight;
-    const float scale = (scaleW < scaleH) ? scaleW : scaleH;
-    outWidth = static_cast<int>(srcWidth * scale);
-    outHeight = static_cast<int>(srcHeight * scale);
-    if (outWidth < 1) outWidth = 1;
-    if (outHeight < 1) outHeight = 1;
-  }
-
-  // Calculate fixed-point scale factors (16.16 format) for accurate sub-pixel sampling
-  // scaleX_fp = (srcWidth << 16) / outWidth = source pixels per output pixel
-  const uint32_t scaleX_fp = (static_cast<uint32_t>(srcWidth) << 16) / outWidth;
-  const uint32_t scaleY_fp = (static_cast<uint32_t>(srcHeight) << 16) / outHeight;
-
-  // Calculate max source rows needed per output row (ceiling of scaleY)
-  const int maxSrcRowsPerOut = ((scaleY_fp + 0xFFFF) >> 16) + 1;
-
-  LOG_DBG(TAG, "Output: %dx%d, scale_fp: %lu x %lu", outWidth, outHeight, static_cast<unsigned long>(scaleX_fp),
-          static_cast<unsigned long>(scaleY_fp));
-
-  // Calculate row sizes
-  const int srcRowBytes = (srcWidth * bpp + 31) / 32 * 4;  // bpp-bit source, 4-byte aligned
-  const int outRowBytes = (outWidth + 31) / 32 * 4;        // 1-bit output, 4-byte aligned
-
-  // Allocate buffers for source rows needed per output row
-  auto* srcRows = static_cast<uint8_t*>(malloc(srcRowBytes * maxSrcRowsPerOut));
-  auto* outRow = static_cast<uint8_t*>(malloc(outRowBytes));
-  if (!srcRows || !outRow) {
-    LOG_ERR(TAG, "Failed to allocate buffers");
-    free(srcRows);
-    free(outRow);
-    srcFile.close();
-    return false;
-  }
-
-  // Open destination file
-  FsFile dstFile;
-  if (!SdMan.openFileForWrite("BMP", dstPath, dstFile)) {
-    LOG_ERR(TAG, "Failed to open destination: %s", dstPath);
-    free(srcRows);
-    free(outRow);
-    srcFile.close();
-    return false;
-  }
-
-  writeBmpHeader1bit(dstFile, outWidth, outHeight);
-
-  // Create 1-bit ditherer (raw version - no contrast adjustment since source is already processed)
-  RawAtkinson1BitDitherer ditherer(outWidth);
-
-  // Seek to pixel data
-  if (!srcFile.seek(pixelOffset)) {
-    LOG_ERR(TAG, "Failed to seek to pixel data");
-    free(srcRows);
-    free(outRow);
-    srcFile.close();
-    dstFile.close();
-    return false;
-  }
-
-  // Track which source rows we've read (for sequential file access)
-  int lastSrcRowRead = -1;
-
-  // Process output rows
-  for (int outY = 0; outY < outHeight; outY++) {
-    // Calculate source Y range for this output row using fixed-point
-    const int srcYStart = (static_cast<uint32_t>(outY) * scaleY_fp) >> 16;
-    int srcYEnd = (static_cast<uint32_t>(outY + 1) * scaleY_fp) >> 16;
-    // Ensure at least one source row is sampled (guards against upscaling edge case)
-    if (srcYEnd <= srcYStart) srcYEnd = srcYStart + 1;
-    const int srcRowsNeeded = srcYEnd - srcYStart;
-
-    // Read required source rows (handling sequential access)
-    for (int srcY = srcYStart; srcY < srcYEnd && srcY < srcHeight; srcY++) {
-      // Skip rows we've already read past (shouldn't happen with sequential access)
-      if (srcY <= lastSrcRowRead) continue;
-
-      // Skip any rows between last read and needed row
-      while (lastSrcRowRead < srcY - 1) {
-        srcFile.seekCur(srcRowBytes);
-        lastSrcRowRead++;
-      }
-
-      // Read this row into the appropriate buffer slot
-      const int bufferSlot = srcY - srcYStart;
-      if (srcFile.read(srcRows + bufferSlot * srcRowBytes, srcRowBytes) != srcRowBytes) {
-        LOG_ERR(TAG, "Failed to read row %d", srcY);
-        free(srcRows);
-        free(outRow);
-        srcFile.close();
-        dstFile.close();
-        return false;
-      }
-      lastSrcRowRead = srcY;
+    if (count == 0 && srcXStart < srcW_) {
+      sum = grayRow[srcXStart];
+      count = 1;
     }
-
-    memset(outRow, 0, outRowBytes);
-
-    // Process each output pixel
-    for (int outX = 0; outX < outWidth; outX++) {
-      // Calculate source X range for this output pixel using fixed-point
-      const int srcXStart = (static_cast<uint32_t>(outX) * scaleX_fp) >> 16;
-      int srcXEnd = (static_cast<uint32_t>(outX + 1) * scaleX_fp) >> 16;
-      // Ensure at least one source pixel is sampled
-      if (srcXEnd <= srcXStart) srcXEnd = srcXStart + 1;
-
-      // Average all source pixels in this range
-      int sum = 0;
-      int count = 0;
-
-      for (int dy = 0; dy < srcRowsNeeded && (srcYStart + dy) < srcHeight; dy++) {
-        const uint8_t* row = srcRows + dy * srcRowBytes;
-        for (int srcX = srcXStart; srcX < srcXEnd && srcX < srcWidth; srcX++) {
-          uint8_t gray;
-          if (bpp == 2) {
-            // 2-bit: 4 pixels per byte, MSB first
-            const int byteIdx = srcX / 4;
-            const int bitShift = 6 - (srcX % 4) * 2;
-            const uint8_t pixel = (row[byteIdx] >> bitShift) & 0x03;
-            gray = palette2bitToGray(pixel);
-          } else {
-            // 1-bit: 8 pixels per byte, MSB first
-            const int byteIdx = srcX / 8;
-            const int bitOffset = 7 - (srcX % 8);
-            const uint8_t pixel = (row[byteIdx] >> bitOffset) & 0x01;
-            gray = palette1bitToGray(pixel);
-          }
-          sum += gray;
-          count++;
-        }
-      }
-
-      const uint8_t gray = (count > 0) ? (sum / count) : 0;
-      const uint8_t bit = ditherer.processPixel(gray, outX);
-
-      // Pack 1-bit value (MSB first, 8 pixels per byte)
-      const int byteIdx = outX / 8;
-      const int bitOffset = 7 - (outX % 8);
-      outRow[byteIdx] |= (bit << bitOffset);
-    }
-
-    ditherer.nextRow();
-    dstFile.write(outRow, outRowBytes);
+    rowAccum_[outX] += sum;
+    rowCount_[outX] += count;
   }
 
-  free(srcRows);
-  free(outRow);
-  srcFile.close();
-  dstFile.close();
+  currentSrcY_++;
+  const uint32_t srcY_fp = currentSrcY_ << 16;
 
-  LOG_INF(TAG, "Successfully created thumbnail: %s", dstPath);
+  // Emit all rows whose boundaries we've crossed (handles both up- and
+  // downscaling). For upscaling, one source row may produce multiple output
+  // rows; accumulators are only reset once the next boundary is beyond this
+  // source row.
+  while (srcY_fp >= nextOutY_srcStart_ && currentOutY_ < static_cast<uint32_t>(outH_)) {
+    for (int outX = 0; outX < outW_; outX++) {
+      meanRow_[outX] = static_cast<uint8_t>((rowCount_[outX] > 0) ? (rowAccum_[outX] / rowCount_[outX]) : 0);
+    }
+    if (!emit(meanRow_.get())) return false;
+    currentOutY_++;
+
+    nextOutY_srcStart_ = (currentOutY_ + 1) * scaleY_fp_;
+
+    if (srcY_fp >= nextOutY_srcStart_) {
+      continue;  // upscaling: next output row reuses this source row's data
+    }
+    memset(rowAccum_.get(), 0, static_cast<size_t>(outW_) * sizeof(uint32_t));
+    memset(rowCount_.get(), 0, static_cast<size_t>(outW_) * sizeof(uint32_t));
+  }
+
   return true;
 }

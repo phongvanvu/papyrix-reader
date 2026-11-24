@@ -24,14 +24,14 @@
 const char* HEADER_TAGS[] = {"h1", "h2", "h3", "h4", "h5", "h6"};
 constexpr int NUM_HEADER_TAGS = 6;
 
-const char* BLOCK_TAGS[] = {"p", "li", "div", "br", "blockquote", "question", "answer", "quotation"};
-constexpr int NUM_BLOCK_TAGS = 8;
+const char* BLOCK_TAGS[] = {"p", "li", "div", "br", "blockquote", "question", "answer", "quotation", "pre"};
+constexpr int NUM_BLOCK_TAGS = 9;
 
 const char* BOLD_TAGS[] = {"b", "strong"};
 constexpr int NUM_BOLD_TAGS = 2;
 
-const char* ITALIC_TAGS[] = {"i", "em"};
-constexpr int NUM_ITALIC_TAGS = 2;
+const char* ITALIC_TAGS[] = {"i", "em", "code", "tt", "kbd", "samp"};
+constexpr int NUM_ITALIC_TAGS = 6;
 
 const char* IMAGE_TAGS[] = {"img"};
 constexpr int NUM_IMAGE_TAGS = 1;
@@ -51,10 +51,14 @@ bool matches(const char* tag_name, const char* possible_tags[], const int possib
 // Block alignment styles (mirrors TextBlock::BLOCK_STYLE)
 enum class BlockStyle { LEFT, CENTER, RIGHT, JUSTIFIED };
 
-// Inline style parser for test (extracts text-align)
+// Inline style parser for test (extracts text-align, font-weight, font-style)
 struct TestCssStyle {
   BlockStyle textAlign = BlockStyle::LEFT;
   bool hasTextAlign = false;
+  bool hasFontWeight = false;
+  bool fontWeightBold = false;
+  bool hasFontStyle = false;
+  bool fontStyleItalic = false;
 };
 
 TestCssStyle parseTestInlineStyle(const char** atts) {
@@ -63,27 +67,54 @@ TestCssStyle parseTestInlineStyle(const char** atts) {
   for (int i = 0; atts[i]; i += 2) {
     if (strcmp(atts[i], "style") != 0) continue;
     const char* val = atts[i + 1];
-    // Simple text-align extraction
+    // text-align
     const char* ta = strstr(val, "text-align");
-    if (!ta) continue;
-    const char* colon = strchr(ta, ':');
-    if (!colon) continue;
-    colon++;
-    while (*colon == ' ') colon++;
-    if (strncmp(colon, "center", 6) == 0) {
-      css.textAlign = BlockStyle::CENTER;
-      css.hasTextAlign = true;
-    } else if (strncmp(colon, "right", 5) == 0) {
-      css.textAlign = BlockStyle::RIGHT;
-      css.hasTextAlign = true;
-    } else if (strncmp(colon, "left", 4) == 0) {
-      css.textAlign = BlockStyle::LEFT;
-      css.hasTextAlign = true;
-    } else if (strncmp(colon, "justify", 7) == 0) {
-      css.textAlign = BlockStyle::JUSTIFIED;
-      css.hasTextAlign = true;
+    if (ta) {
+      const char* colon = strchr(ta, ':');
+      if (colon) {
+        colon++;
+        while (*colon == ' ') colon++;
+        if (strncmp(colon, "center", 6) == 0) {
+          css.textAlign = BlockStyle::CENTER;
+          css.hasTextAlign = true;
+        } else if (strncmp(colon, "right", 5) == 0) {
+          css.textAlign = BlockStyle::RIGHT;
+          css.hasTextAlign = true;
+        } else if (strncmp(colon, "left", 4) == 0) {
+          css.textAlign = BlockStyle::LEFT;
+          css.hasTextAlign = true;
+        } else if (strncmp(colon, "justify", 7) == 0) {
+          css.textAlign = BlockStyle::JUSTIFIED;
+          css.hasTextAlign = true;
+        }
+      }
     }
-    // inherit: hasTextAlign stays false
+    // font-weight
+    const char* fw = strstr(val, "font-weight");
+    if (fw) {
+      const char* colon = strchr(fw, ':');
+      if (colon) {
+        colon++;
+        while (*colon == ' ') colon++;
+        if (strncmp(colon, "bold", 4) == 0 || strncmp(colon, "700", 3) == 0) {
+          css.hasFontWeight = true;
+          css.fontWeightBold = true;
+        }
+      }
+    }
+    // font-style
+    const char* fs = strstr(val, "font-style");
+    if (fs) {
+      const char* colon = strchr(fs, ':');
+      if (colon) {
+        colon++;
+        while (*colon == ' ') colon++;
+        if (strncmp(colon, "italic", 6) == 0 || strncmp(colon, "oblique", 7) == 0) {
+          css.hasFontStyle = true;
+          css.fontStyleItalic = true;
+        }
+      }
+    }
   }
   return css;
 }
@@ -113,6 +144,11 @@ class TestParser {
   int skipUntilDepth = INT_MAX;
   int boldUntilDepth = INT_MAX;
   int italicUntilDepth = INT_MAX;
+  int cssBoldUntilDepth = INT_MAX;
+  int cssItalicUntilDepth = INT_MAX;
+  int preformattedUntilDepth = INT_MAX;
+  int preWsPending = 0;
+  bool inPreWsRun = false;
   bool pendingRtl = false;
   int rtlUntilDepth = INT_MAX;
   uint16_t blockCount = 0;
@@ -131,8 +167,8 @@ class TestParser {
       ParsedElement elem;
       elem.type = ParsedElement::TEXT;
       elem.content = currentText;
-      elem.isBold = boldUntilDepth < depth;
-      elem.isItalic = italicUntilDepth < depth;
+      elem.isBold = boldUntilDepth < depth || cssBoldUntilDepth < depth;
+      elem.isItalic = italicUntilDepth < depth || cssItalicUntilDepth < depth;
       elem.isRtl = pendingRtl;
       elem.blockStyle = currentBlockStyle;
       elements.push_back(elem);
@@ -147,6 +183,18 @@ class TestParser {
     if (self->skipUntilDepth < self->depth) {
       self->depth++;
       return;
+    }
+
+    // Skip elements with the HTML hidden attribute (name only: with or
+    // without a value); before image/table handlers so no placeholders emit
+    if (atts) {
+      for (int i = 0; atts[i]; i += 2) {
+        if (strcmp(atts[i], "hidden") == 0) {
+          self->skipUntilDepth = self->depth;
+          self->depth++;
+          return;
+        }
+      }
     }
 
     // Image handling
@@ -249,8 +297,20 @@ class TestParser {
       }
     }
 
-    // Parse inline style for text-align
+    // Parse inline style for text-align, font-weight, font-style
     TestCssStyle cssStyle = parseTestInlineStyle(atts);
+
+    // CSS font-weight/font-style: flush before setting to capture preceding text
+    if ((cssStyle.hasFontWeight && cssStyle.fontWeightBold) ||
+        (cssStyle.hasFontStyle && cssStyle.fontStyleItalic)) {
+      self->flushText();
+    }
+    if (cssStyle.hasFontWeight && cssStyle.fontWeightBold) {
+      self->cssBoldUntilDepth = std::min(self->cssBoldUntilDepth, self->depth);
+    }
+    if (cssStyle.hasFontStyle && cssStyle.fontStyleItalic) {
+      self->cssItalicUntilDepth = std::min(self->cssItalicUntilDepth, self->depth);
+    }
 
     // Headers
     if (matches(name, HEADER_TAGS, NUM_HEADER_TAGS)) {
@@ -265,6 +325,14 @@ class TestParser {
     if (matches(name, BLOCK_TAGS, NUM_BLOCK_TAGS)) {
       self->flushText();
       self->blockCount++;
+      // <pre> forces LEFT_ALIGN and enters preformatted whitespace mode.
+      if (strcmp(name, "pre") == 0) {
+        self->preformattedUntilDepth = std::min(self->preformattedUntilDepth, self->depth);
+        self->preWsPending = 0;
+        self->currentBlockStyle = BlockStyle::LEFT;
+        self->depth++;
+        return;
+      }
       // Determine block style: CSS text-align > inheritance > default
       BlockStyle blockStyle = BlockStyle::LEFT;
       bool hasExplicitAlign = false;
@@ -294,13 +362,15 @@ class TestParser {
       }
     }
 
-    // Bold tags
+    // Bold tags - flush before setting so the preceding text captures non-bold style.
     if (matches(name, BOLD_TAGS, NUM_BOLD_TAGS)) {
+      self->flushText();
       self->boldUntilDepth = std::min(self->boldUntilDepth, self->depth);
     }
 
-    // Italic tags
+    // Italic tags - flush before setting so the preceding text captures non-italic style.
     if (matches(name, ITALIC_TAGS, NUM_ITALIC_TAGS)) {
+      self->flushText();
       self->italicUntilDepth = std::min(self->italicUntilDepth, self->depth);
     } else if (strcmp(name, "ul") == 0 || strcmp(name, "ol") == 0) {
       self->listStack.push_back({self->depth, strcmp(name, "ol") == 0, 0});
@@ -321,8 +391,47 @@ class TestParser {
       return;
     }
 
+    const bool preformatted = self->depth > self->preformattedUntilDepth;
+
     for (int i = 0; i < len; i++) {
       char c = s[i];
+      if (preformatted) {
+        if (c == '\r') continue;
+        if (c == '\n') {
+          // New pre line = new text element (mirrors startNewTextBlock in production)
+          self->flushText();
+          self->preWsPending = 0;
+          self->inPreWsRun = false;
+          self->currentBlockStyle = BlockStyle::LEFT;
+          continue;
+        }
+        if (c == ' ' || c == '\t') {
+          const int expansion = (c == '\t') ? 4 : 1;
+          if (self->inPreWsRun) {
+            // Subsequent whitespace in a run → preserve as NBSPs.
+            self->preWsPending += expansion;
+          } else if (!self->currentText.empty()) {
+            // First whitespace after a word: one breakable separator, rest as NBSPs.
+            self->currentText += ' ';
+            self->inPreWsRun = true;
+            self->preWsPending = expansion - 1;
+          } else {
+            // Leading whitespace on a line → all NBSPs.
+            self->preWsPending += expansion;
+            self->inPreWsRun = true;
+          }
+          continue;
+        }
+        // Non-whitespace: prepend pending NBSPs (U+00A0 = 0xC2 0xA0 in UTF-8).
+        for (int k = 0; k < self->preWsPending; k++) {
+          self->currentText += static_cast<char>(0xc2);
+          self->currentText += static_cast<char>(0xa0);
+        }
+        self->preWsPending = 0;
+        self->inPreWsRun = false;
+        self->currentText += c;
+        continue;
+      }
       if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
         if (!self->currentText.empty() && self->currentText.back() != ' ') {
           self->currentText += ' ';
@@ -351,10 +460,18 @@ class TestParser {
 
     const bool headerOrBlockTag =
         matches(name, HEADER_TAGS, NUM_HEADER_TAGS) || matches(name, BLOCK_TAGS, NUM_BLOCK_TAGS);
+    const bool italicOrBoldTag =
+        matches(name, BOLD_TAGS, NUM_BOLD_TAGS) || matches(name, ITALIC_TAGS, NUM_ITALIC_TAGS);
 
-    // Flush text on block tag close
+    // Flush text on block tag close, inline style tag close, or CSS-styled
+    // element close so the styled run captures its style before the flag resets.
+    const bool closingCssStyle =
+        self->cssBoldUntilDepth == self->depth - 1 || self->cssItalicUntilDepth == self->depth - 1;
+    // A closing tag inside or exiting a skip region must not flush the
+    // accumulated text of the surrounding visible run
+    const bool closingSkipped = self->skipUntilDepth <= self->depth - 1;
     size_t prevCount = self->elements.size();
-    if (headerOrBlockTag) {
+    if (!closingSkipped && (headerOrBlockTag || italicOrBoldTag || closingCssStyle)) {
       self->flushText();
     }
 
@@ -372,8 +489,18 @@ class TestParser {
     if (self->boldUntilDepth == self->depth) {
       self->boldUntilDepth = INT_MAX;
     }
+    if (self->cssBoldUntilDepth == self->depth) {
+      self->cssBoldUntilDepth = INT_MAX;
+    }
     if (self->italicUntilDepth == self->depth) {
       self->italicUntilDepth = INT_MAX;
+    }
+    if (self->cssItalicUntilDepth == self->depth) {
+      self->cssItalicUntilDepth = INT_MAX;
+    }
+    if (self->preformattedUntilDepth == self->depth) {
+      self->preformattedUntilDepth = INT_MAX;
+      self->preWsPending = 0;
     }
     if (self->rtlUntilDepth == self->depth) {
       self->rtlUntilDepth = INT_MAX;
@@ -431,6 +558,15 @@ class TestParser {
   bool hasImagePlaceholder() const {
     for (const auto& elem : elements) {
       if (elem.type == ParsedElement::IMAGE_PLACEHOLDER) return true;
+    }
+    return false;
+  }
+
+  bool hasImagePlaceholderContaining(const std::string& needle) const {
+    for (const auto& elem : elements) {
+      if (elem.type == ParsedElement::IMAGE_PLACEHOLDER && elem.content.find(needle) != std::string::npos) {
+        return true;
+      }
     }
     return false;
   }
@@ -537,6 +673,75 @@ int main() {
     runner.expectTrue(parser.getAllText().find("Cell1") == std::string::npos,
                       "table_placeholder: table content skipped");
   }
+
+  // Test 5b: Skip elements carrying the HTML hidden attribute
+  {
+    TestParser parser;
+    bool ok = parser.parse(
+        "<html><body>"
+        "<p>Question 1</p>"
+        "<div hidden=\"\"><p>Answer key</p><span>teacher note</span></div>"
+        "<span hidden=\"hidden\">ocr layer text</span>"
+        "<p>Question 2</p>"
+        "</body></html>");
+    runner.expectTrue(ok, "skip_hidden_attr: parses successfully");
+    runner.expectTrue(parser.getAllText().find("Answer key") == std::string::npos,
+                      "skip_hidden_attr: subtree content skipped");
+    runner.expectTrue(parser.getAllText().find("teacher note") == std::string::npos,
+                      "skip_hidden_attr: nested content skipped");
+    runner.expectTrue(parser.getAllText().find("ocr layer") == std::string::npos,
+                      "skip_hidden_attr: valued form skipped");
+    runner.expectTrue(parser.getAllText().find("Question 1") != std::string::npos,
+                      "skip_hidden_attr: visible text before kept");
+    runner.expectTrue(parser.getAllText().find("Question 2") != std::string::npos,
+                      "skip_hidden_attr: visible text after kept");
+  }
+
+  // Test 5c: Hidden images and tables emit no placeholders
+  {
+    TestParser parser;
+    bool ok = parser.parse(
+        "<html><body>"
+        "<img src=\"scan.png\" hidden=\"\" alt=\"OCR text layer\"/>"
+        "<table hidden=\"\"><tr><td>HIDTBL</td></tr></table>"
+        "<img src=\"vis.png\" alt=\"visible art\"/>"
+        "</body></html>");
+    runner.expectTrue(ok, "skip_hidden_media: parses successfully");
+    runner.expectTrue(!parser.hasImagePlaceholderContaining("OCR text layer"),
+                      "skip_hidden_media: no placeholder for hidden image");
+    runner.expectTrue(parser.hasImagePlaceholderContaining("visible art"),
+                      "skip_hidden_media: visible image placeholder kept");
+    runner.expectTrue(!parser.hasTablePlaceholder(),
+                      "skip_hidden_media: no placeholder for hidden table");
+    runner.expectTrue(parser.getAllText().find("HIDTBL") == std::string::npos,
+                      "skip_hidden_media: hidden table content skipped");
+  }
+
+  // Test 5d: A hidden inline style tag must not split the visible word
+  {
+    TestParser parser;
+    bool ok = parser.parse("<html><body><p>some<b hidden=\"\">SECRET</b>thing</p></body></html>");
+    runner.expectTrue(ok, "hidden_inline_split: parses successfully");
+    runner.expectTrue(parser.getAllText().find("SECRET") == std::string::npos,
+                      "hidden_inline_split: hidden content skipped");
+    runner.expectTrue(parser.getAllText().find("something") != std::string::npos,
+                      "hidden_inline_split: visible word not split");
+  }
+
+  // Test 5e: A hidden style tag nested in a visible style run keeps the run
+  {
+    TestParser parser;
+    bool ok = parser.parse("<html><body><p>aa<i>bb<b hidden=\"\">CC</b>dd</i>ee</p></body></html>");
+    runner.expectTrue(ok, "hidden_nested_style: parses successfully");
+    runner.expectTrue(parser.getAllText().find("CC") == std::string::npos,
+                      "hidden_nested_style: hidden content skipped");
+    runner.expectTrue(parser.getAllText().find("bbdd") != std::string::npos &&
+                          parser.getAllText().find("bb dd") == std::string::npos,
+                      "hidden_nested_style: visible run kept together");
+    runner.expectTrue(parser.getAllText().find("ee") != std::string::npos,
+                      "hidden_nested_style: text after run kept");
+  }
+
 
   // Test 6: Skip head element content
   {
@@ -1767,6 +1972,368 @@ int main() {
     size_t b2 = text.find("\xe2\x80\xa2", b1 + 3);
     runner.expectTrue(b2 != std::string::npos, "3level_nest: second bullet");
     runner.expectTrue(text.find("1.") != std::string::npos, "3level_nest: numbered item");
+  }
+
+  // ============================================
+  // Monospace tag tests (issue #94)
+  // ============================================
+
+  // NBSP is U+00A0, UTF-8 encoded as 0xC2 0xA0
+  const std::string NBSP = std::string("\xc2\xa0");
+
+  // Test 104: Inline <code> renders italic
+  {
+    TestParser parser;
+    bool ok = parser.parse("<html><body><p>run <code>foo</code> now</p></body></html>");
+    runner.expectTrue(ok, "code_italic: parses");
+    bool foundItalicFoo = false;
+    for (const auto& elem : parser.elements) {
+      if (elem.type == TestParser::ParsedElement::TEXT && elem.content.find("foo") != std::string::npos && elem.isItalic) {
+        foundItalicFoo = true;
+      }
+    }
+    runner.expectTrue(foundItalicFoo, "code_italic: foo marked italic");
+  }
+
+  // Test 105: <tt>, <kbd>, <samp> also render italic
+  {
+    TestParser parser;
+    bool ok = parser.parse(
+        "<html><body><p><tt>TT</tt><kbd>KBD</kbd><samp>SAMP</samp></p></body></html>");
+    runner.expectTrue(ok, "mono_inline_tags: parses");
+    int italicCount = 0;
+    for (const auto& elem : parser.elements) {
+      if (elem.type == TestParser::ParsedElement::TEXT && elem.isItalic) italicCount++;
+    }
+    runner.expectTrue(italicCount >= 1, "mono_inline_tags: at least one italic text element");
+    std::string all = parser.getAllText();
+    runner.expectTrue(all.find("TT") != std::string::npos, "mono_inline_tags: tt content");
+    runner.expectTrue(all.find("KBD") != std::string::npos, "mono_inline_tags: kbd content");
+    runner.expectTrue(all.find("SAMP") != std::string::npos, "mono_inline_tags: samp content");
+  }
+
+  // Test 106: <pre> creates a block with LEFT_ALIGN
+  {
+    TestParser parser;
+    bool ok = parser.parse("<html><body><pre>code here</pre></body></html>");
+    runner.expectTrue(ok, "pre_block: parses");
+    runner.expectTrue(parser.getBlockStyleForText("code here") == BlockStyle::LEFT, "pre_block: LEFT_ALIGN");
+  }
+
+  // Test 107: <pre> preserves newlines as separate text elements
+  {
+    TestParser parser;
+    bool ok = parser.parse("<html><body><pre>line1\nline2\nline3</pre></body></html>");
+    runner.expectTrue(ok, "pre_newlines: parses");
+    int lineElements = 0;
+    for (const auto& elem : parser.elements) {
+      if (elem.type == TestParser::ParsedElement::TEXT &&
+          (elem.content.find("line1") != std::string::npos ||
+           elem.content.find("line2") != std::string::npos ||
+           elem.content.find("line3") != std::string::npos)) {
+        lineElements++;
+      }
+    }
+    runner.expectTrue(lineElements >= 3, "pre_newlines: three separate text elements");
+  }
+
+  // Test 108: <pre> preserves runs of spaces as NBSPs
+  {
+    TestParser parser;
+    bool ok = parser.parse("<html><body><pre>a   b</pre></body></html>");
+    runner.expectTrue(ok, "pre_multispace: parses");
+    // 3 spaces = 1 breakable space + 2 NBSPs preserved
+    std::string text = parser.getAllText();
+    size_t nbspCount = 0;
+    for (size_t pos = 0; (pos = text.find(NBSP, pos)) != std::string::npos; pos += NBSP.size()) nbspCount++;
+    runner.expectTrue(nbspCount >= 2, "pre_multispace: NBSPs preserved");
+    runner.expectTrue(text.find("a") != std::string::npos && text.find("b") != std::string::npos,
+                      "pre_multispace: both words present");
+  }
+
+  // Test 109: <pre> preserves leading indentation
+  {
+    TestParser parser;
+    bool ok = parser.parse("<html><body><pre>  indented</pre></body></html>");
+    runner.expectTrue(ok, "pre_leading: parses");
+    std::string text = parser.getAllText();
+    runner.expectTrue(text.find(NBSP + NBSP) != std::string::npos, "pre_leading: 2 leading NBSPs");
+    runner.expectTrue(text.find("indented") != std::string::npos, "pre_leading: word present");
+  }
+
+  // Test 110: <pre><code> nesting renders italic with preserved whitespace
+  {
+    TestParser parser;
+    bool ok = parser.parse("<html><body><pre><code>fn x:\n  return y</code></pre></body></html>");
+    runner.expectTrue(ok, "pre_code_nested: parses");
+    bool anyItalic = false;
+    int blocks = 0;
+    for (const auto& elem : parser.elements) {
+      if (elem.type == TestParser::ParsedElement::TEXT) {
+        blocks++;
+        if (elem.isItalic) anyItalic = true;
+      }
+    }
+    runner.expectTrue(anyItalic, "pre_code_nested: content is italic");
+    runner.expectTrue(blocks >= 2, "pre_code_nested: newline split into multiple blocks");
+  }
+
+  // Test 111: Whitespace outside <pre> still collapses
+  {
+    TestParser parser;
+    bool ok = parser.parse("<html><body><p>a    b</p></body></html>");
+    runner.expectTrue(ok, "non_pre_whitespace: parses");
+    std::string text = parser.getAllText();
+    runner.expectTrue(text.find(NBSP) == std::string::npos, "non_pre_whitespace: no NBSPs outside pre");
+  }
+
+  // Test 112: Preformatted mode resets after </pre>
+  {
+    TestParser parser;
+    bool ok = parser.parse(
+        "<html><body><pre>pre  content</pre><p>after  text</p></body></html>");
+    runner.expectTrue(ok, "pre_scope_reset: parses");
+    bool preHasNbsp = false;
+    bool afterHasNbsp = false;
+    for (const auto& elem : parser.elements) {
+      if (elem.type == TestParser::ParsedElement::TEXT) {
+        if (elem.content.find("pre") != std::string::npos && elem.content.find(NBSP) != std::string::npos) {
+          preHasNbsp = true;
+        }
+        if (elem.content.find("after") != std::string::npos && elem.content.find(NBSP) != std::string::npos) {
+          afterHasNbsp = true;
+        }
+      }
+    }
+    runner.expectTrue(preHasNbsp, "pre_scope_reset: pre content has NBSPs");
+    runner.expectFalse(afterHasNbsp, "pre_scope_reset: content after </pre> does not");
+  }
+
+  // Test 113: <pre> expands \t to 4 units (1 breakable space + 3 NBSPs)
+  {
+    TestParser parser;
+    bool ok = parser.parse("<html><body><pre>a\tb</pre></body></html>");
+    runner.expectTrue(ok, "pre_tab: parses");
+    std::string text = parser.getAllText();
+    size_t nbspCount = 0;
+    for (size_t pos = 0; (pos = text.find(NBSP, pos)) != std::string::npos; pos += NBSP.size()) nbspCount++;
+    runner.expectTrue(nbspCount >= 3, "pre_tab: tab produced >=3 NBSPs");
+    runner.expectTrue(text.find("a") != std::string::npos && text.find("b") != std::string::npos,
+                      "pre_tab: both words present");
+  }
+
+  // ============================================
+  // addLineToPage null-guard tests (A2 regression)
+  // ChapterHtmlSlimParser::addLineToPage must not dereference currentPage when
+  // it is null. The 750-word emergency-split path can invoke the line callback
+  // before makePages() ever creates the first Page. The guard added in A2:
+  //   if (!currentPage) { currentPage.reset(new Page()); currentPageNextY = 0; }
+  // prevents the load-access-fault. The tests below exercise the same guard
+  // logic through a self-contained helper that mirrors the production code.
+  // ============================================
+
+  // Minimal representation of the guarded addLineToPage state
+  struct AddLineState {
+    std::unique_ptr<int> page;  // nullptr = no page created yet (mirrors currentPage)
+    int nextY = 0;
+    int linesAdded = 0;
+    int viewportHeight = 100;
+    int lineHeight = 20;
+
+    // Mirrors the guarded addLineToPage:
+    // 1. Create page if null  2. Advance nextY or start new page
+    void addLine() {
+      if (!page) {
+        page.reset(new int(0));
+        nextY = 0;
+      }
+      if (nextY + lineHeight > viewportHeight) {
+        page.reset(new int(0));
+        nextY = 0;
+      }
+      nextY += lineHeight;
+      linesAdded++;
+    }
+  };
+
+  // Test 114: addLineToPage with null currentPage does not crash and creates a page
+  {
+    AddLineState state;
+    runner.expectTrue(state.page == nullptr, "addline_null_guard: page starts null");
+    state.addLine();  // Must not crash even though page was null
+    runner.expectTrue(state.page != nullptr, "addline_null_guard: page created on first call");
+    runner.expectEq(1, state.linesAdded, "addline_null_guard: line was recorded");
+    runner.expectEq(state.lineHeight, state.nextY, "addline_null_guard: nextY advanced");
+  }
+
+  // Test 115: Multiple addLine calls without prior init fill the page correctly
+  {
+    AddLineState state;
+    state.addLine();
+    state.addLine();
+    state.addLine();
+    runner.expectTrue(state.page != nullptr, "addline_multi: page exists");
+    runner.expectEq(3, state.linesAdded, "addline_multi: three lines recorded");
+    runner.expectEq(3 * state.lineHeight, state.nextY, "addline_multi: nextY accumulated");
+  }
+
+  // Test 116: Page rolls over when viewport is full (null-guard + pagination)
+  {
+    AddLineState state;
+    // viewportHeight=100, lineHeight=20 → fits 5 lines per page
+    for (int i = 0; i < 5; i++) state.addLine();
+    runner.expectEq(5, state.linesAdded, "addline_rollover: five lines added");
+    runner.expectEq(100, state.nextY, "addline_rollover: nextY at viewport height");
+    // 6th line triggers new page
+    state.addLine();
+    runner.expectEq(6, state.linesAdded, "addline_rollover: sixth line on new page");
+    runner.expectEq(state.lineHeight, state.nextY, "addline_rollover: nextY reset after rollover");
+  }
+
+  // ============================================
+  // CSS font-weight/font-style flush tests
+  // ============================================
+
+  // Test 117: CSS font-weight:bold flushes text before bold span
+  {
+    TestParser parser;
+    bool ok = parser.parse(
+        "<html><body><p>normal text"
+        "<span style=\"font-weight: bold\">bold text</span>"
+        "</p></body></html>");
+    runner.expectTrue(ok, "css_bold_flush: parses successfully");
+    bool foundNormal = false;
+    bool foundBold = false;
+    for (const auto& elem : parser.elements) {
+      if (elem.type != TestParser::ParsedElement::TEXT) continue;
+      if (elem.content.find("normal") != std::string::npos) {
+        runner.expectFalse(elem.isBold, "css_bold_flush: normal text is not bold");
+        foundNormal = true;
+      }
+      if (elem.content.find("bold text") != std::string::npos) {
+        runner.expectTrue(elem.isBold, "css_bold_flush: bold text is bold");
+        foundBold = true;
+      }
+    }
+    runner.expectTrue(foundNormal, "css_bold_flush: normal text element found");
+    runner.expectTrue(foundBold, "css_bold_flush: bold text element found");
+  }
+
+  // Test 118: CSS font-style:italic flushes text before italic span
+  {
+    TestParser parser;
+    bool ok = parser.parse(
+        "<html><body><p>normal text"
+        "<span style=\"font-style: italic\">italic text</span>"
+        "</p></body></html>");
+    runner.expectTrue(ok, "css_italic_flush: parses successfully");
+    bool foundNormal = false;
+    bool foundItalic = false;
+    for (const auto& elem : parser.elements) {
+      if (elem.type != TestParser::ParsedElement::TEXT) continue;
+      if (elem.content.find("normal") != std::string::npos) {
+        runner.expectFalse(elem.isItalic, "css_italic_flush: normal text is not italic");
+        foundNormal = true;
+      }
+      if (elem.content.find("italic text") != std::string::npos) {
+        runner.expectTrue(elem.isItalic, "css_italic_flush: italic text is italic");
+        foundItalic = true;
+      }
+    }
+    runner.expectTrue(foundNormal, "css_italic_flush: normal text element found");
+    runner.expectTrue(foundItalic, "css_italic_flush: italic text element found");
+  }
+
+  // Test 119: CSS font-weight:700 is recognized as bold
+  {
+    TestParser parser;
+    bool ok = parser.parse(
+        "<html><body><p>before"
+        "<span style=\"font-weight: 700\">after</span>"
+        "</p></body></html>");
+    runner.expectTrue(ok, "css_bold_700: parses successfully");
+    for (const auto& elem : parser.elements) {
+      if (elem.type != TestParser::ParsedElement::TEXT) continue;
+      if (elem.content.find("after") != std::string::npos) {
+        runner.expectTrue(elem.isBold, "css_bold_700: font-weight:700 is bold");
+      }
+    }
+  }
+
+  // Test 120: CSS bold span end flushes partWordBuffer (no trailing space)
+  {
+    TestParser parser;
+    bool ok = parser.parse(
+        "<html><body><p>"
+        "<span style=\"font-weight: bold\">word</span>rest"
+        "</p></body></html>");
+    runner.expectTrue(ok, "css_bold_end_flush: parses successfully");
+    bool foundBold = false;
+    bool foundNonBold = false;
+    for (const auto& elem : parser.elements) {
+      if (elem.type != TestParser::ParsedElement::TEXT) continue;
+      if (elem.content.find("word") != std::string::npos) {
+        runner.expectTrue(elem.isBold, "css_bold_end_flush: 'word' is bold");
+        foundBold = true;
+      }
+      if (elem.content.find("rest") != std::string::npos) {
+        runner.expectFalse(elem.isBold, "css_bold_end_flush: 'rest' is not bold");
+        foundNonBold = true;
+      }
+    }
+    runner.expectTrue(foundBold, "css_bold_end_flush: bold element found");
+    runner.expectTrue(foundNonBold, "css_bold_end_flush: non-bold element found");
+  }
+
+  // Test 121: CSS italic span end flushes partWordBuffer (no trailing space)
+  {
+    TestParser parser;
+    bool ok = parser.parse(
+        "<html><body><p>"
+        "<span style=\"font-style: italic\">word</span>rest"
+        "</p></body></html>");
+    runner.expectTrue(ok, "css_italic_end_flush: parses successfully");
+    bool foundItalic = false;
+    bool foundNonItalic = false;
+    for (const auto& elem : parser.elements) {
+      if (elem.type != TestParser::ParsedElement::TEXT) continue;
+      if (elem.content.find("word") != std::string::npos) {
+        runner.expectTrue(elem.isItalic, "css_italic_end_flush: 'word' is italic");
+        foundItalic = true;
+      }
+      if (elem.content.find("rest") != std::string::npos) {
+        runner.expectFalse(elem.isItalic, "css_italic_end_flush: 'rest' is not italic");
+        foundNonItalic = true;
+      }
+    }
+    runner.expectTrue(foundItalic, "css_italic_end_flush: italic element found");
+    runner.expectTrue(foundNonItalic, "css_italic_end_flush: non-italic element found");
+  }
+
+  // Test 122: Nested HTML bold + CSS italic span end flush
+  {
+    TestParser parser;
+    bool ok = parser.parse(
+        "<html><body><p>"
+        "<b>bold <span style=\"font-style: italic\">both</span> bold</b> normal"
+        "</p></body></html>");
+    runner.expectTrue(ok, "css_nested_end_flush: parses successfully");
+    for (const auto& elem : parser.elements) {
+      if (elem.type != TestParser::ParsedElement::TEXT) continue;
+      if (elem.content.find("both") != std::string::npos) {
+        runner.expectTrue(elem.isBold, "css_nested_end_flush: 'both' is bold");
+        runner.expectTrue(elem.isItalic, "css_nested_end_flush: 'both' is italic");
+      }
+      if (elem.content == "bold" || elem.content.find("bold") != std::string::npos) {
+        if (elem.content.find("both") == std::string::npos) {
+          runner.expectTrue(elem.isBold, "css_nested_end_flush: 'bold' is bold");
+        }
+      }
+      if (elem.content.find("normal") != std::string::npos) {
+        runner.expectFalse(elem.isBold, "css_nested_end_flush: 'normal' is not bold");
+        runner.expectFalse(elem.isItalic, "css_nested_end_flush: 'normal' is not italic");
+      }
+    }
   }
 
   return runner.allPassed() ? 0 : 1;

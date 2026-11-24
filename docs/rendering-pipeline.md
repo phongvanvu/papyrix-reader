@@ -1,153 +1,118 @@
-# Rendering Pipeline Memory Usage (Reader Mode)
-
-This document describes RAM usage in **Reader mode** across all combinations of anti-aliasing (AA), font type, and status bar settings. Reader mode is the minimal-footprint mode optimized for reading — WiFi is off, freeing ~100KB compared to UI mode.
+# Rendering Pipeline
 
 ## Display Framebuffer
 
-The device uses single-buffer mode (`-DEINK_DISPLAY_SINGLE_BUFFER_MODE=1` in `platformio.ini`).
+The release builds use single-buffer mode. The C3 artifact reserves 52,272 bytes for the largest supported panel. The X4 Pro and X4 v2 Classic artifacts allocate their 48,000-byte buffers in PSRAM. Initialization fails if that allocation fails.
 
-One statically-allocated framebuffer:
+- **X3**
+  - Native dimensions: 792 × 528
+  - Active frame bytes: 52,272
+- **X4**
+  - Native dimensions: 800 × 480
+  - Active frame bytes: 48,000
+- **X4 Pro**
+  - Native dimensions: 800 × 480
+  - Active frame bytes: 48,000
+- **X4 v2 Classic**
+  - Native dimensions: 800 × 480
+  - Active frame bytes: 48,000
 
-```
-800 × 480 / 8 = 48,000 bytes (48KB)
-```
+`lib/EInkDisplay/include/Display.h` defines the buffer interface. `lib/EInkDisplay/src/Display.cpp` allocates and initializes the buffer.
 
-Defined as `frameBuffer0[BUFFER_SIZE]` in `lib/EInkDisplay/include/EInkDisplay.h:75`. This is always present — it cannot be freed.
+## Viewport
 
-## Viewport Dimensions
+`GfxRenderer` gets the screen dimensions from the active display profile. Reader margins and orientation determine the text viewport. The status bar reduces the text height. It uses the same framebuffer as the page.
 
-Base margins from `GfxRenderer` (`lib/GfxRenderer/src/GfxRenderer.h:110-113`):
+- **X3**
+  - Portrait viewport with status bar: 512 × 757
+  - Without status bar: 512 × 780
+- **X4, X4 Pro, and X4 v2 Classic**
+  - Portrait viewport with status bar: 464 × 765
+  - Without status bar: 464 × 788
 
-- **Top:** base 9 → effective 9
-- **Left:** base 3 + 5 padding → effective 8
-- **Right:** base 3 + 5 padding → effective 8
-- **Bottom:** base 3 (+23 if status bar) → effective 3 or 26
+## Fonts
 
-Horizontal padding and status bar margin: `src/states/ReaderState.cpp:39-40`.
+Built-in font bitmaps remain in Flash. The C3 `.epdfont` cache retains up to 192 glyph bitmaps in RAM. On S3, a 96 KiB PSRAM slab retains up to 256 glyph bitmaps when space is available. If the PSRAM allocation fails, S3 uses the 192-entry RAM cache. Streaming `.epdfont` files keep metadata in RAM and read cache misses from SD.
 
-Resulting text viewport:
+Bold and italic variants load when text requires them. CJK fonts use a bounded bitmap cache. Actual font memory use depends on the font data and loaded styles.
 
-- **Status bar ON:** 464×765
-- **Status bar OFF:** 464×788
+See [fonts](fonts.md) for formats and fallback rules.
 
-The status bar changes page layout (fewer lines per page) but allocates **no additional buffers**. The status bar is rendered into the same framebuffer.
+## Antialiasing
 
-## Font Memory
+The reader renders a black-and-white page first. For grayscale text, it renders the two grayscale masks into the same framebuffer. The display driver sends each mask to the controller. The controller applies its grayscale waveform. The reader then renders black-and-white data again to restore the controller state.
 
-### Builtin fonts (Flash)
+On S3, the reader retains up to four current-page BMP files for one render turn. It uses at most 256 KiB of PSRAM for their rows. Images that do not fit use a separate bitmap object for each render pass. The C3 reader opens each BMP for each render pass. The status bar uses one-bit rendering.
 
-Builtin fonts (`reader_2b`, `reader_bold_2b`, `reader_italic_2b`) are stored in Flash via `PROGMEM`. Bitmap data costs **0 bytes RAM**.
+Classic uses monochrome rendering when the panel has no supported grayscale waveform. This applies to text and images without changing the stored antialiasing preference. See the [Classic panel policy](x4-classic-specifications.md#display-controller-selection) for supported variants.
 
-Each font has a `GlyphCache` for O(1) hot-glyph lookup (`lib/EpdFont/src/EpdFont.h:4-39`):
+The display driver owns controller-specific RAM synchronization and refresh rules. Do not reuse SSD1677 commands on UC8253, UC8279, or UC8179.
 
-```
-64 entries × 8 bytes (4B codepoint + 4B pointer) = 512 bytes per font
-```
+## Page Cache
 
-Three fonts (regular + bold + italic) = **1,536 bytes (~1.5KB)**.
+The parser writes page records to the SD card. EPUB and FB2 parsers use a separate 64 KiB PSRAM scratch buffer on S3 when space is available. If that allocation fails, they use the framebuffer. The C3 parsers always borrow the framebuffer.
 
-### Streaming external fonts (.epdfont)
+The cache stores a lookup table of page offsets. Viewport, font, hyphenation, and rendering settings determine cache compatibility. A layout change invalidates incompatible pages.
 
-Streaming fonts (`lib/EpdFont/src/StreamingEpdFont.h`) load interval tables and glyph metadata into RAM but stream bitmap data from SD card with an LRU cache.
+The default cache chunk contains five pages. A partial cache records that more content remains. Cache extension adds page records and a replacement lookup table. It updates the header after those writes complete. The previous header remains valid if extension stops before that update.
 
-Typical RAM per font: **~25KB** (vs ~70KB if fully loaded). Breakdown:
+EPUB caches chapters separately. Markdown, FB2, HTML, and TXT use a page cache for the document. EPUB partial and complete cache saves keep anchors in source order. Each original EPUB spine item uses one XML stream with 4 KiB input blocks. Large chapters use complete normalized XHTML files on the SD card.
 
-- Interval + glyph tables: varies by font (~10-15KB)
-- LRU bitmap cache: 64 entries, dynamically allocated per glyph
-- Glyph lookup cache: 64 entries × 12 bytes = 768 bytes
-- Hash table: 64 × 2 bytes = 128 bytes
+The parser keeps paragraph and page state across input blocks. It does not add XML wrappers or page breaks at byte boundaries. Metadata, page caches, page-count indexes, and anchor maps rebuild through version checks. See [file formats](file-formats.md) for record layouts.
 
-Bold and italic variants are loaded **lazily** — 0 bytes until the first styled text is encountered. Each additional variant adds ~25KB.
+### Stylesheet Cache
 
-### CJK external font (.bin)
+EPUB metadata loads do not prepare external styles. Reloading metadata discards the previous manifest's stylesheet list. The first chapter that needs layout prepares external styles:
 
-The CJK fallback font (`lib/ExternalFont/src/ExternalFont.h`) is loaded lazily on the first CJK codepoint. It uses a fixed-size LRU cache:
+- If `styles.bin` contains compatible parsed rules, the chapter loads them.
+- Otherwise, it prepares all source stylesheets and saves the complete result.
 
-```
-CacheEntry = 4B codepoint + 200B bitmap + 4B lastUsed + 3B flags = ~211 bytes
-64 entries × 211 bytes ≈ 13.5KB
-+ hash table: 64 × 2B = 128 bytes
-Total: ~13.6KB
-```
+Complete page-cache reads do not load CSS. An empty rule cache is valid for a book without external styles. The cache keeps property flags, precedence, and relative units. Font and viewport changes reuse the parsed rules.
 
-## Rendering Support Buffers
+CSS preparation uses the chapter's existing scratch storage for ZIP extraction. Memory checks cover string growth, declaration work, and retained rules instead of a fixed 96 KiB threshold. The free-block check covers simultaneous declaration copies. The parser excludes surrounding whitespace from the copy budget.
 
-Always allocated when `GfxRenderer` is constructed (`lib/GfxRenderer/src/GfxRenderer.h:61-76`):
+Limits remain:
 
-- `bitmapOutputRow_` — 200 bytes (row output buffer, 800/4)
-- `bitmapRowBytes_` — 2,400 bytes (24bpp row decode buffer, 800×3)
-- Width cache keys — 2,048 bytes (256 × 8B hash keys)
-- Width cache values — 512 bytes (256 × 2B pixel widths)
-- **Total: ~5.2KB**
+- 64 KiB per source stylesheet.
+- 512 rules.
+- 256 bytes per selector.
 
-## Anti-Aliasing Pipeline
+Failed or cancelled preparation does not emit new pages with incomplete styles. Failed preparation stops cache extension and keeps the committed page cache. A missing or invalid rule cache rebuilds from source.
 
-### Without AA
+Page cache version 29, metrics version 10, and anchor version 7 invalidate older layouts. They do not delete progress or bookmarks.
 
-Simple BW render directly into the framebuffer. One render pass, no extra memory.
+## Cache Scheduling
 
-### With AA (grayscale text)
+Full Book Process indexes the book before reading. The user can cancel with Back. XTC and XTCH do not require text layout.
 
-The AA pipeline reuses the **same 48KB framebuffer** for all passes — no backup buffer is allocated. From `src/states/ReaderState.cpp:776-809`:
+Full-book indexing creates a missing EPUB or FB2 chapter cache with exclusive access. This avoids read retries for a new cache. Existing caches keep the normal read retries. An empty file has no valid cache header, so indexing rebuilds it after an interruption.
 
-1. Render BW page + status bar → `displayBuffer` (normal page flip)
-2. `clearScreen(0x00)`, render LSB mask → `copyGrayscaleLsbBuffers` (SPI to SSD1677 BW RAM)
-3. `clearScreen(0x00)`, render MSB mask → `copyGrayscaleMsbBuffers` (SPI to SSD1677 RED RAM)
-4. `displayGrayBuffer()` → SSD1677 combines BW+RED RAM for 4-level grayscale
-5. Re-render BW from scratch → `cleanupGrayscaleWithFrameBuffer` (restores RED RAM)
-6. If status bar: blank + redraw via `displayWindow` (status bar is 1-bit only)
+Full-book indexing keeps section counts in the existing page-metrics array. A complete run saves `metrics.bin` once and keeps the counts for the first page. This avoids another scan of all chapter caches. A skipped or failed section keeps the total estimated. If the array does not fit in memory, the reader defers the index rebuild. A complete chapter alone does not make an EPUB or FB2 book total exact.
 
-Line 791: *"Re-render BW instead of restoring from backup (saves 48KB peak allocation)"*
+Foreground caching handles a requested page that is not yet available. Backward navigation uses a compatible complete chapter cache without an indexing screen. The reader uses the stored page count to select the last page.
 
-**Extra RAM: 0 bytes.** The cost is CPU time — 3 additional full-page renders (LSB, MSB, BW restore) plus status bar refresh.
+Before foreground cache creation or extension, the reader shows `Indexing`. This includes extension before the current cache ends. The message remains through all preparation chunks. The reader restores page-button input after the next page or overlay completes its display refresh.
 
-## Background Caching Task
+Page-button presses during this wait do not turn pages afterward. A held page button needs a release and a new press before navigation resumes. The reader keeps completed taps from before the wait. Back and Power events remain queued. Synchronous preparation delays their handling. Normal display refreshes outside this wait keep short taps.
 
-The page pre-caching task runs on a FreeRTOS background thread (`src/states/ReaderState.cpp:35`):
+Background caching extends the cache while the user reads. Cancellation uses `AbortCallback`. The background task deletes itself after it stops. Cancellation after setup keeps a compatible cache that has already loaded. The next page turn can keep the live parser instead of parsing the chapter again.
 
-```
-Stack: 12,288 bytes (12KB)
-```
+The live parser keeps its bounded text-layout window, buffered word, and block spacing across batch stops, including the final input block. Layout windows can end inside a CJK source word. The parser clears completed block styles before it continues after an image. If memory is too low for layout, the parser keeps the chapter incomplete. After a restart, the parser reads the chapter from the beginning and skips pages already in the cache.
 
-Pages are cached to SD card, not held in RAM. The ownership model ensures the main thread and background task never access the parser or page cache simultaneously — no mutex overhead on shared data.
+This replay cost grows with the cached part of the chapter. Page progress resets the parser timeout during replay.
 
-## Memory Summary
+The background task owns the parser and page cache while it runs. The main thread accesses them only after the task stops. Do not force-delete the task or access its resources concurrently.
 
-### Builtin fonts (~67KB total)
+## Page Totals
 
-All four combinations (AA on/off × status bar on/off) use the same RAM:
+A partial cache contains an incomplete page count. The status bar adds `~` to an estimated total. The total is exact only when every section cache is complete. See the [status bar reference](user_guide.md#status-bar).
 
-- Framebuffer: 48KB
-- Fonts (3 glyph caches): ~1.5KB
-- Render buffers: 5.2KB
-- Cache task stack: 12KB
-- AA overhead: 0 (re-renders instead of backup buffer)
+## Source Files
 
-### External fonts (~90KB total)
-
-All four combinations (AA on/off × status bar on/off) use the same RAM:
-
-- Framebuffer: 48KB
-- Font (1 streaming regular): ~25KB
-- Render buffers: 5.2KB
-- Cache task stack: 12KB
-- AA overhead: 0 (re-renders instead of backup buffer)
-
-### Additive costs
-
-- CJK fallback font: +~14KB (lazy, loaded on first CJK codepoint)
-- Bold variant (external): +~25KB (lazy, loaded on first bold text)
-- Italic variant (external): +~25KB (lazy, loaded on first italic text)
-
-**Key insight:** AA and status bar settings do not affect peak RAM. The only variable that significantly changes memory usage is the font type (builtin vs external) and how many external font variants are loaded.
-
-## Key Source Files
-
-- `lib/EInkDisplay/include/EInkDisplay.h` — framebuffer, display constants
-- `lib/GfxRenderer/src/GfxRenderer.h` — render buffers, width cache, grayscale API
-- `lib/EpdFont/src/EpdFont.h` — builtin glyph cache
-- `lib/EpdFont/src/StreamingEpdFont.h` — streaming font, LRU bitmap cache
-- `lib/ExternalFont/src/ExternalFont.h` — CJK font, fixed-size LRU cache
-- `src/states/ReaderState.cpp` — viewport, AA pipeline, background task
-- `src/FontManager.cpp` — lazy font loading
-- `platformio.ini` — `EINK_DISPLAY_SINGLE_BUFFER_MODE` flag
+- `lib/GfxRenderer/src/GfxRenderer.h`
+- `lib/EpdFont/src/EpdFont.h`
+- `lib/EpdFont/src/StreamingEpdFont.h`
+- `lib/ExternalFont/src/ExternalFont.h`
+- `lib/PageCache/src/PageCache.cpp`
+- `src/states/ReaderState.cpp`
+- `src/FontManager.cpp`

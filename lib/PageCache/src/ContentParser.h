@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -32,7 +33,7 @@ class ContentParser {
    * @param shouldAbort Optional callback to check for cancellation (called periodically)
    * @return true if parsing completed successfully (may be partial if maxPages hit or aborted)
    */
-  virtual bool parsePages(const std::function<void(std::unique_ptr<Page>)>& onPageComplete, uint16_t maxPages = 0,
+  virtual bool parsePages(const std::function<void(std::unique_ptr<Page>)>& onPageComplete, uint32_t maxPages = 0,
                           const AbortCallback& shouldAbort = nullptr) = 0;
 
   /**
@@ -55,11 +56,26 @@ class ContentParser {
   virtual void reset() = 0;
 
   /**
-   * Get anchor-to-page mapping (element id → page index).
-   * Only meaningful for EPUB parsers; returns empty for other formats.
+   * Get collected anchor IDs and zero-based page indexes.
+   * EPUB indexes use chapter-wide offsets, also during partial parsing.
+   * Return rows in source order. The reader uses the first matching ID.
+   * Return an empty map when the format does not support anchors.
    */
-  virtual const std::vector<std::pair<std::string, uint16_t>>& getAnchorMap() const {
-    static const std::vector<std::pair<std::string, uint16_t>> empty;
+  virtual const std::vector<std::pair<std::string, uint32_t>>& getAnchorMap() const {
+    static const std::vector<std::pair<std::string, uint32_t>> empty;
     return empty;
   }
+
+  /**
+   * Bytes consumed from the source by the parser so far. Used to extrapolate
+   * total page count while the cache is still partial. Returns 0 when not
+   * tracked (e.g. EpubChapterParser, where pages are chapter-relative).
+   */
+  virtual uint32_t bytesConsumed() const { return 0; }
+
+  /**
+   * Total source bytes available to this parser (file size for whole-file
+   * parsers, chapter size for chaptered parsers). 0 if unknown.
+   */
+  virtual uint32_t totalBytes() const { return 0; }
 };

@@ -2,13 +2,20 @@
 
 #include <Arduino.h>
 #include <GfxRenderer.h>
+#include <HardwareIdentity.h>
+#include <I18n.h>
 #include <LittleFS.h>  // Must be before SdFat includes to avoid FILE_READ/FILE_WRITE redefinition
 #include <Logging.h>
 #include <SDCardManager.h>
+#if PAPYRIX_TARGET_MURPHY_M4
+#include <MurphyM4Batch.h>
+#endif
 
 #include <algorithm>
 
-#include "../Battery.h"
+#include "../content/RecentBooksStore.h"
+#include "../core/FirmwareUpdater.h"
+#include "../core/TrashPaths.h"
 
 #define TAG "SETTINGS_UI"
 #include "../config.h"
@@ -19,6 +26,9 @@
 
 namespace papyrix {
 
+static_assert(ui::ScreenSettingsView::MAX_THEMES == MAX_CACHED_THEMES,
+              "Theme manager and settings view capacities must match");
+
 SettingsState::SettingsState(GfxRenderer& renderer)
     : renderer_(renderer),
       core_(nullptr),
@@ -28,12 +38,14 @@ SettingsState::SettingsState(GfxRenderer& renderer)
       goNetwork_(false),
       themeWasChanged_(false),
       returnScreen_(SettingsScreen::Menu),
-      pendingAction_(0),
+      pendingAction_(ACTION_NONE),
       menuView_{},
       readerView_{},
+      screenView_{},
       deviceView_{},
       cleanupView_{},
       confirmView_{},
+      firmwareView_{},
       infoView_{} {}
 
 SettingsState::~SettingsState() = default;
@@ -44,16 +56,26 @@ void SettingsState::enter(Core& core) {
   currentScreen_ = returnScreen_;
   returnScreen_ = SettingsScreen::Menu;  // Reset for next normal entry
 
+  ui::ReaderSettingsView::initDefs();
+  ui::ScreenSettingsView::initDefs();
+  ui::DeviceSettingsView::initDefs();
+
   // Reset all views to ensure clean state
   menuView_.selected = 0;
   menuView_.needsRender = true;
   readerView_.selected = 0;
   readerView_.needsRender = true;
+  screenView_.selected = 0;
+  screenView_.needsRender = true;
   deviceView_.selected = 0;
   deviceView_.needsRender = true;
+  if (currentScreen_ == SettingsScreen::Device) loadDeviceSettings();
   cleanupView_.selected = 0;
   cleanupView_.needsRender = true;
   confirmView_.needsRender = true;
+  firmwareView_ = ui::FirmwareUpdateView{};
+  lastFirmwareRenderMs_ = 0;
+  firmwareCompleteMs_ = 0;
   infoView_.clear();
   infoView_.needsRender = true;
 
@@ -61,7 +83,7 @@ void SettingsState::enter(Core& core) {
   goHome_ = false;
   goNetwork_ = false;
   themeWasChanged_ = false;
-  pendingAction_ = 0;
+  pendingAction_ = ACTION_NONE;
 }
 
 void SettingsState::exit(Core& core) {
@@ -70,9 +92,107 @@ void SettingsState::exit(Core& core) {
   core.settings.save(core.storage);
 }
 
+void SettingsState::handleTap(Core& core, const Event& event) {
+  const int width = renderer_.getScreenWidth();
+  const int height = renderer_.getScreenHeight();
+  int rowHeight = THEME.itemHeight + THEME.itemSpacing;
+  const bool frontLrbc = core.settings.frontButtonLayout == Settings::FrontLRBC;
+  int rowCount = 0;
+  if (currentScreen_ == SettingsScreen::Menu) rowCount = ui::SettingsMenuView::ITEM_COUNT;
+  if (currentScreen_ == SettingsScreen::Cleanup) rowCount = ui::CleanupMenuView::ITEM_COUNT;
+  ui::SettingsListLayout layout{rowCount};
+  if (currentScreen_ == SettingsScreen::Reader) {
+    layout = readerView_.layout();
+  } else if (currentScreen_ == SettingsScreen::Screen) {
+    layout = screenView_.layout();
+  } else if (currentScreen_ == SettingsScreen::Device) {
+    layout = deviceView_.layout();
+  }
+  if (currentScreen_ == SettingsScreen::Reader || currentScreen_ == SettingsScreen::Screen ||
+      currentScreen_ == SettingsScreen::Device) {
+    rowHeight = layout.rowHeight(THEME, height);
+  }
+
+  if (currentScreen_ == SettingsScreen::SleepImages) {
+    const auto hit = ui::SettingsListLayout{static_cast<int>(sleepImageView_.page.count)}.hitTest(
+        {event.touch.x, event.touch.y}, width, height, sleepImageView_.rowHeight(THEME, height), frontLrbc);
+    if (hit.type == ui::SettingsListHit::Type::Row) {
+      sleepImageView_.selected = static_cast<size_t>(hit.index);
+      selectSleepImage(core);
+    } else if (hit.type == ui::SettingsListHit::Type::Open) {
+      selectSleepImage(core);
+    } else if (hit.type == ui::SettingsListHit::Type::Previous) {
+      moveSleepImage(-1, true);
+    } else if (hit.type == ui::SettingsListHit::Type::Next) {
+      moveSleepImage(1, true);
+    } else if (hit.type == ui::SettingsListHit::Type::Back) {
+      goBack(core);
+    }
+    return;
+  }
+
+  if (currentScreen_ == SettingsScreen::ConfirmDialog) {
+    const auto layout = ui::confirmDialogBounds(renderer_, THEME, confirmView_);
+    const auto hit = confirmView_.hitTest({event.touch.x, event.touch.y}, layout, frontLrbc);
+    if (hit == ui::ConfirmDialogView::Hit::Yes) {
+      confirmView_.selection = 0;
+      handleConfirm(core);
+    } else if (hit == ui::ConfirmDialogView::Hit::No) {
+      confirmView_.selection = 1;
+      handleConfirm(core);
+    } else if (hit == ui::ConfirmDialogView::Hit::Select) {
+      handleConfirm(core);
+    } else if (hit == ui::ConfirmDialogView::Hit::Back) {
+      goBack(core);
+    }
+    return;
+  }
+
+  const auto hit = layout.hitTest({event.touch.x, event.touch.y}, width, height, rowHeight, frontLrbc);
+  if (hit.type == ui::SettingsListHit::Type::Row) {
+    if (currentScreen_ == SettingsScreen::Menu) menuView_.selected = static_cast<int8_t>(hit.index);
+    if (currentScreen_ == SettingsScreen::Reader) readerView_.selected = static_cast<int8_t>(hit.index);
+    if (currentScreen_ == SettingsScreen::Screen) screenView_.selected = static_cast<int8_t>(hit.index);
+    if (currentScreen_ == SettingsScreen::Device) deviceView_.selected = static_cast<int8_t>(hit.index);
+    if (currentScreen_ == SettingsScreen::Cleanup) cleanupView_.selected = static_cast<int8_t>(hit.index);
+    needsRender_ = true;
+    if (currentScreen_ == SettingsScreen::Menu || currentScreen_ == SettingsScreen::Cleanup ||
+        (currentScreen_ == SettingsScreen::Device && deviceView_.selected == 0) ||
+        (currentScreen_ == SettingsScreen::Screen && screenView_.sleepImageSelected()))
+      handleConfirm(core);
+  } else if (hit.type == ui::SettingsListHit::Type::Previous &&
+             (currentScreen_ == SettingsScreen::Reader || currentScreen_ == SettingsScreen::Screen ||
+              currentScreen_ == SettingsScreen::Device)) {
+    handleLeftRight(-1);
+  } else if (hit.type == ui::SettingsListHit::Type::Next &&
+             (currentScreen_ == SettingsScreen::Reader || currentScreen_ == SettingsScreen::Screen ||
+              currentScreen_ == SettingsScreen::Device)) {
+    handleLeftRight(1);
+  } else if (hit.type == ui::SettingsListHit::Type::Open &&
+             (currentScreen_ == SettingsScreen::Menu || currentScreen_ == SettingsScreen::Cleanup ||
+              currentScreen_ == SettingsScreen::FirmwareUpdate ||
+              (currentScreen_ == SettingsScreen::Device && deviceView_.selected == 0) ||
+              (currentScreen_ == SettingsScreen::Screen && screenView_.sleepImageSelected()))) {
+    handleConfirm(core);
+  } else if (hit.type == ui::SettingsListHit::Type::Back) {
+    if (currentScreen_ == SettingsScreen::Menu) {
+      core.settings.save(core.storage);
+      goHome_ = true;
+    } else if (currentScreen_ != SettingsScreen::FirmwareUpdate ||
+               (firmwareView_.state != ui::FirmwareUpdateView::State::Flashing &&
+                firmwareView_.state != ui::FirmwareUpdateView::State::Validating)) {
+      goBack(core);
+    }
+  }
+}
+
 StateTransition SettingsState::update(Core& core) {
   Event e;
   while (core.events.pop(e)) {
+    if (e.type == EventType::Tap) {
+      handleTap(core, e);
+      continue;
+    }
     switch (e.type) {
       case EventType::ButtonRepeat:
       case EventType::ButtonPress:
@@ -84,6 +204,12 @@ StateTransition SettingsState::update(Core& core) {
                 break;
               case SettingsScreen::Reader:
                 readerView_.moveUp();
+                break;
+              case SettingsScreen::Screen:
+                screenView_.moveUp();
+                break;
+              case SettingsScreen::SleepImages:
+                moveSleepImage(-1, false);
                 break;
               case SettingsScreen::Device:
                 deviceView_.moveUp();
@@ -108,6 +234,12 @@ StateTransition SettingsState::update(Core& core) {
               case SettingsScreen::Reader:
                 readerView_.moveDown();
                 break;
+              case SettingsScreen::Screen:
+                screenView_.moveDown();
+                break;
+              case SettingsScreen::SleepImages:
+                moveSleepImage(1, false);
+                break;
               case SettingsScreen::Device:
                 deviceView_.moveDown();
                 break;
@@ -128,6 +260,12 @@ StateTransition SettingsState::update(Core& core) {
               case SettingsScreen::Reader:
                 if (readerView_.buttons.isActive(2)) handleLeftRight(-1);
                 break;
+              case SettingsScreen::Screen:
+                if (screenView_.buttons.isActive(2)) handleLeftRight(-1);
+                break;
+              case SettingsScreen::SleepImages:
+                moveSleepImage(-1, true);
+                break;
               case SettingsScreen::Device:
                 if (deviceView_.buttons.isActive(2)) handleLeftRight(-1);
                 break;
@@ -142,6 +280,12 @@ StateTransition SettingsState::update(Core& core) {
             switch (currentScreen_) {
               case SettingsScreen::Reader:
                 if (readerView_.buttons.isActive(3)) handleLeftRight(+1);
+                break;
+              case SettingsScreen::Screen:
+                if (screenView_.buttons.isActive(3)) handleLeftRight(+1);
+                break;
+              case SettingsScreen::SleepImages:
+                moveSleepImage(1, true);
                 break;
               case SettingsScreen::Device:
                 if (deviceView_.buttons.isActive(3)) handleLeftRight(+1);
@@ -164,11 +308,14 @@ StateTransition SettingsState::update(Core& core) {
               core.settings.save(core.storage);
               goHome_ = true;
             } else if (currentScreen_ == SettingsScreen::ConfirmDialog) {
-              // Cancel confirmation dialog
-              pendingAction_ = 0;
-              currentScreen_ = SettingsScreen::Cleanup;
-              cleanupView_.needsRender = true;
-              needsRender_ = true;
+              goBack(core);
+            } else if (currentScreen_ == SettingsScreen::FirmwareUpdate) {
+              if (firmwareView_.state == ui::FirmwareUpdateView::State::Flashing ||
+                  firmwareView_.state == ui::FirmwareUpdateView::State::Validating) {
+                // Back is disabled during validation/flashing
+              } else {
+                goBack(core);
+              }
             } else {
               goBack(core);
             }
@@ -190,6 +337,56 @@ StateTransition SettingsState::update(Core& core) {
     return StateTransition::to(StateId::Network);
   }
 
+  // Firmware validation (runs after "Validating..." frame is rendered)
+  if (currentScreen_ == SettingsScreen::FirmwareUpdate &&
+      firmwareView_.state == ui::FirmwareUpdateView::State::Validating && firmwareValidationRendered_) {
+    if (!FW_UPDATER.beginUpdate()) {
+      firmwareView_.state = ui::FirmwareUpdateView::State::Error;
+      const auto error = FW_UPDATER.progress().error;
+      snprintf(firmwareView_.statusLine, sizeof(firmwareView_.statusLine), "%s",
+               error == FirmwareUpdateError::BadChip || error == FirmwareUpdateError::BadBoard ? tr(UPDATE_WRONG_DEVICE)
+                                                                                               : tr(UPDATE_FAILED));
+    } else {
+      firmwareView_.state = ui::FirmwareUpdateView::State::Flashing;
+      snprintf(firmwareView_.statusLine, sizeof(firmwareView_.statusLine), "%s", tr(FLASHING_UPDATE));
+      lastFirmwareRenderMs_ = 0;
+    }
+    firmwareView_.needsRender = true;
+    needsRender_ = true;
+  }
+
+  // Firmware update pump (runs each frame while flashing)
+  if (currentScreen_ == SettingsScreen::FirmwareUpdate &&
+      firmwareView_.state == ui::FirmwareUpdateView::State::Flashing) {
+    if (!FW_UPDATER.pump()) {
+      const auto& p = FW_UPDATER.progress();
+      if (p.phase == FirmwareUpdatePhase::Complete) {
+        firmwareView_.state = ui::FirmwareUpdateView::State::Complete;
+        snprintf(firmwareView_.statusLine, sizeof(firmwareView_.statusLine), "%s", tr(UPDATE_COMPLETE));
+        firmwareCompleteMs_ = millis();
+      } else {
+        firmwareView_.state = ui::FirmwareUpdateView::State::Error;
+        snprintf(firmwareView_.statusLine, sizeof(firmwareView_.statusLine), "%s", tr(UPDATE_FAILED));
+      }
+      needsRender_ = true;
+      firmwareView_.needsRender = true;
+    } else {
+      const auto& p = FW_UPDATER.progress();
+      firmwareView_.progressPercent =
+          p.totalBytes > 0 ? static_cast<int>(static_cast<int64_t>(p.bytesFlashed) * 100 / p.totalBytes) : 0;
+      if (millis() - lastFirmwareRenderMs_ >= 3000) {
+        lastFirmwareRenderMs_ = millis();
+        needsRender_ = true;
+        firmwareView_.needsRender = true;
+      }
+    }
+  }
+
+  // Auto-restart after showing "Update complete" for 2 seconds
+  if (firmwareCompleteMs_ != 0 && millis() - firmwareCompleteMs_ >= 2000) {
+    ESP.restart();
+  }
+
   if (goHome_) {
     goHome_ = false;
     return StateTransition::to(StateId::Home);
@@ -208,6 +405,11 @@ void SettingsState::render(Core& core) {
       case SettingsScreen::Reader:
         viewNeedsRender = readerView_.needsRender;
         break;
+      case SettingsScreen::Screen:
+        viewNeedsRender = screenView_.needsRender;
+        break;
+      case SettingsScreen::SleepImages:
+        break;
       case SettingsScreen::Device:
         viewNeedsRender = deviceView_.needsRender;
         break;
@@ -219,6 +421,9 @@ void SettingsState::render(Core& core) {
         break;
       case SettingsScreen::ConfirmDialog:
         viewNeedsRender = confirmView_.needsRender;
+        break;
+      case SettingsScreen::FirmwareUpdate:
+        viewNeedsRender = firmwareView_.needsRender;
         break;
     }
     if (!viewNeedsRender) {
@@ -234,6 +439,13 @@ void SettingsState::render(Core& core) {
     case SettingsScreen::Reader:
       ui::render(renderer_, THEME, readerView_);
       readerView_.needsRender = false;
+      break;
+    case SettingsScreen::Screen:
+      ui::render(renderer_, THEME, screenView_);
+      screenView_.needsRender = false;
+      break;
+    case SettingsScreen::SleepImages:
+      ui::render(renderer_, THEME, sleepImageView_);
       break;
     case SettingsScreen::Device:
       ui::render(renderer_, THEME, deviceView_);
@@ -251,35 +463,63 @@ void SettingsState::render(Core& core) {
       ui::render(renderer_, THEME, confirmView_);
       confirmView_.needsRender = false;
       break;
+    case SettingsScreen::FirmwareUpdate:
+      ui::render(renderer_, THEME, firmwareView_);
+      firmwareView_.needsRender = false;
+      if (firmwareView_.state == ui::FirmwareUpdateView::State::Validating && !firmwareValidationRendered_) {
+        firmwareValidationRendered_ = true;
+        needsRender_ = true;
+      }
+      break;
   }
 
   needsRender_ = false;
-  core.display.markDirty();
 }
 
 void SettingsState::openSelected() {
-  switch (menuView_.selected) {
-    case 0:  // Reader
+  switch (menuView_.selectedItem()) {
+    case ui::SettingsMenuView::Item::Reader:
       loadReaderSettings();
       readerView_.selected = 0;
       readerView_.needsRender = true;
       currentScreen_ = SettingsScreen::Reader;
       break;
-    case 1:  // Device
+    case ui::SettingsMenuView::Item::Screen:
+      loadScreenSettings();
+      screenView_.selected = 0;
+      screenView_.needsRender = true;
+      currentScreen_ = SettingsScreen::Screen;
+      break;
+    case ui::SettingsMenuView::Item::Device:
       loadDeviceSettings();
       deviceView_.selected = 0;
       deviceView_.needsRender = true;
       currentScreen_ = SettingsScreen::Device;
       break;
-    case 2:  // Cleanup
+    case ui::SettingsMenuView::Item::Cleanup:
       cleanupView_.selected = 0;
       cleanupView_.needsRender = true;
       currentScreen_ = SettingsScreen::Cleanup;
       break;
-    case 3:  // System Info
+    case ui::SettingsMenuView::Item::FirmwareUpdate:
+      firmwareView_.state = ui::FirmwareUpdateView::State::Idle;
+      firmwareView_.progressPercent = 0;
+      firmwareView_.needsRender = true;
+      lastFirmwareRenderMs_ = 0;
+      if (FW_UPDATER.findFirmwareFile()) {
+        snprintf(firmwareView_.statusLine, sizeof(firmwareView_.statusLine), "%s: %s", tr(FIRMWARE_FILE_FOUND),
+                 PAPYRIX_FIRMWARE_FILE);
+      } else {
+        snprintf(firmwareView_.statusLine, sizeof(firmwareView_.statusLine), "%s", tr(NO_FIRMWARE_FILE));
+      }
+      currentScreen_ = SettingsScreen::FirmwareUpdate;
+      break;
+    case ui::SettingsMenuView::Item::SystemInfo:
       populateSystemInfo();
       infoView_.needsRender = true;
       currentScreen_ = SettingsScreen::SystemInfo;
+      break;
+    case ui::SettingsMenuView::Item::Count:
       break;
   }
   needsRender_ = true;
@@ -287,16 +527,25 @@ void SettingsState::openSelected() {
 
 void SettingsState::goBack(Core& core) {
   switch (currentScreen_) {
+    case SettingsScreen::SleepImages:
+      currentScreen_ = SettingsScreen::Screen;
+      screenView_.needsRender = true;
+      break;
     case SettingsScreen::Reader:
       saveReaderSettings();
+      currentScreen_ = SettingsScreen::Menu;
+      menuView_.needsRender = true;
+      break;
+    case SettingsScreen::Screen:
+      saveScreenSettings();
       currentScreen_ = SettingsScreen::Menu;
       menuView_.needsRender = true;
       break;
     case SettingsScreen::Device:
       saveDeviceSettings();
       // Apply button layouts now that we're leaving the screen
-      core.settings.frontButtonLayout = std::min(deviceView_.values[6], uint8_t(Settings::FrontLRBC));
-      core.settings.sideButtonLayout = std::min(deviceView_.values[7], uint8_t(Settings::NextPrev));
+      core.settings.frontButtonLayout = std::min(deviceView_.values[0], uint8_t(Settings::FrontLRBC));
+      core.settings.sideButtonLayout = std::min(deviceView_.values[1], uint8_t(Settings::NextPrev));
       ui::setFrontButtonLayout(core.settings.frontButtonLayout);
       core.input.resyncState();
       currentScreen_ = SettingsScreen::Menu;
@@ -308,9 +557,25 @@ void SettingsState::goBack(Core& core) {
       menuView_.needsRender = true;
       break;
     case SettingsScreen::ConfirmDialog:
-      pendingAction_ = 0;
-      currentScreen_ = SettingsScreen::Cleanup;
-      cleanupView_.needsRender = true;
+#if PAPYRIX_TARGET_MURPHY_M4
+      if (pendingAction_ == ACTION_M4_BATCH) {
+        deviceView_.values[ui::DeviceSettingsView::BATCH_SETTING] =
+            board::murphyM4Batch() == board::MurphyM4Batch::First ? 0 : 1;
+        currentScreen_ = SettingsScreen::Device;
+        deviceView_.needsRender = true;
+      } else
+#endif
+      {
+        currentScreen_ = SettingsScreen::Cleanup;
+        cleanupView_.needsRender = true;
+      }
+      pendingAction_ = ACTION_NONE;
+      break;
+    case SettingsScreen::FirmwareUpdate:
+      FW_UPDATER.abort();
+      FW_UPDATER.reset();
+      currentScreen_ = SettingsScreen::Menu;
+      menuView_.needsRender = true;
       break;
     default:
       break;
@@ -331,13 +596,41 @@ void SettingsState::handleConfirm(Core& core) {
       break;
 
     case SettingsScreen::Device:
-      deviceView_.cycleValue(1);
-      saveDeviceSettings();
-      needsRender_ = true;
+#if PAPYRIX_TARGET_MURPHY_M4
+      if (deviceView_.settingIndex(deviceView_.selected) == ui::DeviceSettingsView::BATCH_SETTING) {
+        const auto batch =
+            static_cast<board::MurphyM4Batch>(deviceView_.values[ui::DeviceSettingsView::BATCH_SETTING] + 1);
+        if (batch == board::murphyM4Batch()) break;
+        confirmView_.setup(tr(CHANGE_BATCH_Q), deviceView_.getCurrentValueStr(ui::DeviceSettingsView::BATCH_SETTING),
+                           tr(CHANGE_BATCH_RESTART));
+        pendingAction_ = ACTION_M4_BATCH;
+        currentScreen_ = SettingsScreen::ConfirmDialog;
+        needsRender_ = true;
+        break;
+      }
+#endif
+      if (deviceView_.selected == 0) {
+        returnScreen_ = SettingsScreen::Device;
+        goBack(core);
+        core.pendingSync = SyncMode::WifiSetup;
+        goNetwork_ = true;
+      } else {
+        handleLeftRight(1);
+      }
+      break;
+    case SettingsScreen::Screen:
+      if (screenView_.sleepImageSelected()) {
+        openSleepImages();
+      } else {
+        handleLeftRight(1);
+      }
+      break;
+    case SettingsScreen::SleepImages:
+      selectSleepImage(core);
       break;
 
     case SettingsScreen::Cleanup:
-      clearCache(cleanupView_.selected, core);
+      clearCache(cleanupView_.selectedItem());
       break;
 
     case SettingsScreen::SystemInfo:
@@ -345,48 +638,133 @@ void SettingsState::handleConfirm(Core& core) {
       break;
 
     case SettingsScreen::ConfirmDialog:
+#if PAPYRIX_TARGET_MURPHY_M4
+      if (pendingAction_ == ACTION_M4_BATCH) {
+        if (confirmView_.isYesSelected()) {
+          const auto batch =
+              static_cast<board::MurphyM4Batch>(deviceView_.values[ui::DeviceSettingsView::BATCH_SETTING] + 1);
+          saveDeviceSettings();
+          const auto activeFrontLayout = core.settings.frontButtonLayout;
+          const auto activeSideLayout = core.settings.sideButtonLayout;
+          core.settings.frontButtonLayout = std::min(deviceView_.values[0], uint8_t(Settings::FrontLRBC));
+          core.settings.sideButtonLayout = std::min(deviceView_.values[1], uint8_t(Settings::NextPrev));
+          const bool settingsSaved = core.settings.save(core.storage).ok();
+          core.settings.frontButtonLayout = activeFrontLayout;
+          core.settings.sideButtonLayout = activeSideLayout;
+          const auto result = settingsSaved ? board::saveMurphyM4Batch(batch) : board::MurphyM4BatchSaveResult::Failed;
+          if (result == board::MurphyM4BatchSaveResult::Saved) {
+            ESP.restart();
+            return;
+          }
+          if (result == board::MurphyM4BatchSaveResult::Failed) {
+            ui::centeredMessage(renderer_, THEME, THEME.uiFontId, tr(SAVE_FAILED));
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+          }
+        }
+        goBack(core);
+        break;
+      }
+#endif
       if (confirmView_.isYesSelected()) {
-        if (pendingAction_ == 10) {
-          // Clear Book Cache
-          ui::centeredMessage(renderer_, THEME, THEME.uiFontId, "Clearing cache...");
+        if (pendingAction_ == ACTION_CLEAR_BOOK_CACHE) {
+          ui::centeredMessage(renderer_, THEME, THEME.uiFontId, tr(CLEARING_CACHE));
 
-          auto result = core.storage.rmdir(PAPYRIX_CACHE_DIR);
+          int lastRendered = 0;
+          auto result = core.storage.rmdir(PAPYRIX_CACHE_DIR, [this, &lastRendered](int n) {
+            if (n - lastRendered < 50) return;
+            lastRendered = n;
+            char buf[64];
+            snprintf(buf, sizeof(buf), "%s (%d)", tr(CLEARING_CACHE), n);
+            ui::centeredMessage(renderer_, THEME, THEME.uiFontId, buf);
+          });
 
-          const char* msg = result.ok() ? "Cache cleared" : "No cache to clear";
+          const char* msg = result.ok() ? tr(CACHE_CLEARED) : tr(NO_CACHE_TO_CLEAR);
           ui::centeredMessage(renderer_, THEME, THEME.uiFontId, msg);
           vTaskDelay(1500 / portTICK_PERIOD_MS);
 
-          pendingAction_ = 0;
+          pendingAction_ = ACTION_NONE;
           currentScreen_ = SettingsScreen::Cleanup;
           cleanupView_.needsRender = true;
           needsRender_ = true;
 
-        } else if (pendingAction_ == 11) {
-          // Clear Device Storage
-          ui::centeredMessage(renderer_, THEME, THEME.uiFontId, "Clearing device storage...");
+        } else if (pendingAction_ == ACTION_CLEAR_RECENT) {
+          const bool ok = RecentBooksStore::instance().clearAndSave();
+          ui::centeredMessage(renderer_, THEME, THEME.uiFontId, ok ? tr(DONE) : tr(ERROR));
+          vTaskDelay(1000 / portTICK_PERIOD_MS);
+
+          pendingAction_ = ACTION_NONE;
+          currentScreen_ = SettingsScreen::Cleanup;
+          cleanupView_.needsRender = true;
+          needsRender_ = true;
+
+        } else if (pendingAction_ == ACTION_EMPTY_TRASH) {
+          const auto exists = core.storage.exists(trash::DIRECTORY);
+          if (!exists.ok() || !*exists) {
+            ui::centeredMessage(renderer_, THEME, THEME.uiFontId, tr(NO_TRASH_TO_EMPTY));
+          } else {
+            ui::centeredMessage(renderer_, THEME, THEME.uiFontId, tr(EMPTYING_TRASH));
+            auto result = core.storage.rmdir(trash::DIRECTORY);
+            if (result.ok()) {
+              result = core.storage.mkdir(trash::DIRECTORY);
+            }
+            ui::centeredMessage(renderer_, THEME, THEME.uiFontId, result.ok() ? tr(TRASH_EMPTIED) : tr(DELETE_FAILED));
+          }
+          vTaskDelay(1500 / portTICK_PERIOD_MS);
+
+          pendingAction_ = ACTION_NONE;
+          currentScreen_ = SettingsScreen::Cleanup;
+          cleanupView_.needsRender = true;
+          needsRender_ = true;
+
+        } else if (pendingAction_ == ACTION_CLEAR_DEVICE_STORAGE) {
+          ui::centeredMessage(renderer_, THEME, THEME.uiFontId, tr(CLEARING_STORAGE));
 
           LittleFS.format();
 
-          ui::centeredMessage(renderer_, THEME, THEME.uiFontId, "Done. Restarting...");
+          ui::centeredMessage(renderer_, THEME, THEME.uiFontId, tr(DONE_RESTARTING));
           vTaskDelay(1000 / portTICK_PERIOD_MS);
           ESP.restart();
 
-        } else if (pendingAction_ == 12) {
-          // Factory Reset
-          ui::centeredMessage(renderer_, THEME, THEME.uiFontId, "Resetting device...");
+        } else if (pendingAction_ == ACTION_FACTORY_RESET) {
+          ui::centeredMessage(renderer_, THEME, THEME.uiFontId, tr(RESETTING_DEVICE));
 
           LittleFS.format();
           core.storage.rmdir(PAPYRIX_DIR);
 
-          ui::centeredMessage(renderer_, THEME, THEME.uiFontId, "Done. Restarting...");
+          ui::centeredMessage(renderer_, THEME, THEME.uiFontId, tr(DONE_RESTARTING));
           vTaskDelay(1000 / portTICK_PERIOD_MS);
           ESP.restart();
         }
       } else {
-        // No - cancel
-        pendingAction_ = 0;
-        currentScreen_ = SettingsScreen::Cleanup;
-        cleanupView_.needsRender = true;
+        goBack(core);
+      }
+      break;
+
+    case SettingsScreen::FirmwareUpdate:
+      if (firmwareView_.state == ui::FirmwareUpdateView::State::Error) {
+        firmwareView_.state = ui::FirmwareUpdateView::State::Idle;
+        firmwareView_.needsRender = true;
+        needsRender_ = true;
+        FW_UPDATER.reset();
+        if (FW_UPDATER.findFirmwareFile()) {
+          snprintf(firmwareView_.statusLine, sizeof(firmwareView_.statusLine), "%s: %s", tr(FIRMWARE_FILE_FOUND),
+                   PAPYRIX_FIRMWARE_FILE);
+        } else {
+          snprintf(firmwareView_.statusLine, sizeof(firmwareView_.statusLine), "%s", tr(NO_FIRMWARE_FILE));
+        }
+      } else if (firmwareView_.state == ui::FirmwareUpdateView::State::Idle) {
+        if (!FW_UPDATER.isFirmwareAvailable()) {
+          firmwareView_.state = ui::FirmwareUpdateView::State::Error;
+          snprintf(firmwareView_.statusLine, sizeof(firmwareView_.statusLine), "%s", tr(NO_FIRMWARE_FILE));
+          firmwareView_.needsRender = true;
+          needsRender_ = true;
+          break;
+        }
+        firmwareView_.state = ui::FirmwareUpdateView::State::Validating;
+        firmwareValidationRendered_ = false;
+        snprintf(firmwareView_.statusLine, sizeof(firmwareView_.statusLine), "%s", tr(VALIDATING_FIRMWARE));
+        firmwareView_.progressPercent = 0;
+        firmwareView_.needsRender = true;
         needsRender_ = true;
       }
       break;
@@ -394,167 +772,208 @@ void SettingsState::handleConfirm(Core& core) {
 }
 
 void SettingsState::handleLeftRight(int delta) {
+  if (currentScreen_ == SettingsScreen::Screen && screenView_.sleepImageSelected()) return;
+  if (currentScreen_ == SettingsScreen::Screen && screenView_.lightSelected()) {
+    const uint8_t value = screenView_.adjustedLightValue(delta);
+    const bool brightness = screenView_.settingIndex(screenView_.selected) == 1;
+    const uint8_t previous = brightness ? core_->frontLight.brightness() : core_->frontLight.warmth();
+    if (value == previous) return;
+    const bool saved = brightness ? core_->frontLight.setBrightness(value) : core_->frontLight.setWarmth(value);
+    screenView_.values[1] = core_->frontLight.brightness();
+    screenView_.values[2] = core_->frontLight.warmth();
+    if (!saved) LOG_ERR(TAG, "Could not save front light setting");
+    needsRender_ = true;
+    return;
+  }
   if (currentScreen_ == SettingsScreen::Reader) {
     readerView_.cycleValue(delta);
     saveReaderSettings();
     needsRender_ = true;
+  } else if (currentScreen_ == SettingsScreen::Screen) {
+    screenView_.cycleValue(delta);
+    saveScreenSettings();
+    needsRender_ = true;
   } else if (currentScreen_ == SettingsScreen::Device) {
     deviceView_.cycleValue(delta);
+#if PAPYRIX_TARGET_MURPHY_M4
+    if (deviceView_.settingIndex(deviceView_.selected) == ui::DeviceSettingsView::BATCH_SETTING) {
+      handleConfirm(*core_);
+      return;
+    }
+#endif
     saveDeviceSettings();
     needsRender_ = true;
   }
 }
 
-void SettingsState::loadReaderSettings() {
-  auto& settings = core_->settings;
+void SettingsState::openSleepImages() {
+  sleep_images::loadPage(sleepImageView_.page, 0);
+  sleepImageView_.selected = 0;
+  sleepImageView_.savedName = core_->settings.sleepImage;
+  currentScreen_ = SettingsScreen::SleepImages;
+  needsRender_ = true;
+}
 
-  // Index 0: Theme (ThemeSelect) - load available themes from SD card
-  auto themes = THEME_MANAGER.listAvailableThemes();
-  readerView_.themeCount = 0;
-  readerView_.currentThemeIndex = 0;
-  for (size_t i = 0; i < themes.size() && i < ui::ReaderSettingsView::MAX_THEMES; i++) {
-    strncpy(readerView_.themeNames[i], themes[i].c_str(), sizeof(readerView_.themeNames[i]) - 1);
-    readerView_.themeNames[i][sizeof(readerView_.themeNames[i]) - 1] = '\0';
-    if (themes[i] == settings.themeName) {
-      readerView_.currentThemeIndex = static_cast<int>(i);
+void SettingsState::moveSleepImage(int delta, bool page) {
+  auto& view = sleepImageView_;
+  const size_t current = view.page.offset + view.selected;
+  size_t target;
+  if (page) {
+    if (delta < 0) {
+      if (view.page.offset == 0) return;
+      target = view.page.offset - sleep_images::PAGE_SIZE;
+    } else {
+      if (view.page.offset + view.page.count >= view.page.total) return;
+      target = view.page.offset + sleep_images::PAGE_SIZE;
     }
-    readerView_.themeCount++;
+  } else if (delta < 0) {
+    target = current == 0 ? view.page.total - 1 : current - 1;
+  } else {
+    target = current + 1 == view.page.total ? 0 : current + 1;
   }
-  readerView_.values[0] = 0;  // Not used for ThemeSelect
+  const size_t offset = target / sleep_images::PAGE_SIZE * sleep_images::PAGE_SIZE;
+  if (offset != view.page.offset) sleep_images::loadPage(view.page, offset);
+  view.selected = std::min(target - view.page.offset, view.page.count - 1);
+  needsRender_ = true;
+}
 
-  // Index 1: Font Size (0=Small, 1=Normal, 2=Large)
-  readerView_.values[1] = settings.fontSize;
+void SettingsState::selectSleepImage(Core& core) {
+  auto& view = sleepImageView_;
+  if (view.selected >= view.page.count) return;
+  const char* name = view.page.names[view.selected];
+  if (name[0]) {
+    FsFile file;
+    if (!sleep_images::openImage(name, file)) {
+      ui::centeredMessage(renderer_, THEME, THEME.uiFontId, tr(IMAGE_OPEN_FAILED));
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+      sleep_images::loadPage(view.page, view.page.offset);
+      view.selected = std::min(view.selected, view.page.count - 1);
+      needsRender_ = true;
+      return;
+    }
+    file.close();
+  }
+  char previous[sizeof(core.settings.sleepImage)];
+  memcpy(previous, core.settings.sleepImage, sizeof(previous));
+  snprintf(core.settings.sleepImage, sizeof(core.settings.sleepImage), "%s", name);
+  if (!core.settings.save(core.storage).ok()) {
+    memcpy(core.settings.sleepImage, previous, sizeof(previous));
+    ui::centeredMessage(renderer_, THEME, THEME.uiFontId, tr(SAVE_FAILED));
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    needsRender_ = true;
+    return;
+  }
+  goBack(core);
+}
 
-  // Index 2: Text Layout (0=Compact, 1=Standard, 2=Large)
-  readerView_.values[2] = settings.textLayout;
-
-  // Index 3: Line Spacing (0=Compact, 1=Normal, 2=Relaxed, 3=Large)
-  readerView_.values[3] = settings.lineSpacing;
-
-  // Index 4: Text Anti-Aliasing (toggle)
-  readerView_.values[4] = settings.textAntiAliasing;
-
-  // Index 5: Paragraph Alignment (0=Justified, 1=Left, 2=Center, 3=Right)
-  readerView_.values[5] = settings.paragraphAlignment;
-
-  // Index 6: Hyphenation (toggle)
-  readerView_.values[6] = settings.hyphenation;
-
-  // Index 7: Show Images (toggle)
-  readerView_.values[7] = settings.showImages;
-
-  // Index 8: Status Bar (0=None, 1=Title, 2=Chapter)
-  readerView_.values[8] = settings.statusBar;
-
-  // Index 9: Reading Orientation (0=Portrait, 1=Landscape CW, 2=Inverted, 3=Landscape CCW)
-  readerView_.values[9] = settings.orientation;
+void SettingsState::loadReaderSettings() {
+  const auto& settings = core_->settings;
+  readerView_.values[0] = settings.fontSize;
+  readerView_.values[1] = settings.textLayout;
+  readerView_.values[2] = settings.lineSpacing;
+  readerView_.values[3] = settings.paragraphAlignment;
+  readerView_.values[4] = settings.hyphenation;
+  readerView_.values[5] = settings.showImages;
+  readerView_.values[6] = settings.statusBar;
+  readerView_.values[7] = settings.touchPageTurns;
+  readerView_.values[8] = settings.fullBookProcess;
+  readerView_.values[9] = settings.holdChapterSwitch;
+  readerView_.visibleCount =
+      ui::ReaderSettingsView::SETTING_COUNT - (board::hasTouch(board::HardwareIdentity::instance().profile()) ? 0 : 1);
 }
 
 void SettingsState::saveReaderSettings() {
   auto& settings = core_->settings;
+  settings.fontSize = readerView_.values[0];
+  settings.textLayout = readerView_.values[1];
+  settings.lineSpacing = readerView_.values[2];
+  settings.paragraphAlignment = readerView_.values[3];
+  settings.hyphenation = readerView_.values[4];
+  settings.showImages = readerView_.values[5];
+  settings.statusBar = readerView_.values[6];
+  if (readerView_.visibleCount == ui::ReaderSettingsView::SETTING_COUNT) {
+    settings.touchPageTurns = readerView_.values[7];
+  }
+  settings.fullBookProcess = readerView_.values[8];
+  settings.holdChapterSwitch = readerView_.values[9];
+}
 
-  // Index 0: Theme (ThemeSelect) - apply selected theme
-  const char* selectedTheme = readerView_.getCurrentThemeName();
+void SettingsState::loadScreenSettings() {
+  const auto& settings = core_->settings;
+  auto themes = THEME_MANAGER.listAvailableThemes();
+  screenView_.themeCount = 0;
+  screenView_.currentThemeIndex = 0;
+  for (size_t i = 0; i < themes.size() && i < ui::ScreenSettingsView::MAX_THEMES; i++) {
+    strncpy(screenView_.themeNames[i], themes[i].c_str(), sizeof(screenView_.themeNames[i]) - 1);
+    screenView_.themeNames[i][sizeof(screenView_.themeNames[i]) - 1] = '\0';
+    if (themes[i] == settings.themeName) screenView_.currentThemeIndex = static_cast<int>(i);
+    screenView_.themeCount++;
+  }
+  screenView_.frontLightAvailable = core_->frontLight.isAvailable();
+  screenView_.sleepImage = settings.sleepImage;
+  screenView_.values[1] = core_->frontLight.brightness();
+  screenView_.values[2] = core_->frontLight.warmth();
+  screenView_.values[3] = settings.frontLightTimeout;
+  screenView_.values[4] = settings.smoothFrontLight;
+  screenView_.values[5] = settings.orientation;
+  screenView_.values[6] = settings.textAntiAliasing;
+  screenView_.values[7] = settings.pagesPerRefresh;
+  screenView_.values[8] = settings.sunlightFadingFix;
+  screenView_.values[9] = settings.sleepScreen;
+}
+
+void SettingsState::saveScreenSettings() {
+  auto& settings = core_->settings;
+  const char* selectedTheme = screenView_.getCurrentThemeName();
   if (strcmp(settings.themeName, selectedTheme) != 0) {
     strncpy(settings.themeName, selectedTheme, sizeof(settings.themeName) - 1);
     settings.themeName[sizeof(settings.themeName) - 1] = '\0';
-    // Use cached theme for instant switching (no file I/O)
     if (!THEME_MANAGER.applyCachedTheme(settings.themeName)) {
       THEME_MANAGER.loadTheme(settings.themeName);
     }
     themeWasChanged_ = true;
   }
-
-  // Index 1: Font Size
-  settings.fontSize = readerView_.values[1];
-
-  // Index 2: Text Layout
-  settings.textLayout = readerView_.values[2];
-
-  // Index 3: Line Spacing
-  settings.lineSpacing = readerView_.values[3];
-
-  // Index 4: Text Anti-Aliasing
-  settings.textAntiAliasing = readerView_.values[4];
-
-  // Index 5: Paragraph Alignment
-  settings.paragraphAlignment = readerView_.values[5];
-
-  // Index 6: Hyphenation
-  settings.hyphenation = readerView_.values[6];
-
-  // Index 7: Show Images
-  settings.showImages = readerView_.values[7];
-
-  // Index 8: Status Bar
-  settings.statusBar = readerView_.values[8];
-
-  // Index 9: Reading Orientation
-  settings.orientation = readerView_.values[9];
+  settings.frontLightTimeout = screenView_.values[3];
+  settings.smoothFrontLight = screenView_.values[4];
+  settings.orientation = screenView_.values[5];
+  settings.textAntiAliasing = screenView_.values[6];
+  settings.pagesPerRefresh = screenView_.values[7];
+  settings.sunlightFadingFix = screenView_.values[8];
+  settings.sleepScreen = screenView_.values[9];
 }
 
 void SettingsState::loadDeviceSettings() {
   const auto& settings = core_->settings;
-
-  // Index 0: Auto Sleep Timeout (5 min=0, 10 min=1, 15 min=2, 30 min=3, Never=4)
-  deviceView_.values[0] = settings.autoSleepMinutes;
-
-  // Index 1: Sleep Screen (Dark=0, Light=1, Custom=2, Cover=3)
-  deviceView_.values[1] = settings.sleepScreen;
-
-  // Index 2: Startup Behavior (Last Document=0, Home=1)
-  deviceView_.values[2] = settings.startupBehavior;
-
-  // Index 3: Short Power Button (Ignore=0, Sleep=1, Page Turn=2)
-  deviceView_.values[3] = settings.shortPwrBtn;
-
-  // Index 4: Pages Per Refresh (1=0, 5=1, 10=2, 15=3, 30=4)
-  deviceView_.values[4] = settings.pagesPerRefresh;
-
-  // Index 5: Sunlight Fading Fix (toggle)
-  deviceView_.values[5] = settings.sunlightFadingFix;
-
-  // Index 6: Front Buttons (B/C/L/R=0, L/R/B/C=1)
-  deviceView_.values[6] = settings.frontButtonLayout;
-
-  // Index 7: Side Buttons (Prev/Next=0, Next/Prev=1)
-  deviceView_.values[7] = settings.sideButtonLayout;
+  deviceView_.values[0] = settings.frontButtonLayout;
+  deviceView_.values[1] = settings.sideButtonLayout;
+  deviceView_.values[2] = settings.shortPwrBtn;
+  deviceView_.values[3] = settings.startupBehavior;
+  deviceView_.values[4] = settings.showRecents;
+  deviceView_.values[5] = settings.autoSleepMinutes;
+  deviceView_.values[6] = settings.recycleBinEnabled;
+  deviceView_.visibleCount = ui::DeviceSettingsView::SETTING_COUNT;
+#if PAPYRIX_TARGET_MURPHY_M4
+  ++deviceView_.visibleCount;
+  deviceView_.values[ui::DeviceSettingsView::BATCH_SETTING] =
+      board::murphyM4Batch() == board::MurphyM4Batch::First ? 0 : 1;
+#endif
 }
 
 void SettingsState::saveDeviceSettings() {
   auto& settings = core_->settings;
-
-  // Index 0: Auto Sleep Timeout
-  settings.autoSleepMinutes = deviceView_.values[0];
-
-  // Index 1: Sleep Screen
-  settings.sleepScreen = deviceView_.values[1];
-
-  // Index 2: Startup Behavior
-  settings.startupBehavior = deviceView_.values[2];
-
-  // Index 3: Short Power Button
-  settings.shortPwrBtn = deviceView_.values[3];
-
-  // Index 4: Pages Per Refresh
-  settings.pagesPerRefresh = deviceView_.values[4];
-
-  // Index 5: Sunlight Fading Fix
-  settings.sunlightFadingFix = deviceView_.values[5];
-
-  // Index 6: Front Buttons - deferred to goBack() on screen exit.
-  // Changing layout while navigating causes ghost button events because the
-  // MappedInputManager remaps physical buttons mid-press.
-
-  // Index 7: Side Buttons - deferred to goBack() on screen exit.
-  // Same as front buttons: changing layout mid-navigation causes ghost events.
+  settings.shortPwrBtn = deviceView_.values[2];
+  settings.startupBehavior = deviceView_.values[3];
+  settings.showRecents = deviceView_.values[4];
+  settings.autoSleepMinutes = deviceView_.values[5];
+  settings.recycleBinEnabled = deviceView_.values[6];
+  // Apply button layouts in goBack() to prevent remapping the active press.
 }
 
 void SettingsState::populateSystemInfo() {
   infoView_.clear();
 
   // Firmware version
-  infoView_.addField("Version", PAPYRIX_VERSION);
+  infoView_.setField(ui::SystemInfoView::Field::Version, tr(VERSION), PAPYRIX_VERSION);
 
   // Uptime
   const unsigned long uptimeSeconds = millis() / 1000;
@@ -563,31 +982,29 @@ void SettingsState::populateSystemInfo() {
   const unsigned long seconds = uptimeSeconds % 60;
   char uptimeStr[24];
   snprintf(uptimeStr, sizeof(uptimeStr), "%luh %lum %lus", hours, minutes, seconds);
-  infoView_.addField("Uptime", uptimeStr);
+  infoView_.setField(ui::SystemInfoView::Field::Uptime, tr(UPTIME), uptimeStr);
 
-  // Battery
-  const uint16_t millivolts = batteryMonitor.readMillivolts();
+  const auto batteryStatus = core.battery.readStatus();
   char batteryStr[24];
-  if (millivolts < 3000 || millivolts > 4500) {
-    snprintf(batteryStr, sizeof(batteryStr), "-- (%umV)", millivolts);
+  if (!batteryStatus.percentageKnown || !batteryStatus.millivoltsKnown) {
+    snprintf(batteryStr, sizeof(batteryStr), "-- (--mV)");
   } else {
-    const uint8_t percentage = BatteryMonitor::percentageFromMillivolts(millivolts);
-    snprintf(batteryStr, sizeof(batteryStr), "%u%% (%umV)", percentage, millivolts);
+    snprintf(batteryStr, sizeof(batteryStr), "%u%% (%umV)", batteryStatus.percentage, batteryStatus.millivolts);
   }
-  infoView_.addField("Battery", batteryStr);
+  infoView_.setField(ui::SystemInfoView::Field::Battery, tr(BATTERY), batteryStr);
 
   // Chip model
-  infoView_.addField("Chip", ESP.getChipModel());
+  infoView_.setField(ui::SystemInfoView::Field::Chip, tr(CHIP), ESP.getChipModel());
 
   // CPU frequency
   char freqStr[16];
   snprintf(freqStr, sizeof(freqStr), "%d MHz", ESP.getCpuFreqMHz());
-  infoView_.addField("CPU", freqStr);
+  infoView_.setField(ui::SystemInfoView::Field::Cpu, tr(CPU), freqStr);
 
   // Free heap memory
   char heapStr[24];
   snprintf(heapStr, sizeof(heapStr), "%lu KB", ESP.getFreeHeap() / 1024);
-  infoView_.addField("Free Memory", heapStr);
+  infoView_.setField(ui::SystemInfoView::Field::FreeMemory, tr(FREE_MEMORY), heapStr);
 
   // Internal flash storage (LittleFS)
   const size_t totalBytes = LittleFS.totalBytes();
@@ -595,36 +1012,39 @@ void SettingsState::populateSystemInfo() {
   char internalStr[32];
   snprintf(internalStr, sizeof(internalStr), "%lu / %lu KB", (unsigned long)(usedBytes / 1024),
            (unsigned long)(totalBytes / 1024));
-  infoView_.addField("Internal Disk", internalStr);
+  infoView_.setField(ui::SystemInfoView::Field::InternalDisk, tr(INTERNAL_DISK), internalStr);
 
   // SD Card status
-  infoView_.addField("SD Card", SdMan.ready() ? "Ready" : "Not available");
+  infoView_.setField(ui::SystemInfoView::Field::SdCard, tr(SD_CARD), SdMan.ready() ? tr(READY) : tr(NOT_AVAILABLE));
 }
 
-void SettingsState::clearCache(int type, Core& core) {
-  // Set up confirmation dialog messages based on action type
-  if (type == 0) {
-    // Clear Book Cache - show confirmation
-    confirmView_.setup("Clear Caches?", "This will delete all book caches", "and reading progress.");
-    pendingAction_ = 10;
-    currentScreen_ = SettingsScreen::ConfirmDialog;
-    needsRender_ = true;
-    return;
-  } else if (type == 1) {
-    // Clear Device Storage
-    confirmView_.setup("Clear Device?", "This will erase internal flash", "storage. Device will restart.");
-    pendingAction_ = 11;
-    currentScreen_ = SettingsScreen::ConfirmDialog;
-    needsRender_ = true;
-    return;
-  } else if (type == 2) {
-    // Factory Reset
-    confirmView_.setup("Factory Reset?", "This will erase ALL data including", "settings and WiFi credentials!");
-    pendingAction_ = 12;
-    currentScreen_ = SettingsScreen::ConfirmDialog;
-    needsRender_ = true;
-    return;
+void SettingsState::clearCache(ui::CleanupMenuView::Item type) {
+  switch (type) {
+    case ui::CleanupMenuView::Item::ClearBookCache:
+      confirmView_.setup(tr(CLEAR_CACHES_Q), tr(CLEAR_CACHES_MSG1), tr(CLEAR_CACHES_MSG2));
+      pendingAction_ = ACTION_CLEAR_BOOK_CACHE;
+      break;
+    case ui::CleanupMenuView::Item::ClearRecent:
+      confirmView_.setup(tr(CLEAR_RECENT_Q), tr(CLEAR_RECENT_MSG), nullptr);
+      pendingAction_ = ACTION_CLEAR_RECENT;
+      break;
+    case ui::CleanupMenuView::Item::EmptyTrash:
+      confirmView_.setup(tr(EMPTY_TRASH_Q), tr(EMPTY_TRASH_MSG1), tr(EMPTY_TRASH_MSG2));
+      pendingAction_ = ACTION_EMPTY_TRASH;
+      break;
+    case ui::CleanupMenuView::Item::ClearDeviceStorage:
+      confirmView_.setup(tr(CLEAR_DEVICE_Q), tr(CLEAR_DEVICE_MSG1), tr(CLEAR_DEVICE_MSG2));
+      pendingAction_ = ACTION_CLEAR_DEVICE_STORAGE;
+      break;
+    case ui::CleanupMenuView::Item::FactoryReset:
+      confirmView_.setup(tr(FACTORY_RESET_Q), tr(FACTORY_RESET_MSG1), tr(FACTORY_RESET_MSG2));
+      pendingAction_ = ACTION_FACTORY_RESET;
+      break;
+    case ui::CleanupMenuView::Item::Count:
+      return;
   }
+  currentScreen_ = SettingsScreen::ConfirmDialog;
+  needsRender_ = true;
 }
 
 }  // namespace papyrix

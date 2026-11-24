@@ -17,6 +17,8 @@
 #include <blocks/TextBlock.h>
 #include <esp_heap_caps.h>
 
+#include <memory>
+#include <new>
 #include <utility>
 
 #include "md_parser.h"
@@ -42,6 +44,9 @@ void MarkdownParser::reset() {
   encodingTable_ = nullptr;
   bomSkipBytes_ = 0;
   pendingTextBlock_.reset();
+  pendingSpacing_ = 0;
+  pendingPage_.reset();
+  pendingPageNextY_ = 0;
 }
 
 int MarkdownParser::getCurrentFontStyle(const ParseContext& ctx) const {
@@ -59,6 +64,10 @@ void MarkdownParser::flushWordBuffer(ParseContext& ctx) {
   if (ctx.wordBufferIndex > 0) {
     ctx.wordBuffer[ctx.wordBufferIndex] = '\0';
     ctx.wordBufferIndex = utf8NormalizeNfc(ctx.wordBuffer, ctx.wordBufferIndex);
+    if (!isRtl_ && ScriptDetector::classify(ctx.wordBuffer) == ScriptDetector::Script::ARABIC) {
+      isRtl_ = true;
+      if (ctx.textBlock) ctx.textBlock->setRtl(true);
+    }
     if (ctx.textBlock) {
       ctx.textBlock->addWord(ctx.wordBuffer, static_cast<EpdFontFamily::Style>(getCurrentFontStyle(ctx)));
     }
@@ -73,6 +82,7 @@ void MarkdownParser::startNewTextBlock(ParseContext& ctx, const int style) {
       return;
     }
     flushTextBlock(ctx);
+    if (ctx.hitMaxPages) return;
   }
   ctx.textBlock.reset(new ParsedText(static_cast<TextBlock::BLOCK_STYLE>(style), config_.indentLevel,
                                      config_.hyphenation, true, isRtl_));
@@ -98,7 +108,7 @@ void MarkdownParser::flushTextBlock(ParseContext& ctx) {
           addLineToPage(ctx, textBlock);
         }
       },
-      true, [&ctx]() -> bool { return ctx.hitMaxPages; });
+      true, [&ctx]() -> bool { return ctx.hitMaxPages || (ctx.shouldAbort && ctx.shouldAbort()); });
 
   if (!ctx.hitMaxPages) {
     ctx.textBlock.reset();
@@ -111,6 +121,15 @@ void MarkdownParser::flushTextBlock(ParseContext& ctx) {
         ctx.pageNextY += lineHeight;
         break;
     }
+  } else if (ctx.textBlock->isEmpty()) {
+    switch (config_.spacingLevel) {
+      case 1:
+        pendingSpacing_ = lineHeight / 4;
+        break;
+      case 3:
+        pendingSpacing_ = lineHeight;
+        break;
+    }
   }
   // else: textBlock still has unconsumed words — preserve for next batch
 }
@@ -121,15 +140,17 @@ bool MarkdownParser::addLineToPage(ParseContext& ctx, std::shared_ptr<TextBlock>
   if (ctx.pageNextY + lineHeight > config_.viewportHeight) {
     if (ctx.onPageComplete) {
       const size_t freeHeap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-      LOG_DBG(TAG, "Page %d complete, heap: %zu free", ctx.pagesCreated, freeHeap);
+      LOG_DBG(TAG, "Page %u complete, heap: %zu free", ctx.pagesCreated, freeHeap);
       ctx.onPageComplete(std::move(ctx.currentPage));
       ctx.pagesCreated++;
 
       if (freeHeap < 12000) {
         LOG_ERR(TAG, "Stopping early due to low memory (%zu bytes)", freeHeap);
-        ctx.hitMaxPages = true;
         ctx.currentPage.reset(new Page());
         ctx.pageNextY = 0;
+        ctx.currentPage->elements.push_back(std::make_shared<PageLine>(line, 0, ctx.pageNextY));
+        ctx.pageNextY += lineHeight;
+        ctx.hitMaxPages = true;
         return false;
       }
     }
@@ -137,6 +158,8 @@ bool MarkdownParser::addLineToPage(ParseContext& ctx, std::shared_ptr<TextBlock>
     ctx.pageNextY = 0;
 
     if (ctx.maxPages > 0 && ctx.pagesCreated >= ctx.maxPages) {
+      ctx.currentPage->elements.push_back(std::make_shared<PageLine>(line, 0, ctx.pageNextY));
+      ctx.pageNextY += lineHeight;
       ctx.hitMaxPages = true;
       return false;
     }
@@ -186,11 +209,7 @@ bool MarkdownParser::tokenCallback(const md_token_t* token, void* userData) {
           self->flushWordBuffer(ctx);
         } else {
           if (ctx.wordBufferIndex >= MAX_WORD_SIZE) {
-            ctx.wordBuffer[ctx.wordBufferIndex] = '\0';
-            if (ctx.textBlock) {
-              ctx.textBlock->addWord(ctx.wordBuffer, static_cast<EpdFontFamily::Style>(self->getCurrentFontStyle(ctx)));
-            }
-            ctx.wordBufferIndex = 0;
+            self->flushWordBuffer(ctx);
           }
           ctx.wordBuffer[ctx.wordBufferIndex++] = c;
         }
@@ -200,14 +219,17 @@ bool MarkdownParser::tokenCallback(const md_token_t* token, void* userData) {
 
     case MD_HEADER_START: {
       self->flushTextBlock(ctx);
+      if (ctx.hitMaxPages) return false;
       ctx.headerLevel = token->data;
       self->startNewTextBlock(ctx, TextBlock::CENTER_ALIGN);
+      if (ctx.hitMaxPages) return false;
       ctx.inBold = true;
       break;
     }
 
     case MD_HEADER_END: {
       self->flushTextBlock(ctx);
+      if (ctx.hitMaxPages) return false;
       ctx.inBold = false;
       ctx.headerLevel = 0;
       break;
@@ -235,14 +257,14 @@ bool MarkdownParser::tokenCallback(const md_token_t* token, void* userData) {
 
     case MD_LIST_ITEM_START: {
       self->flushTextBlock(ctx);
+      if (ctx.hitMaxPages) return false;
       self->startNewTextBlock(ctx, TextBlock::LEFT_ALIGN);
+      if (ctx.hitMaxPages) return false;
       if (token->data > 0) {
-        // Ordered list - emit number
         char numBuf[8];
         snprintf(numBuf, sizeof(numBuf), "%d.", token->data);
         ctx.textBlock->addWord(numBuf, EpdFontFamily::REGULAR);
       } else {
-        // Unordered list - emit bullet
         ctx.textBlock->addWord("•", EpdFontFamily::REGULAR);
       }
       break;
@@ -268,7 +290,9 @@ bool MarkdownParser::tokenCallback(const md_token_t* token, void* userData) {
 
     case MD_CODE_BLOCK_START: {
       self->flushTextBlock(ctx);
+      if (ctx.hitMaxPages) return false;
       self->startNewTextBlock(ctx, TextBlock::LEFT_ALIGN);
+      if (ctx.hitMaxPages) return false;
       ctx.textBlock->addWord("[Code:", EpdFontFamily::ITALIC);
       ctx.inCodeBlock = true;
       break;
@@ -279,27 +303,34 @@ bool MarkdownParser::tokenCallback(const md_token_t* token, void* userData) {
         ctx.textBlock->addWord("...]", EpdFontFamily::ITALIC);
       }
       self->flushTextBlock(ctx);
+      if (ctx.hitMaxPages) return false;
       ctx.inCodeBlock = false;
       break;
     }
 
     case MD_HR: {
       self->flushTextBlock(ctx);
+      if (ctx.hitMaxPages) return false;
       self->startNewTextBlock(ctx, TextBlock::CENTER_ALIGN);
+      if (ctx.hitMaxPages) return false;
       ctx.textBlock->addWord("───────────", EpdFontFamily::REGULAR);
       self->flushTextBlock(ctx);
+      if (ctx.hitMaxPages) return false;
       break;
     }
 
     case MD_BLOCKQUOTE_START: {
       self->flushTextBlock(ctx);
+      if (ctx.hitMaxPages) return false;
       self->startNewTextBlock(ctx, TextBlock::LEFT_ALIGN);
+      if (ctx.hitMaxPages) return false;
       ctx.inItalic = true;
       break;
     }
 
     case MD_BLOCKQUOTE_END:
       self->flushTextBlock(ctx);
+      if (ctx.hitMaxPages) return false;
       ctx.inItalic = false;
       break;
 
@@ -340,7 +371,7 @@ bool MarkdownParser::tokenCallback(const md_token_t* token, void* userData) {
   return true;
 }
 
-bool MarkdownParser::parsePages(const std::function<void(std::unique_ptr<Page>)>& onPageComplete, uint16_t maxPages,
+bool MarkdownParser::parsePages(const std::function<void(std::unique_ptr<Page>)>& onPageComplete, uint32_t maxPages,
                                 const AbortCallback& shouldAbort) {
   FsFile file;
   if (!SdMan.openFileForRead("MD", filepath_, file)) {
@@ -359,13 +390,18 @@ bool MarkdownParser::parsePages(const std::function<void(std::unique_ptr<Page>)>
   file.seekSet(currentOffset_);
 
   if (currentOffset_ == 0) {
-    uint8_t peekBuf[513];
-    size_t peekBytes = file.read(peekBuf, 512);
+    // Keep the 512 B peek off the stack to respect the 8 KB foreground loopTask budget (Issue #137).
+    auto peekBuf = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[513]);
+    if (!peekBuf) {
+      LOG_ERR(TAG, "Failed to allocate peek buffer");
+      file.close();
+      return false;
+    }
+    size_t peekBytes = file.read(peekBuf.get(), 512);
     if (peekBytes > 0) {
       peekBuf[peekBytes] = '\0';
-      detectedEncoding_ = detectEncoding(peekBuf, peekBytes, bomSkipBytes_);
+      detectedEncoding_ = detectEncoding(peekBuf.get(), peekBytes, bomSkipBytes_);
       encodingTable_ = getEncodingTable(detectedEncoding_);
-      isRtl_ = ScriptDetector::containsArabic(reinterpret_cast<const char*>(peekBuf));
     }
     file.seekSet(currentOffset_ + bomSkipBytes_);
   }
@@ -385,26 +421,38 @@ bool MarkdownParser::parsePages(const std::function<void(std::unique_ptr<Page>)>
   ctx.pagesCreated = 0;
   ctx.maxPages = maxPages;
   ctx.onPageComplete = onPageComplete;
+  ctx.shouldAbort = shouldAbort;
   ctx.wordBufferIndex = 0;
 
   // Initialize md_parser
   md_parser_t parser;
   md_parser_init(&parser, tokenCallback, &ctx);
 
+  // Resume: restore partial page from previous batch
+  if (pendingPage_) {
+    ctx.currentPage = std::move(pendingPage_);
+    ctx.pageNextY = pendingPageNextY_;
+    pendingPageNextY_ = 0;
+  }
+
   // Resume: flush any pending text block carried over from a previous interrupted batch
   if (pendingTextBlock_) {
     ctx.textBlock = std::move(pendingTextBlock_);
     flushTextBlock(ctx);
     if (ctx.hitMaxPages) {
-      // Still can't fit — save and return
       pendingTextBlock_ = std::move(ctx.textBlock);
-      if (ctx.currentPage && !ctx.currentPage->elements.empty() && onPageComplete) {
-        onPageComplete(std::move(ctx.currentPage));
-        ctx.pagesCreated++;
+      if (ctx.currentPage && !ctx.currentPage->elements.empty()) {
+        pendingPage_ = std::move(ctx.currentPage);
+        pendingPageNextY_ = ctx.pageNextY;
       }
       file.close();
       return true;
     }
+  }
+
+  if (pendingSpacing_ > 0) {
+    ctx.pageNextY += pendingSpacing_;
+    pendingSpacing_ = 0;
   }
 
   // Start with a paragraph block
@@ -425,7 +473,6 @@ bool MarkdownParser::parsePages(const std::function<void(std::unique_ptr<Page>)>
     if (!readLine(file)) {
       break;
     }
-    bytesProcessed = file.position() - currentOffset_;
 
     int lineLen = strlen(lineBuffer_);
 
@@ -441,9 +488,13 @@ bool MarkdownParser::parsePages(const std::function<void(std::unique_ptr<Page>)>
     if (isBlank) {
       if (!prevLineBlank && !ctx.inCodeBlock) {
         flushTextBlock(ctx);
-        startNewTextBlock(ctx, config_.paragraphAlignment);
+        if (!ctx.hitMaxPages) {
+          startNewTextBlock(ctx, config_.paragraphAlignment);
+        }
       }
       prevLineBlank = true;
+      if (ctx.hitMaxPages) break;
+      bytesProcessed = file.position() - currentOffset_;
       continue;
     }
 
@@ -455,20 +506,29 @@ bool MarkdownParser::parsePages(const std::function<void(std::unique_ptr<Page>)>
 
     prevLineBlank = false;
 
-    // Periodic memory check
-    if (ctx.textBlock && ctx.textBlock->size() > 300) {
-      const size_t freeBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-      if (freeBlock < 25000) {
-        LOG_ERR(TAG, "Low memory (%zu free), flushing early", freeBlock);
-        ctx.textBlock->layoutAndExtractLines(
-            renderer_, config_.fontId, config_.viewportWidth,
-            [this, &ctx](const std::shared_ptr<TextBlock>& textBlock) {
-              if (!ctx.hitMaxPages) {
-                addLineToPage(ctx, textBlock);
-              }
-            },
-            false, [&ctx]() -> bool { return ctx.hitMaxPages; });
+    // Bound the working set: a paragraph of hundreds of non-blank lines joins into
+    // one block of thousands of words and exhausts the heap (Issue #137). At this
+    // line boundary — a safe resume point — flush the block once it reaches the
+    // word cap (or under memory pressure) and continue the paragraph in a fresh
+    // block of the same style.
+    if (!ctx.hitMaxPages && ctx.textBlock && ctx.textBlock->size() > 300) {
+      const bool atWordCap = ctx.textBlock->size() >= ParsedText::kMaxWordsPerBlock;
+      if (atWordCap || heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 25000) {
+        const auto blockStyle = ctx.textBlock->getStyle();
+        flushTextBlock(ctx);
+        if (!ctx.hitMaxPages) {
+          startNewTextBlock(ctx, blockStyle);
+        } else {
+          // The batch filled while draining. This line's words are already in the
+          // preserved block (pendingTextBlock_), so advance past it — otherwise the
+          // resume re-reads the line and duplicates those words.
+          bytesProcessed = file.position() - currentOffset_;
+        }
       }
+    }
+
+    if (!ctx.hitMaxPages) {
+      bytesProcessed = file.position() - currentOffset_;
     }
   }
 
@@ -476,9 +536,17 @@ bool MarkdownParser::parsePages(const std::function<void(std::unique_ptr<Page>)>
 
   // Finalize
   flushTextBlock(ctx);
-  if (ctx.currentPage && !ctx.currentPage->elements.empty() && onPageComplete) {
-    onPageComplete(std::move(ctx.currentPage));
-    ctx.pagesCreated++;
+
+  if (ctx.hitMaxPages) {
+    if (ctx.currentPage && !ctx.currentPage->elements.empty()) {
+      pendingPage_ = std::move(ctx.currentPage);
+      pendingPageNextY_ = ctx.pageNextY;
+    }
+  } else {
+    if (ctx.currentPage && !ctx.currentPage->elements.empty() && onPageComplete) {
+      onPageComplete(std::move(ctx.currentPage));
+      ctx.pagesCreated++;
+    }
   }
 
   // Save any unconsumed text block for the next parsePages call
@@ -491,6 +559,6 @@ bool MarkdownParser::parsePages(const std::function<void(std::unique_ptr<Page>)>
   currentOffset_ += bytesProcessed;
   hasMore_ = ctx.hitMaxPages || (currentOffset_ < fileSize_);
 
-  LOG_INF(TAG, "Parsed %d pages, offset %zu/%zu, hasMore=%d", ctx.pagesCreated, currentOffset_, fileSize_, hasMore_);
+  LOG_INF(TAG, "Parsed %u pages, offset %zu/%zu, hasMore=%d", ctx.pagesCreated, currentOffset_, fileSize_, hasMore_);
   return true;
 }

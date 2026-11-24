@@ -1,8 +1,9 @@
 #pragma once
 
-#include <EInkDisplay.h>
+#include <Display.h>
 #include <EpdFontFamily.h>
 #include <ThaiCluster.h>
+#include <TouchTransform.h>
 
 #include <array>
 #include <map>
@@ -15,9 +16,14 @@
 class ExternalFont;
 // Forward declaration for streaming font support
 class StreamingEpdFont;
+class BitmapTurnCache;
 
 class GfxRenderer {
  public:
+  static constexpr int BUTTON_HINT_WIDTH = 106;
+  static constexpr int BUTTON_HINT_TEXT_PADDING = 6;
+  static constexpr int BUTTON_HINT_MAX_TEXT_WIDTH = BUTTON_HINT_WIDTH - BUTTON_HINT_TEXT_PADDING * 2;
+
   enum RenderMode { BW, GRAYSCALE_LSB, GRAYSCALE_MSB };
 
   // Logical screen orientation from the perspective of callers
@@ -30,13 +36,15 @@ class GfxRenderer {
 
  private:
   static constexpr size_t BW_BUFFER_CHUNK_SIZE = 8000;  // 8KB chunks to allow for non-contiguous memory
-  static constexpr size_t BW_BUFFER_NUM_CHUNKS = EInkDisplay::BUFFER_SIZE / BW_BUFFER_CHUNK_SIZE;
-  static_assert(BW_BUFFER_CHUNK_SIZE * BW_BUFFER_NUM_CHUNKS == EInkDisplay::BUFFER_SIZE,
-                "BW buffer chunking does not line up with display buffer size");
+  // Sized to cover the largest supported panel (X3: 52272 B). Last chunk is partial on X3,
+  // unused on X4 (48000 B uses 6 of 7 slots). Runtime size comes from display_.
+  static constexpr size_t BW_BUFFER_NUM_CHUNKS =
+      (papyrix::hal::Display::MAX_BUFFER_SIZE + BW_BUFFER_CHUNK_SIZE - 1) / BW_BUFFER_CHUNK_SIZE;
 
-  EInkDisplay& einkDisplay;
+  papyrix::hal::Display& display_;
   RenderMode renderMode;
   Orientation orientation;
+  mutable bool darkBackground_ = false;
   uint8_t* frameBuffer = nullptr;
   uint8_t* bwBufferChunks[BW_BUFFER_NUM_CHUNKS] = {nullptr};
   std::map<int, EpdFontFamily> fontMap;
@@ -44,6 +52,9 @@ class GfxRenderer {
   // Mutable: getStreamingFont may trigger lazy loading of bold variant via resolver
   mutable std::map<int, std::array<StreamingEpdFont*, EpdFontFamily::kExternalStyleCount>> _streamingFonts;
   ExternalFont* _externalFont = nullptr;
+#if PAPYRIX_TARGET_X4PRO || PAPYRIX_TARGET_X4CLASSIC || PAPYRIX_TARGET_STICKY || PAPYRIX_TARGET_MURPHY_M4
+  BitmapTurnCache* bitmapTurnCache_ = nullptr;
+#endif
 
   // Font IDs excluded from external font lookup (UI/status bar fonts stay builtin)
   static constexpr size_t MAX_EXCLUDED_FONT_IDS = 4;
@@ -70,14 +81,14 @@ class GfxRenderer {
   mutable ExternalFontResolver _externalFontResolver = nullptr;
   mutable void* _externalFontResolverCtx = nullptr;
 
-  // Pre-allocated row buffers for bitmap rendering (reduces heap fragmentation)
-  // Sized for max screen dimension (800 pixels): outputRow = 800/4 = 200 bytes, rowBytes = 800*3 = 2400 bytes (24bpp)
-  static constexpr size_t BITMAP_OUTPUT_ROW_SIZE = (EInkDisplay::DISPLAY_WIDTH + 3) / 4;
-  static constexpr size_t BITMAP_ROW_BYTES_SIZE = EInkDisplay::DISPLAY_WIDTH * 3;  // 24-bit max
-  uint8_t* bitmapOutputRow_ = nullptr;
-  uint8_t* bitmapRowBytes_ = nullptr;
-  void allocateBitmapRowBuffers();
-  void freeBitmapRowBuffers();
+  // Pre-allocated row buffers for bitmap rendering (reduces heap fragmentation).
+  // Sized for the largest supported panel width (X4=800, X3=792 — both ≤ 800):
+  // outputRow = 800/4 = 200 bytes, rowBytes = 800*3 = 2400 bytes (24bpp).
+  static constexpr size_t BITMAP_OUTPUT_ROW_SIZE = (papyrix::hal::Display::DISPLAY_WIDTH + 3) / 4;
+  static constexpr size_t BITMAP_ROW_BYTES_SIZE = papyrix::hal::Display::DISPLAY_WIDTH * 3;  // 24-bit max
+  mutable uint8_t* bitmapOutputRow_ = nullptr;
+  mutable uint8_t* bitmapRowBytes_ = nullptr;
+  bool ensureBitmapRowBuffers() const;
 
   // Word width cache: open-addressing flat hash table for O(1) lookup.
   // Key: FNV-1a hash of (fontId, text, style). Value: measured width in pixels.
@@ -104,6 +115,10 @@ class GfxRenderer {
     return hash == 0 ? 1 : hash;
   }
 
+  // Maps logical (x, y) to the panel's native gate orientation. Uses runtime
+  // panel dimensions from display_ so it works on both X4 (800x480) and X3 (792x528).
+  void rotateCoordinates(int x, int y, int* rotatedX, int* rotatedY) const;
+
   void renderChar(const EpdFontFamily& fontFamily, uint32_t cp, int* x, const int* y, bool pixelState,
                   EpdFontFamily::Style style, int fontId) const;
   void renderThaiCluster(const EpdFontFamily& fontFamily, const ThaiShaper::ThaiCluster& cluster, int* x, int y,
@@ -114,10 +129,9 @@ class GfxRenderer {
   void freeBwBufferChunks();
 
  public:
-  explicit GfxRenderer(EInkDisplay& einkDisplay) : einkDisplay(einkDisplay), renderMode(BW), orientation(Portrait) {
-    allocateBitmapRowBuffers();
-  }
+  explicit GfxRenderer(papyrix::hal::Display& display) : display_(display), renderMode(BW), orientation(Portrait) {}
   ~GfxRenderer() { freeBitmapRowBuffers(); }
+  void freeBitmapRowBuffers();
 
   static constexpr int VIEWABLE_MARGIN_TOP = 9;
   static constexpr int VIEWABLE_MARGIN_RIGHT = 3;
@@ -126,6 +140,10 @@ class GfxRenderer {
 
   // Setup
   void begin();
+#if PAPYRIX_TARGET_X4PRO || PAPYRIX_TARGET_X4CLASSIC || PAPYRIX_TARGET_STICKY || PAPYRIX_TARGET_MURPHY_M4
+  void setBitmapTurnCache(BitmapTurnCache* cache) { bitmapTurnCache_ = cache; }
+  BitmapTurnCache* bitmapTurnCache() const { return bitmapTurnCache_; }
+#endif
   void insertFont(int fontId, EpdFontFamily font);
   void removeFont(int fontId);
   void clearWidthCache() const {
@@ -174,13 +192,18 @@ class GfxRenderer {
   }
 
   // Orientation control (affects logical width/height and coordinate transforms)
-  void setOrientation(const Orientation o) { orientation = o; }
+  void setOrientation(const Orientation o) {
+    orientation = o;
+    papyrix::board::setDisplayOrientation(static_cast<papyrix::board::DisplayOrientation>(o));
+  }
   Orientation getOrientation() const { return orientation; }
+  bool panelToLogical(int panelX, int panelY, int* logicalX, int* logicalY) const;
 
   // Screen ops
   int getScreenWidth() const;
   int getScreenHeight() const;
-  void displayBuffer(EInkDisplay::RefreshMode refreshMode = EInkDisplay::FAST_REFRESH,
+  void displayBufferDriveAll(bool turnOffScreen = false) const;
+  void displayBuffer(papyrix::hal::Display::RefreshMode refreshMode = papyrix::hal::Display::FAST_REFRESH,
                      bool turnOffScreen = false) const;
   // EXPERIMENTAL: Windowed update - display only a rectangular region
   void displayWindow(int x, int y, int width, int height, bool turnOffScreen = false) const;
@@ -195,6 +218,14 @@ class GfxRenderer {
   void fillRect(int x, int y, int width, int height, bool state = true) const;
   void drawImage(const uint8_t bitmap[], int x, int y, int width, int height) const;
   void drawBitmap(const Bitmap& bitmap, int x, int y, int maxWidth, int maxHeight) const;
+  // Draws a bitmap over white ground covering the target rect. The B/W
+  // path paints only ink, so a dark theme would otherwise swallow the
+  // image background.
+  void drawBitmapOnWhite(const Bitmap& bitmap, int x, int y, int maxWidth, int maxHeight) const;
+  // Streams a 1-bpp, screen-fitting bitmap row by row onto white ground:
+  // a set file bit is palette white, a clear bit is black. Returns false
+  // when the bitmap needs the scaled or color path instead.
+  bool drawBitmapStreamed(const Bitmap& bitmap, int x, int y) const;
 
   // Text
   int getTextWidth(int fontId, const char* text, EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
@@ -215,6 +246,10 @@ class GfxRenderer {
                                                    EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
   bool fontSupportsGrayscale(int fontId) const;
 
+  // Glyph warming
+  void warmCodepointsBatch(int fontId, const uint32_t* codepoints, size_t count,
+                           EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
+
   // Thai text rendering
   int getThaiTextWidth(int fontId, const char* text, EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
   void drawThaiText(int fontId, int x, int y, const char* text, bool black = true,
@@ -225,12 +260,9 @@ class GfxRenderer {
   void drawArabicText(int fontId, int x, int y, const char* text, bool black = true,
                       EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
 
-  // UI Components
-  void drawButtonHints(int fontId, const char* btn1, const char* btn2, const char* btn3, const char* btn4,
-                       bool black = true) const;
-
   // Grayscale functions
   void setRenderMode(const RenderMode mode) { this->renderMode = mode; }
+  bool supportsGrayscale() const;
   void copyGrayscaleLsbBuffers() const;
   void copyGrayscaleMsbBuffers() const;
   void displayGrayBuffer(bool turnOffScreen = false) const;
@@ -240,7 +272,7 @@ class GfxRenderer {
 
   // Low level functions
   uint8_t* getFrameBuffer() const;
-  static size_t getBufferSize();
+  size_t getBufferSize() const;
   void grayscaleRevert() const;
   void getOrientedViewableTRBL(int* outTop, int* outRight, int* outBottom, int* outLeft) const;
 };

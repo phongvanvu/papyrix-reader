@@ -8,6 +8,7 @@
 #include "Xtc.h"
 
 #include <FsHelpers.h>
+#include <HomeThumbnail.h>
 #include <Logging.h>
 #include <SDCardManager.h>
 
@@ -62,6 +63,10 @@ void Xtc::setupCacheDir() const {
   SdMan.mkdir(cachePath.c_str());
 }
 
+void Xtc::migrateStaleFailureMarkers() const {
+  xtc::migrateStaleFailureMarkers(cachePath, parser && parser->getBitDepth() == 2);
+}
+
 std::string Xtc::getTitle() const {
   if (!loaded || !parser) {
     return "";
@@ -108,17 +113,39 @@ const std::vector<xtc::ChapterInfo>& Xtc::getChapters() const {
 std::string Xtc::getCoverBmpPath() const { return cachePath + "/cover.bmp"; }
 
 bool Xtc::generateCoverBmp() const {
-  if (SdMan.exists(getCoverBmpPath().c_str())) {
+  if (loaded && parser) {
+    setupCacheDir();
+    migrateStaleFailureMarkers();
+  }
+  const std::string coverPath = getCoverBmpPath();
+  const std::string failedMarkerPath = cachePath + "/.cover.failed";
+  if (home_thumbnail::validateCover(coverPath)) {
+    SdMan.remove(failedMarkerPath.c_str());
     return true;
   }
+  if (SdMan.exists(coverPath.c_str())) SdMan.remove(coverPath.c_str());
+  if (SdMan.exists(failedMarkerPath.c_str())) return false;
 
   if (!loaded || !parser) {
     LOG_ERR(TAG, "Cannot generate cover BMP, file not loaded");
+    FsFile marker;
+    if (SdMan.openFileForWrite("XTC", failedMarkerPath, marker)) marker.close();
     return false;
   }
 
-  setupCacheDir();
-  return xtc::generateCoverBmpFromParser(*const_cast<xtc::XtcParser*>(parser.get()), getCoverBmpPath());
+  const xtc::CoverResult generated =
+      xtc::generateCoverBmpFromParser(*const_cast<xtc::XtcParser*>(parser.get()), coverPath);
+  const bool valid = generated == xtc::CoverResult::Generated && home_thumbnail::validateCover(coverPath);
+  if (!valid && generated == xtc::CoverResult::InvalidFile) {
+    FsFile marker;
+    if (SdMan.openFileForWrite("XTC", failedMarkerPath, marker)) marker.close();
+  } else if (!valid) {
+    // Transient failure (heap/IO): no marker so a later attempt can retry.
+    SdMan.remove(coverPath.c_str());
+  } else {
+    SdMan.remove(failedMarkerPath.c_str());
+  }
+  return valid;
 }
 
 uint32_t Xtc::getPageCount() const {
@@ -156,13 +183,12 @@ size_t Xtc::loadPage(uint32_t pageIndex, uint8_t* buffer, size_t bufferSize) con
   return const_cast<xtc::XtcParser*>(parser.get())->loadPage(pageIndex, buffer, bufferSize);
 }
 
-xtc::XtcError Xtc::loadPageStreaming(uint32_t pageIndex,
-                                     std::function<void(const uint8_t* data, size_t size, size_t offset)> callback,
-                                     size_t chunkSize) const {
+xtc::XtcError Xtc::loadPageStreaming(uint32_t pageIndex, xtc::XtcParser::PageChunkCallback callback, size_t chunkSize,
+                                     const std::function<bool()>& shouldAbort) const {
   if (!loaded || !parser) {
     return xtc::XtcError::FILE_NOT_FOUND;
   }
-  return const_cast<xtc::XtcParser*>(parser.get())->loadPageStreaming(pageIndex, callback, chunkSize);
+  return const_cast<xtc::XtcParser*>(parser.get())->loadPageStreaming(pageIndex, callback, chunkSize, shouldAbort);
 }
 
 uint8_t Xtc::calculateProgress(uint32_t currentPage) const {

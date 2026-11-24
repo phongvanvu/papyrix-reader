@@ -1,5 +1,7 @@
 #include "MarkdownProvider.h"
 
+#include <Utf8.h>
+
 #include <cstring>
 
 namespace papyrix {
@@ -19,8 +21,7 @@ Result<void> MarkdownProvider::open(const char* path, const char* cacheDir) {
   meta.type = ContentType::Markdown;
 
   const std::string& title = markdown->getTitle();
-  strncpy(meta.title, title.c_str(), sizeof(meta.title) - 1);
-  meta.title[sizeof(meta.title) - 1] = '\0';
+  utf8SafeCopy(meta.title, sizeof(meta.title), title.c_str());
 
   meta.author[0] = '\0';  // Markdown doesn't have author
 
@@ -34,7 +35,7 @@ Result<void> MarkdownProvider::open(const char* path, const char* cacheDir) {
   meta.coverPath[sizeof(meta.coverPath) - 1] = '\0';
 
   // Markdown uses file size, not pages
-  meta.totalPages = 1;  // Will be updated by reader
+  meta.totalPages = 1;  // The reader updates this value
   meta.currentPage = 0;
   meta.progressPercent = 0;
 

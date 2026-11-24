@@ -1,6 +1,8 @@
 #pragma once
 
 #include <GfxRenderer.h>
+#include <HomeThumbnail.h>
+#include <I18n.h>
 #include <Theme.h>
 
 #include <cstdint>
@@ -21,7 +23,7 @@ struct CardDimensions {
     int x, y, width, height;
   };
 
-  static CardDimensions calculate(int screenWidth, int screenHeight) {
+  static constexpr CardDimensions calculate(int screenWidth, int screenHeight) {
     const int w = screenWidth * 7 / 10;  // 70% width for larger cover
     const int h = screenHeight / 2 + 100;
     const int x = (screenWidth - w) / 2;
@@ -29,31 +31,33 @@ struct CardDimensions {
     return {x, y, w, h};
   }
 
-  CoverArea getCoverArea() const {
-    constexpr int padding = 10;
-    return {x + padding, y + padding, width - 2 * padding, height - 2 * padding};
+  constexpr CoverArea getCoverArea() const {
+    const int coverWidth = width < home_thumbnail::MAX_WIDTH ? width : home_thumbnail::MAX_WIDTH;
+    const int coverHeight = height < home_thumbnail::MAX_HEIGHT ? height : home_thumbnail::MAX_HEIGHT;
+    return {x + (width - coverWidth) / 2, y + (height - coverHeight) / 2, coverWidth, coverHeight};
   }
 };
 
-struct HomeView {
-  static constexpr int MAX_TITLE_LEN = 64;
-  static constexpr int MAX_AUTHOR_LEN = 48;
-  static constexpr int MAX_PATH_LEN = 128;
+static_assert(CardDimensions::calculate(480, 800).getCoverArea().width == 320);
+static_assert(CardDimensions::calculate(480, 800).getCoverArea().height == 440);
 
-  ButtonBar buttons{"", "File", "Apps", "Settings"};
+struct HomeView {
+  enum class Hit : uint8_t { None, Read, Browse, Apps, Settings };
+  static constexpr int MAX_TITLE_LEN = 256;
+  static constexpr int MAX_AUTHOR_LEN = 96;
+  static constexpr int MAX_PATH_LEN = 128;
+  static constexpr int MAX_EMPTY_HINT_LINES = 2;
+
+  ButtonBar buttons;
 
   // Current book info
   char bookTitle[MAX_TITLE_LEN] = {0};
   char bookAuthor[MAX_AUTHOR_LEN] = {0};
   char bookPath[MAX_PATH_LEN] = {0};
   bool hasBook = false;
+  bool showRecents = true;  // home entry: Books (Recent) when true, Files when false
 
-  // Cover image (external pointer - not owned)
-  const uint8_t* coverData = nullptr;
-  int16_t coverWidth = 0;
-  int16_t coverHeight = 0;
-
-  // Cover from BMP file (rendered by HomeState after ui::render)
+  // Cover from BMP file rendered by HomeState
   bool hasCoverBmp = false;
 
   // Font override for title/author (resolved by state, -1 = use theme default)
@@ -61,18 +65,45 @@ struct HomeView {
 
   // UI state
   int8_t batteryPercent = 100;
+  bool batteryCharging = false;
   bool needsRender = true;
+  bool batteryNeedsRender = false;
 
   void setBook(const char* title, const char* author, const char* path) {
-    strncpy(bookTitle, title, MAX_TITLE_LEN - 1);
-    bookTitle[MAX_TITLE_LEN - 1] = '\0';
-    strncpy(bookAuthor, author, MAX_AUTHOR_LEN - 1);
-    bookAuthor[MAX_AUTHOR_LEN - 1] = '\0';
+    copyUtf8Safe(bookTitle, title, MAX_TITLE_LEN);
+    copyUtf8Safe(bookAuthor, author, MAX_AUTHOR_LEN);
     strncpy(bookPath, path, MAX_PATH_LEN - 1);
     bookPath[MAX_PATH_LEN - 1] = '\0';
     hasBook = true;
-    buttons.labels[0] = "Read";
     needsRender = true;
+  }
+
+  // strncpy can split a multi-byte UTF-8 codepoint at the tail (renders as tofu).
+  // If the last codepoint is incomplete, drop it.
+  static void copyUtf8Safe(char* dst, const char* src, int cap) {
+    strncpy(dst, src, cap - 1);
+    dst[cap - 1] = '\0';
+    int n = static_cast<int>(strlen(dst));
+    if (n == 0) return;
+    int leadIdx = n - 1;
+    while (leadIdx > 0 && (static_cast<unsigned char>(dst[leadIdx]) & 0xC0) == 0x80) {
+      --leadIdx;
+    }
+    const unsigned char lead = static_cast<unsigned char>(dst[leadIdx]);
+    int expect;
+    if (lead < 0x80)
+      expect = 1;
+    else if ((lead >> 5) == 0x6)
+      expect = 2;
+    else if ((lead >> 4) == 0xE)
+      expect = 3;
+    else if ((lead >> 3) == 0x1E)
+      expect = 4;
+    else
+      expect = 1;
+    if (n - leadIdx < expect) {
+      dst[leadIdx] = '\0';
+    }
   }
 
   void clearBook() {
@@ -80,35 +111,74 @@ struct HomeView {
     bookAuthor[0] = '\0';
     bookPath[0] = '\0';
     hasBook = false;
-    coverData = nullptr;
-    coverWidth = 0;
-    coverHeight = 0;
     hasCoverBmp = false;
     buttons.labels[0] = "";
-    needsRender = true;
-  }
-
-  void setCover(const uint8_t* data, int w, int h) {
-    coverData = data;
-    coverWidth = static_cast<int16_t>(w);
-    coverHeight = static_cast<int16_t>(h);
     needsRender = true;
   }
 
   void setBattery(int percent) {
     if (batteryPercent != percent) {
       batteryPercent = static_cast<int8_t>(percent);
-      needsRender = true;
+      batteryNeedsRender = true;
+    }
+  }
+
+  void setBatteryCharging(bool charging) {
+    if (batteryCharging != charging) {
+      batteryCharging = charging;
+      batteryNeedsRender = true;
     }
   }
 
   void clear() {
     clearBook();
     batteryPercent = 100;
+    batteryCharging = false;
+    batteryNeedsRender = false;
+  }
+
+  Hit hitTest(touch::Point point, int16_t screenWidth, int16_t screenHeight, bool frontLrbc = false) const {
+    const int action = touch::semanticButtonBarIndex(point, screenWidth, screenHeight, frontLrbc);
+    if (action == 0) return hasBook ? Hit::Read : Hit::None;
+    if (action == 1) return Hit::Browse;
+    if (action == 2) return Hit::Apps;
+    if (action == 3) return Hit::Settings;
+    const auto cover = CardDimensions::calculate(screenWidth, screenHeight);
+    const touch::Rect coverBounds{static_cast<int16_t>(cover.x), static_cast<int16_t>(cover.y),
+                                  static_cast<int16_t>(cover.width), static_cast<int16_t>(cover.height)};
+    if (hasBook && coverBounds.contains(point)) return Hit::Read;
+    return Hit::None;
   }
 };
 
 void render(const GfxRenderer& r, const Theme& t, const HomeView& v);
+
+struct BatteryRegion {
+  int x, y, width, height;
+};
+BatteryRegion renderBatteryOnly(const GfxRenderer& r, const Theme& t, const HomeView& v);
+
+struct RecentHit {
+  static constexpr int LIST_START_Y = 60;
+  enum class Type : uint8_t { None, Entry, Back, Open, Files, Info };
+  Type type = Type::None;
+  int index = -1;
+};
+
+inline RecentHit recentHitTest(touch::Point point, int16_t screenWidth, int16_t screenHeight, int16_t rowHeight,
+                               int rowCount, bool frontLrbc = false) {
+  const int action = touch::semanticButtonBarIndex(point, screenWidth, screenHeight, frontLrbc);
+  if (action >= 0) {
+    constexpr RecentHit::Type actions[] = {RecentHit::Type::Back, RecentHit::Type::Open, RecentHit::Type::Files,
+                                           RecentHit::Type::Info};
+    return {actions[action], -1};
+  }
+  const int row = touch::rowAt(
+      point,
+      {0, RecentHit::LIST_START_Y, screenWidth, static_cast<int16_t>(screenHeight - RecentHit::LIST_START_Y - 50)},
+      rowHeight, rowCount);
+  return row < 0 ? RecentHit{} : RecentHit{RecentHit::Type::Entry, row};
+}
 
 // ============================================================================
 // FileListView - Paginated file browser
@@ -116,6 +186,7 @@ void render(const GfxRenderer& r, const Theme& t, const HomeView& v);
 
 struct FileListView {
   static constexpr int MAX_FILES = 64;
+  static constexpr int LIST_START_Y = 65;
   static constexpr int NAME_LEN = 48;
   static constexpr int PATH_LEN = 128;
   static constexpr int PAGE_SIZE = 12;
@@ -126,7 +197,7 @@ struct FileListView {
     bool isDirectory;
   };
 
-  ButtonBar buttons{"Back", "Open", "", ""};
+  ButtonBar buttons;
 
   // Path and file list
   char currentPath[PATH_LEN] = "/";
@@ -217,6 +288,26 @@ struct FileListView {
 
 void render(const GfxRenderer& r, const Theme& t, const FileListView& v);
 
+struct FileListHit {
+  static constexpr int LIST_START_Y = 60;
+  enum class Type : uint8_t { None, Entry, Back, Open, Delete };
+  Type type = Type::None;
+  int index = -1;
+};
+
+inline FileListHit fileListHitTest(touch::Point point, int16_t screenWidth, int16_t screenHeight, int16_t rowHeight,
+                                   int pageStart, int visibleCount, bool frontLrbc = false) {
+  const int action = touch::semanticButtonBarIndex(point, screenWidth, screenHeight, frontLrbc);
+  if (action == 0) return {FileListHit::Type::Back, -1};
+  if (action == 1) return {FileListHit::Type::Open, -1};
+  if (action == 3) return {FileListHit::Type::Delete, -1};
+  const int row = touch::rowAt(
+      point,
+      {0, FileListHit::LIST_START_Y, screenWidth, static_cast<int16_t>(screenHeight - FileListHit::LIST_START_Y - 50)},
+      rowHeight, visibleCount);
+  return row < 0 ? FileListHit{} : FileListHit{FileListHit::Type::Entry, pageStart + row};
+}
+
 // ============================================================================
 // ChapterListView - Chapter/TOC selection for readers
 // ============================================================================
@@ -231,7 +322,7 @@ struct ChapterListView {
     uint8_t depth;  // Nesting level (0 = root)
   };
 
-  ButtonBar buttons{"Back", "Go", "", ""};
+  ButtonBar buttons;
   Chapter chapters[MAX_CHAPTERS];
   uint16_t chapterCount = 0;
   uint16_t currentChapter = 0;  // The chapter user is currently reading

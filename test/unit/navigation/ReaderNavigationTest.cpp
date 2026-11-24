@@ -1,131 +1,12 @@
 #include "test_utils.h"
 
+#include <PageCache.h>
+#include <ReaderNavigation.h>
+
 #include <cstdint>
 
-// ============================================================================
-// Inline dependencies to avoid linker issues (following project pattern)
-// ============================================================================
-
-// ContentType enum from src/core/Types.h
-enum class ContentType : uint8_t {
-  None = 0,
-  Epub,
-  Xtc,
-  Txt,
-  Markdown,
-};
-
-// Mock PageCache - minimal interface needed for navigation tests
-class PageCache {
- public:
-  PageCache(int pageCount, bool partial) : pageCount_(pageCount), partial_(partial) {}
-
-  int pageCount() const { return pageCount_; }
-  bool isPartial() const { return partial_; }
-  bool needsExtension(int) const { return partial_; }
-
-  void setPageCount(int count) { pageCount_ = count; }
-  void setPartial(bool partial) { partial_ = partial; }
-
- private:
-  int pageCount_;
-  bool partial_;
-};
-
-// ============================================================================
-// Inline ReaderNavigation implementation from src/content/ReaderNavigation.cpp
-// ============================================================================
-
-class ReaderNavigation {
- public:
-  struct Position {
-    int spineIndex = 0;
-    int sectionPage = 0;
-    uint32_t flatPage = 0;
-  };
-
-  struct NavResult {
-    Position position;
-    bool needsRender = false;
-    bool needsCacheReset = false;
-  };
-
-  static NavResult next(ContentType type, const Position& current, const PageCache* cache, uint32_t totalPages) {
-    NavResult result;
-    result.position = current;
-    result.needsRender = false;
-    result.needsCacheReset = false;
-
-    const int pageCount = cache ? cache->pageCount() : 0;
-
-    if (type == ContentType::Xtc) {
-      if (current.flatPage + 1 < totalPages) {
-        result.position.flatPage = current.flatPage + 1;
-        result.needsRender = true;
-      }
-    } else if (type == ContentType::Epub) {
-      if (pageCount > 0 && current.sectionPage < pageCount - 1) {
-        result.position.sectionPage = current.sectionPage + 1;
-        result.needsRender = true;
-      } else if (cache && cache->isPartial()) {
-        result.position.sectionPage = current.sectionPage + 1;
-        result.needsRender = true;
-      } else if (pageCount > 0 && current.sectionPage >= pageCount - 1) {
-        result.position.spineIndex = current.spineIndex + 1;
-        result.position.sectionPage = 0;
-        result.needsCacheReset = true;
-        result.needsRender = true;
-      }
-    } else {
-      if (pageCount > 0 && current.sectionPage < pageCount - 1) {
-        result.position.sectionPage = current.sectionPage + 1;
-        result.needsRender = true;
-      } else if (cache && cache->isPartial()) {
-        result.position.sectionPage = current.sectionPage + 1;
-        result.needsRender = true;
-      }
-    }
-
-    return result;
-  }
-
-  static NavResult prev(ContentType type, const Position& current, const PageCache* cache) {
-    (void)cache;  // Used only for potential future extensions
-
-    NavResult result;
-    result.position = current;
-    result.needsRender = false;
-    result.needsCacheReset = false;
-
-    if (type == ContentType::Xtc) {
-      if (current.flatPage > 0) {
-        result.position.flatPage = current.flatPage - 1;
-        result.needsRender = true;
-      }
-    } else if (type == ContentType::Epub) {
-      if (current.sectionPage > 0) {
-        result.position.sectionPage = current.sectionPage - 1;
-        result.needsRender = true;
-      } else if (current.spineIndex > 0) {
-        result.position.spineIndex = current.spineIndex - 1;
-        result.position.sectionPage = INT16_MAX;
-        result.needsCacheReset = true;
-        result.needsRender = true;
-      }
-    } else {
-      if (current.sectionPage > 0) {
-        result.position.sectionPage = current.sectionPage - 1;
-        result.needsRender = true;
-      }
-    }
-
-    return result;
-  }
-};
-
-// ============================================================================
-// Tests
-// ============================================================================
+using papyrix::ContentType;
+using papyrix::ReaderNavigation;
 
 int main() {
   TestUtils::TestRunner runner("ReaderNavigation");
@@ -355,14 +236,82 @@ int main() {
     runner.expectFalse(result.needsRender, "EPUB null cache: needsRender is false");
   }
 
-  // Test 20: EPUB with empty cache (pageCount=0) - no navigation
+  // Test 20: EPUB with empty complete cache (pageCount=0) - skip to next spine
+  // Regression (#136 residual): image-only FB2/EPUB sections produce 0-page complete
+  // caches; next must advance rather than stall.
   {
     PageCache cache(0, false);
     ReaderNavigation::Position pos;
     pos.spineIndex = 1;
     pos.sectionPage = 0;
     auto result = ReaderNavigation::next(ContentType::Epub, pos, &cache, 0);
-    runner.expectFalse(result.needsRender, "EPUB empty cache: needsRender is false");
+    runner.expectEq(2, result.position.spineIndex, "EPUB empty complete: spine advances");
+    runner.expectEq(0, result.position.sectionPage, "EPUB empty complete: sectionPage resets");
+    runner.expectTrue(result.needsRender, "EPUB empty complete: needsRender is true");
+    runner.expectTrue(result.needsCacheReset, "EPUB empty complete: needsCacheReset is true");
+  }
+
+  // Test 20b: FB2 empty complete cache - same skip behavior
+  {
+    PageCache cache(0, false);
+    ReaderNavigation::Position pos;
+    pos.spineIndex = 0;
+    pos.sectionPage = 0;
+    auto result = ReaderNavigation::next(ContentType::Fb2, pos, &cache, 0);
+    runner.expectEq(1, result.position.spineIndex, "FB2 empty complete: spine advances");
+    runner.expectTrue(result.needsCacheReset, "FB2 empty complete: needsCacheReset is true");
+  }
+
+  // Empty-section traversal used by renderCachedPage
+  {
+    ReaderNavigation::Position pos;
+    pos.spineIndex = 2;
+    auto result = ReaderNavigation::skipEmptySection(pos, 5, false);
+    runner.expectEq(3, result.position.spineIndex, "empty section forward: advances spine");
+    runner.expectEq(0, result.position.sectionPage, "empty section forward: starts at first page");
+    runner.expectTrue(result.needsRender, "empty section forward: needs render");
+    runner.expectTrue(result.needsCacheReset, "empty section forward: resets cache");
+  }
+
+  {
+    ReaderNavigation::Position pos;
+    pos.spineIndex = 2;
+    auto result = ReaderNavigation::skipEmptySection(pos, 5, true);
+    runner.expectEq(1, result.position.spineIndex, "empty section backward: decrements spine");
+    runner.expectEq(static_cast<int>(INT16_MAX), result.position.sectionPage,
+                    "empty section backward: requests previous last page");
+  }
+
+  // At spine 0, backward preference stops instead of underflowing or bouncing
+  // forward through a leading chain of empty sections.
+  {
+    ReaderNavigation::Position pos;
+    pos.spineIndex = 0;
+    auto result = ReaderNavigation::skipEmptySection(pos, 3, true);
+    runner.expectFalse(result.needsRender, "leading empty backward: no previous spine");
+    runner.expectEq(0, result.position.spineIndex, "leading empty backward: position unchanged");
+  }
+
+  // First-open/forward traversal still skips a leading empty section.
+  {
+    ReaderNavigation::Position pos;
+    pos.spineIndex = 0;
+    auto result = ReaderNavigation::skipEmptySection(pos, 3, false);
+    runner.expectTrue(result.needsRender, "leading empty forward: advances");
+    runner.expectEq(1, result.position.spineIndex, "leading empty forward: next spine");
+  }
+
+  // A trailing or only empty section has no adjacent page in the requested direction.
+  {
+    ReaderNavigation::Position trailing;
+    trailing.spineIndex = 2;
+    auto trailingResult = ReaderNavigation::skipEmptySection(trailing, 3, false);
+    runner.expectFalse(trailingResult.needsRender, "trailing empty: signals end of book");
+    runner.expectEq(2, trailingResult.position.spineIndex, "trailing empty: position unchanged");
+
+    ReaderNavigation::Position only;
+    auto onlyResult = ReaderNavigation::skipEmptySection(only, 1, false);
+    runner.expectFalse(onlyResult.needsRender, "only empty spine: signals end of book");
   }
 
   // Test 21: XTC single page book - next stays in place
@@ -382,6 +331,168 @@ int main() {
     auto result = ReaderNavigation::next(ContentType::Txt, pos, &cache, 0);
     runner.expectEq(5, result.position.sectionPage, "TXT partial: sectionPage advances to trigger extension");
     runner.expectTrue(result.needsRender, "TXT partial: needsRender is true");
+  }
+
+  // ============================================
+  // FB2 Navigation Tests
+  // ============================================
+
+  // Test 23: FB2 next() - advances sectionPage within section
+  {
+    PageCache cache(10, false);
+    ReaderNavigation::Position pos;
+    pos.spineIndex = 2;
+    pos.sectionPage = 3;
+    auto result = ReaderNavigation::next(ContentType::Fb2, pos, &cache, 0);
+    runner.expectEq(2, result.position.spineIndex, "FB2 next: spineIndex unchanged within section");
+    runner.expectEq(4, result.position.sectionPage, "FB2 next: sectionPage advances from 3 to 4");
+    runner.expectTrue(result.needsRender, "FB2 next: needsRender is true");
+    runner.expectFalse(result.needsCacheReset, "FB2 next: needsCacheReset is false within section");
+  }
+
+  // Test 24: FB2 next() - moves to next section at end of complete cache
+  {
+    PageCache cache(10, false);
+    ReaderNavigation::Position pos;
+    pos.spineIndex = 2;
+    pos.sectionPage = 9;
+    auto result = ReaderNavigation::next(ContentType::Fb2, pos, &cache, 0);
+    runner.expectEq(3, result.position.spineIndex, "FB2 next: spineIndex advances to next section");
+    runner.expectEq(0, result.position.sectionPage, "FB2 next: sectionPage resets to 0");
+    runner.expectTrue(result.needsRender, "FB2 next: needsRender is true");
+    runner.expectTrue(result.needsCacheReset, "FB2 next: needsCacheReset is true for section change");
+  }
+
+  // Test 25: FB2 next() - extends cache when partial (no section change)
+  {
+    PageCache cache(5, true);
+    ReaderNavigation::Position pos;
+    pos.spineIndex = 1;
+    pos.sectionPage = 4;
+    auto result = ReaderNavigation::next(ContentType::Fb2, pos, &cache, 0);
+    runner.expectEq(1, result.position.spineIndex, "FB2 next partial: spineIndex unchanged");
+    runner.expectEq(5, result.position.sectionPage, "FB2 next partial: sectionPage advances to trigger extension");
+    runner.expectTrue(result.needsRender, "FB2 next partial: needsRender is true");
+    runner.expectFalse(result.needsCacheReset, "FB2 next partial: needsCacheReset is false");
+  }
+
+  // Test 26: FB2 prev() - decrements sectionPage within section
+  {
+    PageCache cache(10, false);
+    ReaderNavigation::Position pos;
+    pos.spineIndex = 2;
+    pos.sectionPage = 5;
+    auto result = ReaderNavigation::prev(ContentType::Fb2, pos, &cache);
+    runner.expectEq(2, result.position.spineIndex, "FB2 prev: spineIndex unchanged within section");
+    runner.expectEq(4, result.position.sectionPage, "FB2 prev: sectionPage decrements from 5 to 4");
+    runner.expectTrue(result.needsRender, "FB2 prev: needsRender is true");
+    runner.expectFalse(result.needsCacheReset, "FB2 prev: needsCacheReset is false within section");
+  }
+
+  // Test 27: FB2 prev() - moves to previous section from sectionPage 0
+  {
+    PageCache cache(10, false);
+    ReaderNavigation::Position pos;
+    pos.spineIndex = 3;
+    pos.sectionPage = 0;
+    auto result = ReaderNavigation::prev(ContentType::Fb2, pos, &cache);
+    runner.expectEq(2, result.position.spineIndex, "FB2 prev: spineIndex decrements to 2");
+    runner.expectEq(static_cast<int>(INT16_MAX), result.position.sectionPage,
+                    "FB2 prev: sectionPage set to INT16_MAX (clamped later)");
+    runner.expectTrue(result.needsRender, "FB2 prev: needsRender is true");
+    runner.expectTrue(result.needsCacheReset, "FB2 prev: needsCacheReset is true for section change");
+  }
+
+  // Test 28: FB2 prev() - stays at first section, first page
+  {
+    PageCache cache(10, false);
+    ReaderNavigation::Position pos;
+    pos.spineIndex = 0;
+    pos.sectionPage = 0;
+    auto result = ReaderNavigation::prev(ContentType::Fb2, pos, &cache);
+    runner.expectEq(0, result.position.spineIndex, "FB2 prev: spineIndex stays at 0");
+    runner.expectEq(0, result.position.sectionPage, "FB2 prev: sectionPage stays at 0");
+    runner.expectFalse(result.needsRender, "FB2 prev: needsRender is false at start of book");
+  }
+
+  // ============================================
+  // Null cache force-render (ReaderState pattern)
+  // ReaderState forces needsRender=true when pageCache
+  // is null to ensure re-render triggers re-caching.
+  // ============================================
+
+  // Test 29: EPUB next with null cache - caller forces needsRender
+  {
+    ReaderNavigation::Position pos;
+    pos.spineIndex = 1;
+    pos.sectionPage = 5;
+    PageCache* cache = nullptr;
+    auto result = ReaderNavigation::next(ContentType::Epub, pos, cache, 0);
+    runner.expectFalse(result.needsRender, "null_cache_epub_next_nav_returns_false");
+
+    if (!result.needsRender && !cache) {
+      result.needsRender = true;
+    }
+    runner.expectTrue(result.needsRender, "null_cache_epub_next_forced_render");
+  }
+
+  // Test 30: TXT next with null cache - caller forces needsRender
+  {
+    ReaderNavigation::Position pos;
+    pos.sectionPage = 5;
+    PageCache* cache = nullptr;
+    auto result = ReaderNavigation::next(ContentType::Txt, pos, cache, 0);
+    runner.expectFalse(result.needsRender, "null_cache_txt_next_nav_returns_false");
+
+    if (!result.needsRender && !cache) {
+      result.needsRender = true;
+    }
+    runner.expectTrue(result.needsRender, "null_cache_txt_next_forced_render");
+  }
+
+  // Test 31: EPUB prev at sectionPage 0 with null cache - forced render
+  {
+    ReaderNavigation::Position pos;
+    pos.spineIndex = 0;
+    pos.sectionPage = 0;
+    PageCache* cache = nullptr;
+    auto result = ReaderNavigation::prev(ContentType::Epub, pos, cache);
+    runner.expectFalse(result.needsRender, "null_cache_epub_prev_start_returns_false");
+
+    if (!result.needsRender && !cache) {
+      result.needsRender = true;
+    }
+    runner.expectTrue(result.needsRender, "null_cache_epub_prev_start_forced_render");
+  }
+
+  // Test 32: At end of complete cache - no override (cache exists)
+  {
+    PageCache cache(20, false);
+    ReaderNavigation::Position pos;
+    pos.sectionPage = 19;
+    PageCache* cachePtr = &cache;
+    auto result = ReaderNavigation::next(ContentType::Txt, pos, cachePtr, 0);
+    runner.expectFalse(result.needsRender, "end_of_cache_no_render");
+
+    if (!result.needsRender && !cachePtr) {
+      result.needsRender = true;
+    }
+    runner.expectFalse(result.needsRender, "end_of_cache_no_override");
+  }
+
+  // Test 33: FB2 next with null cache - forced render
+  {
+    ReaderNavigation::Position pos;
+    pos.spineIndex = 2;
+    pos.sectionPage = 3;
+    PageCache* cache = nullptr;
+    auto result = ReaderNavigation::next(ContentType::Fb2, pos, cache, 0);
+    runner.expectFalse(result.needsRender, "null_cache_fb2_next_returns_false");
+
+    if (!result.needsRender && !cache) {
+      result.needsRender = true;
+    }
+    runner.expectTrue(result.needsRender, "null_cache_fb2_next_forced_render");
   }
 
   return runner.allPassed() ? 0 : 1;

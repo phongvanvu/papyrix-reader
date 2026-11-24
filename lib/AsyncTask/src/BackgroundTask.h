@@ -2,6 +2,7 @@
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
 
 #include <atomic>
@@ -22,7 +23,7 @@
  *       doSomeWork(task.getAbortCallback());
  *     }
  *   }, 1);
- *   task.stop();  // Always waits for self-delete, never force-kills
+ *   task.stop();  // Wait for worker completion without a forced delete.
  *
  * KEY RULES:
  * 1. Check shouldStop() frequently (every 100ms max)
@@ -62,11 +63,12 @@ class BackgroundTask {
   bool start(const char* name, uint32_t stackSize, TaskFunction func, int priority);
 
   /**
-   * Request task to stop and wait for self-deletion.
-   * Uses event-based signaling (efficient, no polling).
-   * NEVER force-deletes - always waits for cooperative exit.
+   * Request a cooperative stop and wait for worker completion.
+   * Use an exit event and a completion generation.
+   * The method never force-deletes a task.
    * @param maxWaitMs Maximum wait time (0 = wait forever)
-   * @return true if stopped cleanly, false if timeout (task still running)
+   * @return true when the method confirms completion.
+   * The method returns false on a timeout or a synchronization failure.
    */
   bool stop(uint32_t maxWaitMs = 10000);
 
@@ -79,16 +81,13 @@ class BackgroundTask {
   }
 
   /** Check if task is currently running. */
-  bool isRunning() const {
-    State s = state_.load(std::memory_order_acquire);
-    return s == State::RUNNING || s == State::STOPPING;
-  }
+  bool isRunning() const;
 
-  /** Get current task state. */
-  State getState() const { return state_.load(std::memory_order_acquire); }
+  /** Get current task state, including completion after a stop timeout. */
+  State getState() const;
 
   /** Get task handle (for advanced FreeRTOS operations). */
-  TaskHandle_t getHandle() const { return handle_; }
+  TaskHandle_t getHandle() const { return handle_.load(std::memory_order_acquire); }
 
  private:
   static void trampoline(void* param);
@@ -97,10 +96,13 @@ class BackgroundTask {
   // Event bits for signaling
   static constexpr EventBits_t EVENT_EXITED = (1 << 0);
 
-  TaskHandle_t handle_ = nullptr;
+  std::atomic<TaskHandle_t> handle_{nullptr};
   EventGroupHandle_t eventGroup_ = nullptr;
+  SemaphoreHandle_t lifecycleMutex_ = nullptr;
   std::atomic<bool> stopRequested_{false};
   std::atomic<State> state_{State::IDLE};
+  std::atomic<uint32_t> generation_{0};
+  std::atomic<uint32_t> exitedGeneration_{0};
   TaskFunction func_;
   std::string name_;  // Stored copy for debugging (prevents use-after-free)
 };

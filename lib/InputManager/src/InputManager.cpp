@@ -1,5 +1,10 @@
 #include "InputManager.h"
 
+#include <AdcMutex.h>
+#include <HardwareIdentity.h>
+
+#include <algorithm>
+
 // Recorded ADC values from real devices
 // BACK CONF LEFT RGHT   UP DOWN
 // 3597 2760 1530    6 2300    6
@@ -27,7 +32,72 @@ InputManager::InputManager()
       buttonPressStart(0),
       buttonPressFinish(0) {}
 
+InputManager::~InputManager() { stopSampling(); }
+
+bool InputManager::startSampling() {
+  if (sampling_) return true;
+  sampling_ = samplingTask_.start(
+      "Buttons", 4096,
+      [this]() {
+        while (!samplingTask_.shouldStop()) {
+          sampleButtons();
+          // Pending changes mean the main loop is behind (e.g. mid-refresh): stay fast.
+          // Keep enough time to debounce a short tap after the first idle sample.
+          const TickType_t interval =
+              pdMS_TO_TICKS(isDebouncePending() ? ACTIVE_SAMPLE_INTERVAL_MS : IDLE_SAMPLE_INTERVAL_MS);
+          vTaskDelay(interval == 0 ? 1 : interval);
+        }
+      },
+      2);
+  return sampling_;
+}
+
+void InputManager::stopSampling() {
+  if (!sampling_) return;
+  samplingTask_.stop(0);
+  sampling_ = false;
+  std::lock_guard<std::mutex> lock(samplingMutex_);
+  readIndex_ = writeIndex_ = pendingCount_ = 0;
+  lastState = sampledState_ = queuedState_ = currentState;
+  suppressedButtons_ = releaseSuppressedButtons_ = pendingSuppression_ = suppressedEvents_ = 0;
+  lastDebounceTime = millis();
+}
+
+bool InputManager::isDebouncePending() const {
+  std::lock_guard<std::mutex> lock(samplingMutex_);
+  return pendingCount_ != 0 || pendingSuppression_ != 0 || lastState != sampledState_;
+}
+
+void InputManager::setSuppressedButtons(const uint8_t mask) {
+  const uint8_t physicalState = getState();
+  std::lock_guard<std::mutex> lock(samplingMutex_);
+  if (physicalState != lastState) {
+    lastState = physicalState;
+    lastDebounceTime = millis();
+  }
+  const uint8_t started = mask & ~suppressedButtons_;
+  if (started != 0) {
+    // Deliver cancellation after older taps, without taking a queue slot.
+    if (pendingCount_ != 0) {
+      pending_[(writeIndex_ + pending_.size() - 1) % pending_.size()].suppressAfter |= started;
+    } else {
+      pendingSuppression_ |= started;
+    }
+    queuedState_ &= ~started;
+  }
+  releaseSuppressedButtons_ |= (suppressedButtons_ & ~mask) & (physicalState | sampledState_);
+  suppressedButtons_ = mask;
+}
+
 void InputManager::begin() {
+  const auto& input = papyrix::board::HardwareIdentity::instance().profile().input;
+  if (input.style == papyrix::board::InputStyle::DigitalButtons) {
+    const int8_t pins[] = {input.back, input.confirm, input.left, input.right, input.up, input.down, input.power};
+    for (const int8_t pin : pins) {
+      if (pin != papyrix::board::kPinUnused) pinMode(pin, input.activeHigh ? INPUT : INPUT_PULLUP);
+    }
+    return;
+  }
   pinMode(BUTTON_ADC_PIN_1, INPUT);
   pinMode(BUTTON_ADC_PIN_2, INPUT);
   pinMode(POWER_BUTTON_PIN, INPUT_PULLUP);
@@ -46,17 +116,38 @@ int InputManager::getButtonFromADC(const int adcValue, const int ranges[], const
 
 uint8_t InputManager::getState() {
   uint8_t state = 0;
+  const auto& input = papyrix::board::HardwareIdentity::instance().profile().input;
+  if (input.style == papyrix::board::InputStyle::DigitalButtons) {
+    const int8_t pins[] = {input.back, input.confirm, input.left, input.right, input.up, input.down, input.power};
+    for (uint8_t button = 0; button < sizeof(pins) / sizeof(pins[0]); ++button) {
+      if (pins[button] != papyrix::board::kPinUnused && digitalRead(pins[button]) == (input.activeHigh ? HIGH : LOW)) {
+        state |= uint8_t{1} << button;
+      }
+    }
+    return state;
+  }
 
-  // Read GPIO1 buttons
-  const int adcValue1 = analogRead(BUTTON_ADC_PIN_1);
-  const int button1 = getButtonFromADC(adcValue1, ADC_RANGES_1, NUM_BUTTONS_1);
+  std::lock_guard<std::mutex> adcLock(papyrix::board::adcMutex);
+  const bool filter = papyrix::board::HardwareIdentity::instance().board() == papyrix::board::BoardId::X4;
+  const auto readAdc = [filter](int pin) {
+    // Discard charge from the previous ADC channel.
+    (void)analogRead(pin);
+    int first = analogRead(pin);
+    if (filter && first <= ADC_NO_BUTTON) {
+      // Confirm a possible press without extra ADC reads at idle.
+      int second = analogRead(pin);
+      const int third = analogRead(pin);
+      if (first > second) std::swap(first, second);
+      return std::clamp(third, first, second);
+    }
+    return first;
+  };
+  const int button1 = getButtonFromADC(readAdc(BUTTON_ADC_PIN_1), ADC_RANGES_1, NUM_BUTTONS_1);
   if (button1 >= 0) {
     state |= (1 << button1);
   }
 
-  // Read GPIO2 buttons
-  const int adcValue2 = analogRead(BUTTON_ADC_PIN_2);
-  const int button2 = getButtonFromADC(adcValue2, ADC_RANGES_2, NUM_BUTTONS_2);
+  const int button2 = getButtonFromADC(readAdc(BUTTON_ADC_PIN_2), ADC_RANGES_2, NUM_BUTTONS_2);
   if (button2 >= 0) {
     state |= (1 << (button2 + 4));
   }
@@ -69,44 +160,57 @@ uint8_t InputManager::getState() {
   return state;
 }
 
-void InputManager::update() {
-  const unsigned long currentTime = millis();
+void InputManager::sampleButtons() {
   const uint8_t state = getState();
-
-  // Always clear events first
-  pressedEvents = 0;
-  releasedEvents = 0;
-
-  // Debounce
+  std::lock_guard<std::mutex> lock(samplingMutex_);
+  const unsigned long now = millis();
   if (state != lastState) {
-    lastDebounceTime = currentTime;
+    lastDebounceTime = now;
     lastState = state;
   }
-
-  if ((currentTime - lastDebounceTime) > DEBOUNCE_DELAY) {
-    if (state != currentState) {
-      // Calculate pressed and released events
-      pressedEvents = state & ~currentState;
-      releasedEvents = currentState & ~state;
-
-      // If pressing buttons and wasn't before, start recording time
-      if (pressedEvents > 0 && currentState == 0) {
-        buttonPressStart = currentTime;
-      }
-
-      // If releasing a button and no other buttons being pressed, record finish time
-      if (releasedEvents > 0 && state == 0) {
-        buttonPressFinish = currentTime;
-      }
-
-      currentState = state;
-    }
+  if (now - lastDebounceTime <= DEBOUNCE_DELAY) return;
+  sampledState_ = state;
+  releaseSuppressedButtons_ &= state;
+  const uint8_t visibleState = state & ~(suppressedButtons_ | releaseSuppressedButtons_);
+  if (visibleState == queuedState_) return;
+  if (pendingCount_ == pending_.size()) {
+    pendingSuppression_ |= pending_[readIndex_].suppressAfter;
+    readIndex_ = (readIndex_ + 1) % pending_.size();
+    --pendingCount_;
   }
+  pending_[writeIndex_] = {now, visibleState, 0};
+  queuedState_ = visibleState;
+  writeIndex_ = (writeIndex_ + 1) % pending_.size();
+  ++pendingCount_;
+}
+
+void InputManager::update() {
+  if (!sampling_) sampleButtons();
+  std::lock_guard<std::mutex> lock(samplingMutex_);
+  pressedEvents = releasedEvents = suppressedEvents_ = 0;
+  if (pendingSuppression_ != 0) {
+    suppressedEvents_ = pendingSuppression_;
+    pendingSuppression_ = 0;
+    currentState &= ~suppressedEvents_;
+    return;
+  }
+  if (pendingCount_ == 0) return;
+  const StateChange change = pending_[readIndex_];
+  readIndex_ = (readIndex_ + 1) % pending_.size();
+  --pendingCount_;
+  pressedEvents = change.state & ~currentState;
+  releasedEvents = currentState & ~change.state;
+  if (pressedEvents != 0 && currentState == 0) buttonPressStart = change.time;
+  if (releasedEvents != 0 && change.state == 0) buttonPressFinish = change.time;
+  currentState = change.state;
+  pendingSuppression_ |= change.suppressAfter;
 }
 
 bool InputManager::isPressed(const uint8_t buttonIndex) const { return currentState & (1 << buttonIndex); }
 
 bool InputManager::wasPressed(const uint8_t buttonIndex) const { return pressedEvents & (1 << buttonIndex); }
+
+bool InputManager::wasSuppressed(const uint8_t buttonIndex) const { return suppressedEvents_ & (1u << buttonIndex); }
 
 bool InputManager::wasAnyPressed() const { return pressedEvents > 0; }
 

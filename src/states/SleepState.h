@@ -24,11 +24,12 @@ class SleepState : public State {
  private:
   GfxRenderer& renderer_;
 
-  void renderDefaultSleepScreen(const Core& core) const;
+  void renderSleepProgress() const;
+  void renderDefaultSleepScreen(uint8_t sleepMode) const;
   void renderCustomSleepScreen(const Core& core) const;
   void renderCoverSleepScreen(Core& core) const;
   void renderBitmapSleepScreen(const Bitmap& bitmap) const;
-  void waitForPowerRelease() const;
+  bool waitForPowerRelease(uint32_t timeoutMs = 0) const;
 };
 
 }  // namespace papyrix

@@ -1,6 +1,6 @@
 #include "test_utils.h"
 
-#include <EInkDisplay.h>
+#include <Display.h>
 
 #include <algorithm>
 #include <array>
@@ -51,7 +51,7 @@ class GfxRenderer {
   enum RenderMode { BW, GRAYSCALE_LSB, GRAYSCALE_MSB };
   enum Orientation { Portrait, LandscapeClockwise, PortraitInverted, LandscapeCounterClockwise };
 
-  explicit GfxRenderer(EInkDisplay& display)
+  explicit GfxRenderer(papyrix::hal::Display& display)
       : einkDisplay(display), renderMode(BW), orientation(LandscapeCounterClockwise) {}
 
   void begin() { frameBuffer = einkDisplay.getFrameBuffer(); }
@@ -63,32 +63,32 @@ class GfxRenderer {
     switch (orientation) {
       case Portrait:
       case PortraitInverted:
-        return EInkDisplay::DISPLAY_HEIGHT;
+        return papyrix::hal::Display::DISPLAY_HEIGHT;
       case LandscapeClockwise:
       case LandscapeCounterClockwise:
-        return EInkDisplay::DISPLAY_WIDTH;
+        return papyrix::hal::Display::DISPLAY_WIDTH;
     }
-    return EInkDisplay::DISPLAY_HEIGHT;
+    return papyrix::hal::Display::DISPLAY_HEIGHT;
   }
 
   int getScreenHeight() const {
     switch (orientation) {
       case Portrait:
       case PortraitInverted:
-        return EInkDisplay::DISPLAY_WIDTH;
+        return papyrix::hal::Display::DISPLAY_WIDTH;
       case LandscapeClockwise:
       case LandscapeCounterClockwise:
-        return EInkDisplay::DISPLAY_HEIGHT;
+        return papyrix::hal::Display::DISPLAY_HEIGHT;
     }
-    return EInkDisplay::DISPLAY_WIDTH;
+    return papyrix::hal::Display::DISPLAY_WIDTH;
   }
 
   void drawPixel(int x, int y, bool state = true) const {
     // LandscapeCounterClockwise = identity mapping for simplicity
-    if (x < 0 || x >= static_cast<int>(EInkDisplay::DISPLAY_WIDTH) || y < 0 ||
-        y >= static_cast<int>(EInkDisplay::DISPLAY_HEIGHT))
+    if (x < 0 || x >= static_cast<int>(papyrix::hal::Display::DISPLAY_WIDTH) || y < 0 ||
+        y >= static_cast<int>(papyrix::hal::Display::DISPLAY_HEIGHT))
       return;
-    const uint16_t byteIndex = y * EInkDisplay::DISPLAY_WIDTH_BYTES + (x / 8);
+    const uint16_t byteIndex = y * papyrix::hal::Display::DISPLAY_WIDTH_BYTES + (x / 8);
     const uint8_t bitPosition = 7 - (x % 8);
     if (state)
       frameBuffer[byteIndex] &= ~(1 << bitPosition);
@@ -151,7 +151,7 @@ class GfxRenderer {
   }
 
  private:
-  EInkDisplay& einkDisplay;
+  papyrix::hal::Display& einkDisplay;
   RenderMode renderMode;
   Orientation orientation;
   uint8_t* frameBuffer = nullptr;
@@ -159,7 +159,7 @@ class GfxRenderer {
 
 // Helper: check if pixel at (x,y) is black (bit cleared) in framebuffer
 static bool isPixelSet(const uint8_t* fb, int x, int y) {
-  const uint16_t byteIndex = y * EInkDisplay::DISPLAY_WIDTH_BYTES + (x / 8);
+  const uint16_t byteIndex = y * papyrix::hal::Display::DISPLAY_WIDTH_BYTES + (x / 8);
   const uint8_t bitPosition = 7 - (x % 8);
   return (fb[byteIndex] & (1 << bitPosition)) == 0;
 }
@@ -169,7 +169,7 @@ int main() {
 
   // Test 1: Top-down bitmap - row 0 appears at top of placement
   {
-    EInkDisplay display(0, 0, 0, 0, 0, 0);
+    papyrix::hal::Display display(0, 0, 0, 0, 0, 0);
     GfxRenderer gfx(display);
     gfx.begin();
     gfx.setOrientation(GfxRenderer::LandscapeCounterClockwise);
@@ -186,7 +186,7 @@ int main() {
 
   // Test 2: Bottom-up bitmap - row 0 appears at bottom of placement
   {
-    EInkDisplay display(0, 0, 0, 0, 0, 0);
+    papyrix::hal::Display display(0, 0, 0, 0, 0, 0);
     GfxRenderer gfx(display);
     gfx.begin();
     gfx.setOrientation(GfxRenderer::LandscapeCounterClockwise);
@@ -206,13 +206,13 @@ int main() {
     Bitmap bmpTD(4, 4, true);
     Bitmap bmpBU(4, 4, false);
 
-    EInkDisplay d1(0, 0, 0, 0, 0, 0);
+    papyrix::hal::Display d1(0, 0, 0, 0, 0, 0);
     GfxRenderer g1(d1);
     g1.begin();
     g1.setOrientation(GfxRenderer::LandscapeCounterClockwise);
     g1.drawBitmap(bmpTD, 0, 0, 0, 0);
 
-    EInkDisplay d2(0, 0, 0, 0, 0, 0);
+    papyrix::hal::Display d2(0, 0, 0, 0, 0, 0);
     GfxRenderer g2(d2);
     g2.begin();
     g2.setOrientation(GfxRenderer::LandscapeCounterClockwise);
@@ -223,9 +223,22 @@ int main() {
     runner.expectTrue(bmpBU.readRowCalls == expected, "bottomup_sequential_readRow");
   }
 
-  // Test 4: Bottom-up bitmap - verify each row's pixel value lands at correct screen Y
+  // Test 4: Exact max bounds keep a 1:1 row mapping
   {
-    EInkDisplay display(0, 0, 0, 0, 0, 0);
+    Bitmap bmp(4, 4, true);
+    papyrix::hal::Display display(0, 0, 0, 0, 0, 0);
+    GfxRenderer gfx(display);
+    gfx.begin();
+    gfx.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+    gfx.drawBitmap(bmp, 0, 0, 4, 4);
+
+    const std::vector<int> expected = {0, 1, 2, 3};
+    runner.expectTrue(bmp.readRowCalls == expected, "exact_bounds_draws_one_to_one");
+  }
+
+  // Test 5: Bottom-up bitmap - verify each row's pixel value lands at correct screen Y
+  {
+    papyrix::hal::Display display(0, 0, 0, 0, 0, 0);
     GfxRenderer gfx(display);
     gfx.begin();
     gfx.setOrientation(GfxRenderer::LandscapeCounterClockwise);
@@ -248,7 +261,7 @@ int main() {
 
   // Test 5: Top-down bitmap - verify each row's pixel value lands at correct screen Y
   {
-    EInkDisplay display(0, 0, 0, 0, 0, 0);
+    papyrix::hal::Display display(0, 0, 0, 0, 0, 0);
     GfxRenderer gfx(display);
     gfx.begin();
     gfx.setOrientation(GfxRenderer::LandscapeCounterClockwise);
@@ -267,7 +280,7 @@ int main() {
 
   // Test 6: Scaled bitmap - bottom-up with 2x downscale
   {
-    EInkDisplay display(0, 0, 0, 0, 0, 0);
+    papyrix::hal::Display display(0, 0, 0, 0, 0, 0);
     GfxRenderer gfx(display);
     gfx.begin();
     gfx.setOrientation(GfxRenderer::LandscapeCounterClockwise);
@@ -287,7 +300,7 @@ int main() {
 
   // Test 7: Bitmap partially off-screen (negative y) - bottom-up should use continue not break
   {
-    EInkDisplay display(0, 0, 0, 0, 0, 0);
+    papyrix::hal::Display display(0, 0, 0, 0, 0, 0);
     GfxRenderer gfx(display);
     gfx.begin();
     gfx.setOrientation(GfxRenderer::LandscapeCounterClockwise);
@@ -305,7 +318,7 @@ int main() {
 
   // Test 8: Bitmap at bottom edge - bottom-up should use continue for screenY >= screenHeight
   {
-    EInkDisplay display(0, 0, 0, 0, 0, 0);
+    papyrix::hal::Display display(0, 0, 0, 0, 0, 0);
     GfxRenderer gfx(display);
     gfx.begin();
     gfx.setOrientation(GfxRenderer::LandscapeCounterClockwise);
@@ -321,6 +334,19 @@ int main() {
     runner.expectTrue(isPixelSet(gfx.getFrameBuffer(), 0, screenH - 1), "bottom_edge_visible");
     // destY=3 (srcY=3, val=3 white) → screenY=screenH-2
     runner.expectFalse(isPixelSet(gfx.getFrameBuffer(), 0, screenH - 2), "bottom_edge_white_row");
+  }
+
+  // Test 9: Home cover dimensions use the full bounding box rather than rounded fitted dimensions.
+  {
+    papyrix::hal::Display display(0, 0, 0, 0, 0, 0);
+    GfxRenderer gfx(display);
+    gfx.begin();
+    gfx.setOrientation(GfxRenderer::LandscapeCounterClockwise);
+
+    Bitmap bmp(450, 691, true);
+    gfx.drawBitmap(bmp, 0, 0, 320, 440);
+
+    runner.expectTrue(isPixelSet(gfx.getFrameBuffer(), 0, 439), "home_cover_reaches_fitted_bottom_row");
   }
 
   return runner.allPassed() ? 0 : 1;

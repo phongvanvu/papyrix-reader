@@ -1,38 +1,20 @@
 #include "CoverHelpers.h"
 
 #include <Bitmap.h>
-#include <BitmapHelpers.h>
 #include <GfxRenderer.h>
+#include <HardwareIdentity.h>
+#include <HomeThumbnail.h>
 #include <ImageConverter.h>
 #include <Logging.h>
 #include <SDCardManager.h>
 
 #define TAG "COVER"
 
-#include "../../src/config.h"
-
 namespace CoverHelpers {
-
-bool renderCoverWithFallback(GfxRenderer& renderer, const std::string& coverPath, const std::string& previewPath,
-                             int marginTop, int marginRight, int marginBottom, int marginLeft,
-                             int& pagesUntilFullRefresh, int pagesPerRefreshValue, bool turnOffScreen) {
-  // Prefer full cover if available
-  if (SdMan.exists(coverPath.c_str())) {
-    return renderCoverFromBmp(renderer, coverPath, marginTop, marginRight, marginBottom, marginLeft,
-                              pagesUntilFullRefresh, pagesPerRefreshValue, turnOffScreen);
-  }
-  // Fall back to preview
-  if (SdMan.exists(previewPath.c_str())) {
-    LOG_DBG(TAG, "Using preview cover (full cover not ready)");
-    return renderCoverFromBmp(renderer, previewPath, marginTop, marginRight, marginBottom, marginLeft,
-                              pagesUntilFullRefresh, pagesPerRefreshValue, turnOffScreen);
-  }
-  return false;
-}
 
 bool renderCoverFromBmp(GfxRenderer& renderer, const std::string& bmpPath, int marginTop, int marginRight,
                         int marginBottom, int marginLeft, int& pagesUntilFullRefresh, int pagesPerRefreshValue,
-                        bool turnOffScreen) {
+                        bool turnOffScreen, void (*drawOverlay)(const GfxRenderer&, bool)) {
   FsFile coverFile;
   if (!SdMan.openFileForRead("CVR", bmpPath, coverFile)) {
     LOG_ERR(TAG, "Failed to open cover BMP: %s", bmpPath.c_str());
@@ -54,29 +36,34 @@ bool renderCoverFromBmp(GfxRenderer& renderer, const std::string& bmpPath, int m
   auto rect = calculateCenteredRect(bitmap.getWidth(), bitmap.getHeight(), marginLeft, marginTop, viewportWidth,
                                     viewportHeight);
 
+  renderer.clearScreen(0xFF);
   renderer.drawBitmap(bitmap, rect.x, rect.y, rect.width, rect.height);
+  if (drawOverlay) drawOverlay(renderer, true);
 
-  // Display with refresh logic
-  if (pagesUntilFullRefresh <= 1) {
-    renderer.displayBuffer(EInkDisplay::HALF_REFRESH, turnOffScreen);
+  if (pagesPerRefreshValue == 0) {
+    renderer.displayBuffer(papyrix::hal::Display::FAST_REFRESH, turnOffScreen);
+  } else if (pagesUntilFullRefresh <= 1) {
+    renderer.displayBuffer(papyrix::hal::Display::HALF_REFRESH, turnOffScreen);
     pagesUntilFullRefresh = pagesPerRefreshValue;
   } else {
-    renderer.displayBuffer(EInkDisplay::FAST_REFRESH, turnOffScreen);
+    renderer.displayBuffer(papyrix::hal::Display::FAST_REFRESH, turnOffScreen);
     pagesUntilFullRefresh--;
   }
 
   // Grayscale rendering (if bitmap supports it and buffer can be stored)
-  if (bitmap.hasGreyscale() && renderer.storeBwBuffer()) {
+  if (renderer.supportsGrayscale() && bitmap.hasGreyscale() && renderer.storeBwBuffer()) {
     bitmap.rewindToData();
     renderer.clearScreen(0x00);
     renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
     renderer.drawBitmap(bitmap, rect.x, rect.y, rect.width, rect.height);
+    if (drawOverlay) drawOverlay(renderer, true);
     renderer.copyGrayscaleLsbBuffers();
 
     bitmap.rewindToData();
     renderer.clearScreen(0x00);
     renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
     renderer.drawBitmap(bitmap, rect.x, rect.y, rect.width, rect.height);
+    if (drawOverlay) drawOverlay(renderer, true);
     renderer.copyGrayscaleMsbBuffers();
 
     renderer.displayGrayBuffer(turnOffScreen);
@@ -89,14 +76,16 @@ bool renderCoverFromBmp(GfxRenderer& renderer, const std::string& bmpPath, int m
   return true;
 }
 
-std::string findCoverImage(const std::string& dirPath, const std::string& baseName) {
+std::string findCoverImage(const std::string& dirPath, const std::string& baseName,
+                           const std::function<bool()>& shouldAbort) {
   // Extensions to search for, in priority order
   const char* extensions[] = {".jpg", ".jpeg", ".png", ".bmp"};
 
   // Priority 1: Image matching base filename (e.g., book.jpg for book.txt)
   for (const char* ext : extensions) {
+    if (isAbortRequested(shouldAbort)) return "";
     std::string imagePath = dirPath + "/" + baseName + ext;
-    if (SdMan.exists(imagePath.c_str())) {
+    if (SdMan.exists(imagePath.c_str()) && ImageConverterFactory::detectFormat(imagePath) != ImageFormat::Unknown) {
       LOG_DBG(TAG, "Found cover image: %s", imagePath.c_str());
       return imagePath;
     }
@@ -104,8 +93,9 @@ std::string findCoverImage(const std::string& dirPath, const std::string& baseNa
 
   // Priority 2: Generic cover image in same directory
   for (const char* ext : extensions) {
+    if (isAbortRequested(shouldAbort)) return "";
     std::string imagePath = dirPath + "/cover" + ext;
-    if (SdMan.exists(imagePath.c_str())) {
+    if (SdMan.exists(imagePath.c_str()) && ImageConverterFactory::detectFormat(imagePath) != ImageFormat::Unknown) {
       LOG_DBG(TAG, "Found cover image: %s", imagePath.c_str());
       return imagePath;
     }
@@ -115,29 +105,18 @@ std::string findCoverImage(const std::string& dirPath, const std::string& baseNa
 }
 
 bool convertImageToBmp(const std::string& inputPath, const std::string& outputPath, const char* logTag,
-                       bool use1BitDithering) {
+                       bool use1BitDithering, const std::function<bool()>& shouldAbort) {
   ImageConvertConfig config;
+  const auto& display = papyrix::board::HardwareIdentity::instance().profile().display;
+  config.maxWidth = display.height;
+  config.maxHeight = display.width;
   config.oneBit = use1BitDithering;
   config.logTag = logTag;
-  return ImageConverterFactory::convertToBmp(inputPath, outputPath, config);
-}
-
-bool generateThumbFromCover(const std::string& coverBmpPath, const std::string& thumbBmpPath, const char* logTag) {
-  if (SdMan.exists(thumbBmpPath.c_str())) return true;
-  if (!SdMan.exists(coverBmpPath.c_str())) return false;
-
-  const auto thumbTempPath = thumbBmpPath + ".tmp";
-  if (bmpTo1BitBmpScaled(coverBmpPath.c_str(), thumbTempPath.c_str(), THUMB_WIDTH, THUMB_HEIGHT)) {
-    FsFile tempFile = SdMan.open(thumbTempPath.c_str(), O_RDWR);
-    if (tempFile) {
-      tempFile.rename(thumbBmpPath.c_str());
-      tempFile.close();
-      LOG_INF(logTag, "Generated thumbnail");
-      return true;
-    }
+  config.shouldAbort = shouldAbort;
+  if (use1BitDithering) {
+    config.validateOutput = [](const std::string& path) { return home_thumbnail::validateCover(path); };
   }
-  SdMan.remove(thumbTempPath.c_str());
-  return false;
+  return ImageConverterFactory::convertToBmp(inputPath, outputPath, config);
 }
 
 }  // namespace CoverHelpers

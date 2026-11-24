@@ -1,6 +1,6 @@
 #include "HomeView.h"
 
-#include <CoverHelpers.h>
+#include <I18n.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -16,11 +16,11 @@ void render(const GfxRenderer& r, const Theme& t, const HomeView& v) {
   const int pageWidth = r.getScreenWidth();
   const int pageHeight = r.getScreenHeight();
 
-  // "Papyrix" brand title - bold in top-left corner
-  brandTitle(r, t, 10, "Papyrix");
+  // "PapyriX" brand title - bold in top-left corner
+  brandTitle(r, t, 10, "PapyriX");
 
   // Battery indicator - top right
-  battery(r, t, pageWidth - 90, 10, v.batteryPercent);
+  battery(r, t, pageWidth - 90, 10, v.batteryPercent, v.batteryCharging);
 
   // Book card dimensions (70% width, centered)
   const auto card = CardDimensions::calculate(pageWidth, pageHeight);
@@ -29,17 +29,10 @@ void render(const GfxRenderer& r, const Theme& t, const HomeView& v) {
   const int cardWidth = card.width;
   const int cardHeight = card.height;
 
-  const bool hasCover = v.coverData != nullptr || v.hasCoverBmp;
+  const bool hasCover = v.hasCoverBmp;
 
   if (v.hasBook) {
-    // Draw cover image if available (in-memory version; BMP cover rendered by HomeState)
     const auto coverArea = card.getCoverArea();
-    if (v.coverData != nullptr && v.coverWidth > 0 && v.coverHeight > 0) {
-      const auto rect = CoverHelpers::calculateCenteredRect(v.coverWidth, v.coverHeight, coverArea.x, coverArea.y,
-                                                            coverArea.width, coverArea.height);
-      r.drawImage(v.coverData, rect.x, rect.y, v.coverWidth, v.coverHeight);
-    }
-
     // Draw book placeholder when no cover available
     if (!hasCover) {
       bookPlaceholder(r, t, coverArea.x, coverArea.y, coverArea.width, coverArea.height);
@@ -56,7 +49,7 @@ void render(const GfxRenderer& r, const Theme& t, const HomeView& v) {
     const int maxTitleHeight = availableHeight - authorHeight;
     const int maxTitleLines = std::max(1, maxTitleHeight / titleLineHeight);
 
-    const auto titleLines = r.wrapTextWithHyphenation(titleFontId, v.bookTitle, cardWidth, std::min(3, maxTitleLines));
+    const auto titleLines = r.wrapTextWithHyphenation(titleFontId, v.bookTitle, cardWidth, std::min(4, maxTitleLines));
 
     // Draw title lines centered
     int textY = textStartY;
@@ -83,29 +76,40 @@ void render(const GfxRenderer& r, const Theme& t, const HomeView& v) {
     const int lineHeight = r.getLineHeight(t.uiFontId);
     const int centerY = cardY + cardHeight / 2;
 
-    const char* noBookText = "No book open";
+    const char* noBookText = tr(NO_BOOK_OPEN);
     const int noBookWidth = r.getTextWidth(t.uiFontId, noBookText);
     const int noBookX = cardX + (cardWidth - noBookWidth) / 2;
     r.drawText(t.uiFontId, noBookX, centerY - lineHeight, noBookText, t.primaryTextBlack);
 
-    const char* hintText = "Press \"File\" to explore";
-    const int hintWidth = r.getTextWidth(t.uiFontId, hintText);
-    const int hintX = cardX + (cardWidth - hintWidth) / 2;
-    r.drawText(t.uiFontId, hintX, centerY + lineHeight / 2, hintText, t.secondaryTextBlack);
+    const char* hintText = v.showRecents ? tr(PRESS_FILE_TO_EXPLORE) : tr(PRESS_FILES_TO_EXPLORE);
+    centeredTextWrapped(r, t.uiFontId, centerY + lineHeight / 2, hintText, cardWidth, HomeView::MAX_EMPTY_HINT_LINES,
+                        t.secondaryTextBlack);
   }
 
-  // Button hints - direct shortcuts (no menu navigation)
-  buttonBar(r, t, v.buttons);
+  ButtonBar btns{v.hasBook ? tr(READ) : "", v.showRecents ? tr(BOOKS) : tr(FILES), tr(APPS), tr(SETTINGS)};
+  buttonBar(r, t, btns);
 
-  // Note: displayBuffer() is NOT called here; HomeState will call it
-  // after rendering the cover image on top of the card area
+  // HomeState presents the completed frame.
+}
+
+BatteryRegion renderBatteryOnly(const GfxRenderer& r, const Theme& t, const HomeView& v) {
+  const int pageWidth = r.getScreenWidth();
+  const int x = pageWidth - 90;
+  constexpr int y = 6;
+  constexpr int w = 90;
+  constexpr int h = 24;
+
+  r.clearArea(x, y, w, h, t.backgroundColor);
+  battery(r, t, x, 10, v.batteryPercent, v.batteryCharging);
+
+  return {x, y, w, h};
 }
 
 void render(const GfxRenderer& r, const Theme& t, const FileListView& v) {
   r.clearScreen(t.backgroundColor);
 
   // Title with path
-  title(r, t, t.screenMarginTop, "Files");
+  title(r, t, t.screenMarginTop, tr(FILES));
 
   // Current path (truncated if needed)
   const int pathY = 40;
@@ -114,7 +118,7 @@ void render(const GfxRenderer& r, const Theme& t, const FileListView& v) {
   r.drawText(t.smallFontId, t.screenMarginSide + 8, pathY, truncPath.c_str(), t.secondaryTextBlack);
 
   // File list
-  const int listStartY = 65;
+  const int listStartY = FileListView::LIST_START_Y;
   const int pageStart = v.getPageStart();
   const int pageEnd = v.getPageEnd();
 
@@ -131,7 +135,8 @@ void render(const GfxRenderer& r, const Theme& t, const FileListView& v) {
     centeredText(r, t, pageY, pageStr);
   }
 
-  buttonBar(r, t, v.buttons);
+  ButtonBar fileBtns{tr(BACK), tr(OPEN), "", ""};
+  buttonBar(r, t, fileBtns);
 
   r.displayBuffer();
 }
@@ -139,7 +144,7 @@ void render(const GfxRenderer& r, const Theme& t, const FileListView& v) {
 void render(const GfxRenderer& r, const Theme& t, ChapterListView& v) {
   r.clearScreen(t.backgroundColor);
 
-  title(r, t, t.screenMarginTop, "Chapters");
+  title(r, t, t.screenMarginTop, tr(CHAPTERS));
 
   constexpr int listStartY = 60;
   const int availableHeight = r.getScreenHeight() - listStartY - 50;
@@ -154,7 +159,8 @@ void render(const GfxRenderer& r, const Theme& t, ChapterListView& v) {
     chapterItem(r, t, t.uiFontId, y, v.chapters[i].title, v.chapters[i].depth, i == v.selected, i == v.currentChapter);
   }
 
-  buttonBar(r, t, v.buttons);
+  ButtonBar chapBtns{tr(BACK), tr(GO), "", ""};
+  buttonBar(r, t, chapBtns);
 
   r.displayBuffer();
 }

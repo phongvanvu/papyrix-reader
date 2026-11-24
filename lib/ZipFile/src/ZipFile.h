@@ -1,9 +1,27 @@
 #pragma once
 #include <SdFat.h>
 
+#include <functional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
+
+class BuildArena;
+
+enum class StreamReadResult : uint8_t {
+  Success,
+  OpenFailed,
+  NotFound,
+  InvalidOffset,
+  UnsupportedMethod,
+  AllocFailed,
+  Aborted,
+  ReadError,
+  WriteError,
+  DecompressionError,
+  SizeMismatch,
+};
 
 class ZipFile {
  public:
@@ -43,17 +61,20 @@ class ZipFile {
   }
 
  private:
-  const std::string& filePath;
+  std::string filePath;
   FsFile file;
   ZipDetails zipDetails = {0, 0, false};
   std::unordered_map<std::string, FileStatSlim> fileStatSlimCache;
 
+#ifdef TEST_BUILD
+ public:
+#endif
   bool loadFileStatSlim(const char* filename, FileStatSlim* fileStat);
   long getDataOffset(const FileStatSlim& fileStat);
   bool loadZipDetails();
 
  public:
-  explicit ZipFile(const std::string& filePath) : filePath(filePath) {}
+  explicit ZipFile(std::string filePath) : filePath(std::move(filePath)) {}
   ~ZipFile() = default;
   // Zip file can be opened and closed by hand in order to allow for quick calculation of inflated file size
   // It is NOT recommended to pre-open it for any kind of inflation due to memory constraints
@@ -70,9 +91,14 @@ class ZipFile {
   int fillUncompressedSizes(std::vector<SizeTarget>& targets, std::vector<uint32_t>& sizes);
   // Find first existing file from a list of paths. Returns index into paths array, or -1 if none found.
   // More efficient than calling getInflatedFileSize() for each path individually.
-  int findFirstExisting(const char* const* paths, int pathCount);
+  int findFirstExisting(const char* const* paths, int pathCount, const std::function<bool()>& shouldAbort = nullptr);
   // Due to the memory required to run each of these, it is recommended to not preopen the zip file for multiple
   // These functions will open and close the zip as needed
   uint8_t* readFileToMemory(const char* filename, size_t* size = nullptr, bool trailingNullByte = false);
-  bool readFileToStream(const char* filename, Print& out, size_t chunkSize, uint8_t* dictBuffer = nullptr);
+  bool readFileToStream(const char* filename, Print& out, size_t chunkSize, uint8_t* dictBuffer = nullptr,
+                        const std::function<bool()>& shouldAbort = nullptr, BuildArena* scratch = nullptr);
+  StreamReadResult readFileToStreamDetailed(const char* filename, Print& out, size_t chunkSize,
+                                            uint8_t* dictBuffer = nullptr,
+                                            const std::function<bool()>& shouldAbort = nullptr,
+                                            BuildArena* scratch = nullptr);
 };

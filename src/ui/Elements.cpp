@@ -1,16 +1,39 @@
 #include "Elements.h"
 
+#include <I18n.h>
+
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
 
 #include "core/PapyrixSettings.h"
+#include "images/LocalsendLogo.h"
+#include "images/PrinterLogo.h"
 
 namespace ui {
 
 static uint8_t frontButtonLayout_ = 0;
 
 void setFrontButtonLayout(uint8_t layout) { frontButtonLayout_ = layout; }
+
+void inkBitmap(const GfxRenderer& r, const uint8_t* data, int size, int x0, int y0, bool ink) {
+  if (data == nullptr || size <= 0) return;
+  const int rowBytes = size / 8;
+  for (int y = 0; y < size; y++) {
+    int run = -1;
+    for (int x = 0; x < size; x++) {
+      const bool isInk = (data[y * rowBytes + (x / 8)] & (0x80 >> (x & 7))) == 0;
+      if (isInk) {
+        if (run < 0) run = x;
+      } else if (run >= 0) {
+        r.fillRect(x0 + run, y0 + y, x - run, 1, ink);
+        run = -1;
+      }
+    }
+    if (run >= 0) r.fillRect(x0 + run, y0 + y, size - run, 1, ink);
+  }
+}
 
 void title(const GfxRenderer& r, const Theme& t, int y, const char* text) {
   r.drawCenteredText(t.readerFontId, y, text, t.primaryTextBlack, EpdFontFamily::BOLD);
@@ -44,24 +67,24 @@ void toggle(const GfxRenderer& r, const Theme& t, int y, const char* label, bool
   if (selected) {
     r.fillRect(x, y, w, h, t.selectionFillBlack);
     r.drawText(t.uiFontId, x + t.itemPaddingX, textY, label, t.selectionTextBlack);
-    r.drawText(t.uiFontId, valueX, textY, value ? "ON" : "OFF", t.selectionTextBlack);
+    r.drawText(t.uiFontId, valueX, textY, value ? tr(ON) : tr(OFF), t.selectionTextBlack);
   } else {
     r.drawText(t.uiFontId, x + t.itemPaddingX, textY, label, t.primaryTextBlack);
-    r.drawText(t.uiFontId, valueX, textY, value ? "ON" : "OFF", t.secondaryTextBlack);
+    r.drawText(t.uiFontId, valueX, textY, value ? tr(ON) : tr(OFF), t.secondaryTextBlack);
   }
 }
 
-void enumValue(const GfxRenderer& r, const Theme& t, int y, const char* label, const char* value, bool selected) {
+void enumValue(const GfxRenderer& r, const Theme& t, int y, const char* label, const char* value, bool selected,
+               int height) {
   const int x = t.screenMarginSide;
   const int w = r.getScreenWidth() - 2 * t.screenMarginSide;
-  const int h = t.itemHeight;
-  const int textY = y + (h - r.getLineHeight(t.uiFontId)) / 2;
+  const int textY = y + (height - r.getLineHeight(t.uiFontId)) / 2;
 
   const int valueWidth = r.getTextWidth(t.uiFontId, value);
   const int valueX = r.getScreenWidth() - t.screenMarginSide - valueWidth - t.itemValuePadding;
 
   if (selected) {
-    r.fillRect(x, y, w, h, t.selectionFillBlack);
+    r.fillRect(x, y, w, height, t.selectionFillBlack);
     r.drawText(t.uiFontId, x + t.itemPaddingX, textY, label, t.selectionTextBlack);
     r.drawText(t.uiFontId, valueX, textY, value, t.selectionTextBlack);
   } else {
@@ -70,22 +93,29 @@ void enumValue(const GfxRenderer& r, const Theme& t, int y, const char* label, c
   }
 }
 
-void buttonBar(const GfxRenderer& r, const Theme& t, const char* b1, const char* b2, const char* b3, const char* b4) {
-  if (frontButtonLayout_ == papyrix::Settings::FrontLRBC) {
-    r.drawButtonHints(t.uiFontId, b3, b4, b1, b2, t.primaryTextBlack);
-  } else {
-    r.drawButtonHints(t.uiFontId, b1, b2, b3, b4, t.primaryTextBlack);
+static void drawButtonBar(const GfxRenderer& r, const Theme& t, const char* const labels[4]) {
+  for (int i = 0; i < 4; ++i) {
+    if (labels[i] == nullptr || labels[i][0] == '\0') continue;
+    const touch::Rect bounds = buttonBarButtonBounds(r, i);
+    r.drawRect(bounds.x, bounds.y, bounds.width, bounds.height, t.primaryTextBlack);
+    const std::string label = r.truncatedText(t.uiFontId, labels[i], GfxRenderer::BUTTON_HINT_MAX_TEXT_WIDTH);
+    const int textX = bounds.x + (bounds.width - 1 - r.getTextWidth(t.uiFontId, label.c_str())) / 2;
+    r.drawText(t.uiFontId, textX, bounds.y + 10, label.c_str(), t.primaryTextBlack);
   }
 }
 
+void buttonBar(const GfxRenderer& r, const Theme& t, const char* b1, const char* b2, const char* b3, const char* b4) {
+  const char* labels[] = {b1, b2, b3, b4};
+  const char* remapped[] = {b3, b4, b1, b2};
+  drawButtonBar(r, t, frontButtonLayout_ == papyrix::Settings::FrontLRBC ? remapped : labels);
+}
+
 void buttonBar(const GfxRenderer& r, const Theme& t, const ButtonBar& buttons) {
-  if (frontButtonLayout_ == papyrix::Settings::FrontLRBC) {
-    r.drawButtonHints(t.uiFontId, buttons.labels[2], buttons.labels[3], buttons.labels[0], buttons.labels[1],
-                      t.primaryTextBlack);
-  } else {
-    r.drawButtonHints(t.uiFontId, buttons.labels[0], buttons.labels[1], buttons.labels[2], buttons.labels[3],
-                      t.primaryTextBlack);
-  }
+  buttonBar(r, t, buttons.labels[0], buttons.labels[1], buttons.labels[2], buttons.labels[3]);
+}
+
+touch::Rect buttonBarButtonBounds(const GfxRenderer& r, int index) {
+  return touch::buttonBarButtonRect(index, r.getScreenWidth(), r.getScreenHeight(), GfxRenderer::BUTTON_HINT_WIDTH);
 }
 
 void progress(const GfxRenderer& r, const Theme& t, int y, int current, int total) {
@@ -138,15 +168,22 @@ void image(const GfxRenderer& r, int x, int y, const uint8_t* data, int w, int h
   }
 }
 
-void dialog(const GfxRenderer& r, const Theme& t, const char* titleText, const char* msg, int selected) {
-  const int screenW = r.getScreenWidth();
-  const int screenH = r.getScreenHeight();
+void localsendLogo(const GfxRenderer& r, const Theme& t, int cx, int cy) {
+  inkBitmap(r, LocalsendLogo, LocalsendLogoSize, cx - LocalsendLogoSize / 2, cy - LocalsendLogoSize / 2,
+            t.primaryTextBlack);
+}
 
-  // Dialog box dimensions
-  const int dialogW = screenW - 60;
-  const int dialogH = 160;
-  const int dialogX = 30;
-  const int dialogY = (screenH - dialogH) / 2;
+void printerLogo(const GfxRenderer& r, const Theme& t, int cx, int cy) {
+  inkBitmap(r, PrinterLogo, PrinterLogoSize, cx - PrinterLogoSize / 2, cy - PrinterLogoSize / 2, t.primaryTextBlack);
+}
+
+void dialog(const GfxRenderer& r, const Theme& t, const char* titleText, const char* msg, int selected) {
+  const touch::DialogLayout layout = confirmationDialogBounds(r, t, msg);
+  const int dialogW = layout.bounds.width;
+  const int messageMaxWidth = dialogW - 40;
+  const int dialogH = layout.bounds.height;
+  const int dialogX = layout.bounds.x;
+  const int dialogY = layout.bounds.y;
 
   // Draw dialog background (clear area)
   r.clearArea(dialogX, dialogY, dialogW, dialogH, t.backgroundColor);
@@ -156,24 +193,26 @@ void dialog(const GfxRenderer& r, const Theme& t, const char* titleText, const c
   r.drawCenteredText(t.readerFontId, dialogY + 20, titleText, t.primaryTextBlack, EpdFontFamily::BOLD);
 
   // Draw message
-  r.drawCenteredText(t.uiFontId, dialogY + 60, msg, t.primaryTextBlack);
+  centeredTextWrapped(r, t.uiFontId, dialogY + 60, msg, messageMaxWidth, 2, t.primaryTextBlack);
 
   // Draw buttons (Yes/No)
-  const int btnW = 80;
-  const int btnH = 30;
-  const int btnY = dialogY + dialogH - 50;
+  const touch::Rect yesBounds = layout.choices[0];
+  const touch::Rect noBounds = layout.choices[1];
+  const int btnW = yesBounds.width;
+  const int btnH = yesBounds.height;
+  const int btnY = yesBounds.y;
   const int btnTextY = btnY + (btnH - r.getLineHeight(t.uiFontId)) / 2;
-  const int yesX = dialogX + (dialogW / 2) - btnW - 20;
-  const int noX = dialogX + (dialogW / 2) + 20;
+  const int yesX = yesBounds.x;
+  const int noX = noBounds.x;
 
   // Yes button
   if (selected == 0) {
     r.fillRect(yesX, btnY, btnW, btnH, t.selectionFillBlack);
-    r.drawCenteredText(t.uiFontId, btnTextY, "Yes", t.selectionTextBlack);
+    r.drawCenteredText(t.uiFontId, btnTextY, tr(YES), t.selectionTextBlack);
   } else {
     r.drawRect(yesX, btnY, btnW, btnH, t.primaryTextBlack);
   }
-  r.drawText(t.uiFontId, yesX + (btnW - r.getTextWidth(t.uiFontId, "Yes")) / 2, btnTextY, "Yes",
+  r.drawText(t.uiFontId, yesX + (btnW - r.getTextWidth(t.uiFontId, tr(YES))) / 2, btnTextY, tr(YES),
              selected == 0 ? t.selectionTextBlack : t.primaryTextBlack);
 
   // No button
@@ -182,8 +221,16 @@ void dialog(const GfxRenderer& r, const Theme& t, const char* titleText, const c
   } else {
     r.drawRect(noX, btnY, btnW, btnH, t.primaryTextBlack);
   }
-  r.drawText(t.uiFontId, noX + (btnW - r.getTextWidth(t.uiFontId, "No")) / 2, btnTextY, "No",
+  r.drawText(t.uiFontId, noX + (btnW - r.getTextWidth(t.uiFontId, tr(NO))) / 2, btnTextY, tr(NO),
              selected == 1 ? t.selectionTextBlack : t.primaryTextBlack);
+}
+
+touch::DialogLayout confirmationDialogBounds(const GfxRenderer& r, const Theme& t, const char* msg) {
+  const int dialogWidth = r.getScreenWidth() - 60;
+  const int messageMaxWidth = dialogWidth - 40;
+  const bool messageWraps = r.getTextWidth(t.uiFontId, msg) > messageMaxWidth;
+  const int dialogHeight = 160 + (messageWraps ? r.getLineHeight(t.uiFontId) : 0);
+  return touch::confirmationDialogLayout(r.getScreenWidth(), r.getScreenHeight(), dialogHeight);
 }
 
 // Keyboard layout - 10x10 grid
@@ -363,30 +410,50 @@ char getKeyboardChar(const KeyboardState& state) {
   return '\0';
 }
 
-void battery(const GfxRenderer& r, const Theme& t, int x, int y, int percent) {
-  // Simple battery icon: [====]
-  const int battW = 30;
-  const int battH = 14;
-  const int tipW = 3;
-  const int tipH = 6;
+static void drawBatteryBody(const GfxRenderer& r, const Theme& t, int x, int y, int percent, bool charging) {
+  constexpr int battW = 30;
+  constexpr int battH = 14;
+  constexpr int tipW = 3;
+  constexpr int tipH = 6;
 
-  const int iconY = y + 3;  // shift icon down to align with text
+  r.drawRect(x, y, battW, battH, t.primaryTextBlack);
+  r.fillRect(x + battW, y + (battH - tipH) / 2, tipW, tipH, t.primaryTextBlack);
 
-  // Battery body outline
-  r.drawRect(x, iconY, battW, battH, t.primaryTextBlack);
-
-  // Battery tip (positive terminal)
-  r.fillRect(x + battW, iconY + (battH - tipH) / 2, tipW, tipH, t.primaryTextBlack);
-
-  // Fill level
-  const int fillW = ((battW - 4) * percent) / 100;
+  const int boundedPercent = percent > 100 ? 100 : percent;
+  const int fillW = boundedPercent > 0 ? ((battW - 4) * boundedPercent) / 100 : 0;
   if (fillW > 0) {
-    r.fillRect(x + 2, iconY + 2, fillW, battH - 4, t.primaryTextBlack);
+    r.fillRect(x + 2, y + 2, fillW, battH - 4, t.primaryTextBlack);
   }
 
-  // Percentage text
+  if (charging) {
+    const int boltCx = x + battW / 2;
+    const int boltTop = y + 2;
+    const int boltBot = y + battH - 3;
+    const int boltMid = (boltTop + boltBot) / 2;
+    r.fillRect(boltCx - 3, boltTop - 1, 7, boltBot - boltTop + 3, t.backgroundColor == 0x00);
+    r.drawLine(boltCx + 2, boltTop, boltCx - 1, boltMid, t.primaryTextBlack);
+    r.drawLine(boltCx - 1, boltMid, boltCx + 1, boltMid, t.primaryTextBlack);
+    r.drawLine(boltCx + 1, boltMid, boltCx - 2, boltBot, t.primaryTextBlack);
+  }
+}
+
+void batteryIcon(const GfxRenderer& r, const Theme& t, int x, int y, int percent, bool charging) {
+  const int boundedPercent = percent > 100 ? 100 : percent;
+  const int level = boundedPercent > 0 ? (boundedPercent + 12) / 25 : 0;
+  drawBatteryBody(r, t, x, y, level * 25, charging);
+}
+
+void battery(const GfxRenderer& r, const Theme& t, int x, int y, int percent, bool charging) {
+  constexpr int battW = 30;
+  constexpr int tipW = 3;
+  drawBatteryBody(r, t, x, y + 3, percent, charging);
+
   char buf[8];
-  snprintf(buf, sizeof(buf), "%d%%", percent);
+  if (percent < 0) {
+    snprintf(buf, sizeof(buf), "--%%");
+  } else {
+    snprintf(buf, sizeof(buf), "%d%%", percent);
+  }
   r.drawText(t.smallFontId, x + battW + tipW + 5, y, buf, t.primaryTextBlack);
 }
 
@@ -546,14 +613,11 @@ void wifiEntry(const GfxRenderer& r, const Theme& t, int y, const char* ssid, in
   }
 }
 
-void centeredText(const GfxRenderer& r, const Theme& t, int y, const char* str) {
-  r.drawCenteredText(t.uiFontId, y, str, t.primaryTextBlack);
-}
-
 void centeredMessage(const GfxRenderer& r, const Theme& t, int fontId, const char* message) {
   r.clearScreen(t.backgroundColor);
   const int y = r.getScreenHeight() / 2 - r.getLineHeight(fontId) / 2;
-  r.drawCenteredText(fontId, y, message, t.primaryTextBlack, EpdFontFamily::BOLD);
+  const int maxWidth = r.getScreenWidth() - 2 * (t.screenMarginSide + t.itemPaddingX);
+  centeredTextWrapped(r, fontId, y, message, maxWidth, 3, t.primaryTextBlack, EpdFontFamily::BOLD);
   r.displayBuffer();
 }
 
@@ -633,7 +697,7 @@ void bookPlaceholder(const GfxRenderer& r, const Theme& t, int x, int y, int wid
   // 5. Draw "No Cover" text centered on front cover
   const int coverCenterX = sx(35) + sw(295) / 2;
   const int coverCenterY = sy(35) + sw(430) / 2;
-  const char* noCoverText = "No Cover";
+  const char* noCoverText = tr(NO_COVER);
   const int textWidth = r.getTextWidth(t.uiFontId, noCoverText);
   const int textX = coverCenterX - textWidth / 2;
   const int textY = coverCenterY - r.getLineHeight(t.uiFontId) / 2;
@@ -707,8 +771,10 @@ void readerStatusBar(const GfxRenderer& r, const Theme& t, int marginLeft, int m
 
   // 2. Page numbers (right side)
   char pageStr[16];
-  if (data.isPartial || data.totalPages == 0) {
+  if (data.totalPages <= 0) {
     snprintf(pageStr, sizeof(pageStr), "%d/-", data.currentPage);
+  } else if (data.isPartial) {
+    snprintf(pageStr, sizeof(pageStr), "%d/%d~", data.currentPage, data.totalPages);
   } else {
     snprintf(pageStr, sizeof(pageStr), "%d/%d", data.currentPage, data.totalPages);
   }

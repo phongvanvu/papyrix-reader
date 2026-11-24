@@ -5,6 +5,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 // Collect words from extracted TextBlock lines
@@ -227,6 +228,57 @@ int main() {
     runner.expectEq(size_t(8), w1.size() + w2.size(), "parser_pattern_all_words_accounted");
   }
 
+  // --- Repeated aborts during oversized-word preprocessing preserve output ---
+  {
+    auto makeOversized = [] {
+      auto block = std::make_unique<ParsedText>(TextBlock::LEFT_ALIGN, 0, true, true, false);
+      for (int i = 0; i < 120; ++i) {
+        const auto style = (i % 2 == 0) ? EpdFontFamily::REGULAR : EpdFontFamily::ITALIC;
+        block->addWord("abcdefgh\xC2\xADijklmnop\xC2\xADqrstuvwx", style);
+      }
+      return block;
+    };
+    auto flattenStyled = [](const std::vector<std::shared_ptr<TextBlock>>& lines) {
+      std::vector<std::pair<std::string, EpdFontFamily::Style>> result;
+      for (const auto& line : lines) {
+        for (const auto& word : line->getWords()) result.emplace_back(word.word, word.style);
+      }
+      return result;
+    };
+
+    auto uninterrupted = makeOversized();
+    std::vector<std::shared_ptr<TextBlock>> expectedLines;
+    runner.expectTrue(uninterrupted->layoutAndExtractLines(
+                          renderer, kFontId, kViewport,
+                          [&](std::shared_ptr<TextBlock> line) { expectedLines.push_back(std::move(line)); }),
+                      "oversized uninterrupted completes");
+
+    auto resumed = makeOversized();
+    int abortBudget = 3;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+      int checksThisAttempt = 0;
+      const bool ok = resumed->layoutAndExtractLines(
+          renderer, kFontId, kViewport, [](std::shared_ptr<TextBlock>) {}, true,
+          [&]() {
+            ++checksThisAttempt;
+            if (checksThisAttempt == 2 && abortBudget > 0) {
+              --abortBudget;
+              return true;
+            }
+            return false;
+          });
+      runner.expectFalse(ok, "oversized preprocessing attempt aborts");
+    }
+
+    std::vector<std::shared_ptr<TextBlock>> actualLines;
+    runner.expectTrue(resumed->layoutAndExtractLines(
+                          renderer, kFontId, kViewport,
+                          [&](std::shared_ptr<TextBlock> line) { actualLines.push_back(std::move(line)); }),
+                      "oversized resumed parse completes");
+    runner.expectTrue(flattenStyled(actualLines) == flattenStyled(expectedLines),
+                      "oversized abort/resume preserves words and styles");
+  }
+
   // --- Single word: always fits on one line ---
   {
     auto pt = makeBlock(1);
@@ -247,6 +299,79 @@ int main() {
     runner.expectTrue(ok, "exclude_last_single_line_ok");
     runner.expectEq(size_t(0), lines.size(), "exclude_last_single_line_no_extract");
     runner.expectEq(size_t(2), pt->size(), "exclude_last_single_line_words_preserved");
+  }
+
+  // --- Indentation applied only once (includeLastLine=false resume) ---
+  {
+    auto pt = std::make_unique<ParsedText>(TextBlock::LEFT_ALIGN, 2, false, true, false);
+    const char* names[] = {"aaa", "bbb", "ccc", "ddd", "eee", "fff"};
+    for (int i = 0; i < 6; i++) {
+      pt->addWord(names[i], EpdFontFamily::REGULAR);
+    }
+    std::vector<std::shared_ptr<TextBlock>> lines;
+    bool ok = pt->layoutAndExtractLines(
+        renderer, kFontId, kViewport,
+        [&](std::shared_ptr<TextBlock> l) { lines.push_back(l); }, false);
+    runner.expectTrue(ok, "indent_resume_exclude_ok");
+    runner.expectEq(size_t(2), lines.size(), "indent_resume_exclude_two_lines");
+
+    auto& words1 = lines[0]->getWords();
+    runner.expectTrue(words1.size() > 0, "indent_resume_first_line_has_words");
+    if (words1.size() > 0) {
+      runner.expectEqual(std::string("\xe2\x80\x83" "aaa"), words1[0].word, "indent_resume_first_word_indented");
+    }
+
+    std::vector<std::shared_ptr<TextBlock>> lines2;
+    ok = pt->layoutAndExtractLines(
+        renderer, kFontId, kViewport,
+        [&](std::shared_ptr<TextBlock> l) { lines2.push_back(l); }, true);
+    runner.expectTrue(ok, "indent_resume_second_ok");
+    runner.expectEq(size_t(1), lines2.size(), "indent_resume_second_one_line");
+
+    auto& words2 = lines2[0]->getWords();
+    runner.expectTrue(words2.size() > 0, "indent_resume_second_has_words");
+    if (words2.size() > 0) {
+      runner.expectEqual(std::string("eee"), words2[0].word, "indent_resume_no_double_indent");
+    }
+  }
+
+  // --- Indentation not duplicated after abort ---
+  {
+    auto pt = std::make_unique<ParsedText>(TextBlock::LEFT_ALIGN, 2, false, true, false);
+    const char* names[] = {"aaa", "bbb", "ccc", "ddd", "eee", "fff"};
+    for (int i = 0; i < 6; i++) {
+      pt->addWord(names[i], EpdFontFamily::REGULAR);
+    }
+    std::vector<std::shared_ptr<TextBlock>> lines;
+    int linesCollected = 0;
+    bool ok = pt->layoutAndExtractLines(
+        renderer, kFontId, kViewport,
+        [&](std::shared_ptr<TextBlock> l) {
+          lines.push_back(l);
+          linesCollected++;
+        },
+        true, [&]() -> bool { return linesCollected >= 1; });
+    runner.expectFalse(ok, "indent_abort_returns_false");
+    runner.expectEq(size_t(1), lines.size(), "indent_abort_one_line");
+
+    auto& words1 = lines[0]->getWords();
+    runner.expectTrue(words1.size() > 0, "indent_abort_first_line_has_words");
+    if (words1.size() > 0) {
+      runner.expectEqual(std::string("\xe2\x80\x83" "aaa"), words1[0].word, "indent_abort_first_word_indented");
+    }
+
+    std::vector<std::shared_ptr<TextBlock>> lines2;
+    ok = pt->layoutAndExtractLines(
+        renderer, kFontId, kViewport,
+        [&](std::shared_ptr<TextBlock> l) { lines2.push_back(l); }, true);
+    runner.expectTrue(ok, "indent_abort_resume_ok");
+    runner.expectEq(size_t(2), lines2.size(), "indent_abort_resume_two_lines");
+
+    auto& words2 = lines2[0]->getWords();
+    runner.expectTrue(words2.size() > 0, "indent_abort_resume_first_has_words");
+    if (words2.size() > 0) {
+      runner.expectEqual(std::string("ccc"), words2[0].word, "indent_abort_resume_no_double_indent");
+    }
   }
 
   runner.printSummary();

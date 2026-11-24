@@ -1,16 +1,14 @@
 # Customization Guide
 
-This guide explains how to create custom themes and add custom fonts to Papyrix.
-
 ---
 
 ## Custom Themes
 
-Papyrix supports user-customizable themes stored on the SD card. Themes control colors, layout options, and fonts.
+Themes control colors, layout, and fonts. The device reads theme files from the SD card.
 
 ### Theme File Location
 
-Theme files are stored in the `/config/themes/` directory on the SD card:
+Theme files are in the `/config/themes/` directory on the SD card:
 
 ```
 /config/themes/
@@ -19,30 +17,30 @@ Theme files are stored in the `/config/themes/` directory on the SD card:
 └── my-custom.theme  # Your custom theme
 ```
 
-When you first use the device, default `light.theme` and `dark.theme` files are created automatically.
+When you use the device the first time, default `light.theme` and `dark.theme` files are created.
 
 ### Creating a Custom Theme
 
-1. Copy [example.theme](example.theme) or an existing theme file from your device
-2. Rename it (e.g., `my-custom.theme`) — use only letters, digits, hyphens, and underscores
-3. Edit the file with any text editor
-4. Place it in `/config/themes/` on your SD card
-5. Restart the device and select your theme in **Settings > Reader > Theme**
+1. Copy [example.theme](example.theme) or a theme file that is on your device
+2. Rename it (for example, `my-custom.theme`) — use only letters, digits, hyphens, and underscores
+3. Edit the file with a text editor
+4. Put it in `/config/themes/` on your SD card
+5. Start the device again and select your theme in **Settings > Screen > Theme**
 
 ### Theme Limits
 
-- **Maximum themes**: 16 themes can be displayed in the Settings UI
+- **Maximum themes**: 16 themes can show in the Settings UI
 - **Theme name length**: Maximum 31 characters
-- **Filename format**: Theme filenames must contain only letters, digits, hyphens, and underscores (e.g., `my-custom.theme`, `dark_v2.theme`). Files with other characters are ignored.
-- Themes beyond the limit are ignored with a log warning (alphabetical order by filename)
-- If a theme file is invalid or fails to parse, the device skips it and logs a warning
+- **Filename format**: Theme filenames must contain only letters, digits, hyphens, and underscores (for example, `my-custom.theme`, `dark_v2.theme`). Files with other characters are ignored.
+- Themes above the limit are ignored. A log warning is written (alphabetical order by filename)
+- If a theme file is not valid or parse fails, the device skips it and writes a warning to the log
 
 ### Theme File Format
 
 Theme files use a simple INI format:
 
 ```ini
-# Papyrix Theme Configuration
+# PapyriX Theme Configuration
 # Edit values and restart device to apply
 
 [theme]
@@ -79,12 +77,12 @@ reader_font_large =       # Reader font for large size (empty = builtin)
 Optional metadata for the theme:
 
 - **name** - Display name shown in the Settings UI
-  - If not specified, the filename (without extension) is used
+  - If not specified, the filename (with no extension) is used
   - Example: `name = Dark Noto Serif`
 
 #### Colors Section
 
-- **inverted_mode** - Enable dark mode (inverted colors)
+- **inverted_mode** - Set dark mode to on (inverted colors)
   - Values: `true` or `false`
 - **background** - Screen background color
   - Values: `white` or `black`
@@ -98,7 +96,7 @@ Optional metadata for the theme:
 
 #### Text Section
 
-- **primary_color** - Main text color
+- **primary_color** - Primary text color
   - Values: `white` or `black`
 - **secondary_color** - Secondary/dimmed text color
   - Values: `white` or `black`
@@ -111,22 +109,25 @@ Optional metadata for the theme:
   - Default: `3`
 - **item_height** - Height of menu items in pixels
   - Default: `30`
-  - Minimum: `1` (values of 0 will cause errors)
-  - Affects file browser and menu navigation (including long-press page skip)
-  - Note: Chapter selection screens use automatic 2-line item heights based on font size
+  - Minimum: `1` (values of 0 cause errors)
+  - Has an effect on the file browser and menu navigation (including long-press page skip)
+  - Note: Chapter selection screens use automatic 2-line item heights from font size
 - **item_spacing** - Vertical space between items in pixels
   - Default: `0`
 
-> **Note:** Front button layout (B/C/L/R vs L/R/B/C) and side button layout are now configured in **Settings > Device** instead of the theme file.
+The [Apps menu](user_guide.md#apps) reduces row height and spacing when needed to fit above the bottom actions.
+Reader and Screen settings also reduce row height to keep all settings above the bottom actions.
+
+Set the front and side button layouts in **Settings > Device**.
 
 #### Fonts Section
 
 - **reader_font_small** - Custom reader font for small size (14pt)
-  - Leave empty to use builtin font
+  - Leave empty to use the builtin font
 - **reader_font_medium** - Custom reader font for medium size (16pt)
-  - Leave empty to use builtin font
+  - Leave empty to use the builtin font
 - **reader_font_large** - Custom reader font for large size (18pt)
-  - Leave empty to use builtin font
+  - Leave empty to use the builtin font
 
 ### Example: Dark Theme
 
@@ -214,17 +215,17 @@ This theme uses custom fonts:
 - Reader (medium): `/config/fonts/noto-serif-16/`
 - Reader (large): `/config/fonts/noto-serif-18/`
 
-If any font directory doesn't exist, the device falls back to the builtin font for that size.
+If a font directory does not exist, the device uses the builtin font for that size.
 
 ---
 
 ## Custom Fonts
 
-Papyrix supports loading custom fonts from the SD card. Fonts must be pre-converted to the `.epdfont` binary format.
+PapyriX supports load of custom fonts from the SD card. You must convert fonts to the `.epdfont` binary format first.
 
 ### Font File Location
 
-Custom fonts are stored in the `/config/fonts/` directory, organized by font family:
+Custom fonts are in the `/config/fonts/` directory, organized by font family:
 
 ```
 /config/fonts/
@@ -235,16 +236,16 @@ Custom fonts are stored in the `/config/fonts/` directory, organized by font fam
     └── regular.epdfont
 ```
 
-Each font family is a subdirectory containing style variants. Only `regular.epdfont` is required. Bold is loaded on demand when first encountered. Italic text renders using the regular variant. If the font is not found on SD card, the built-in font is used (with native italic support).
+Each font family is a subdirectory that contains style variants. Only `regular.epdfont` is necessary. Bold is loaded when it occurs the first time. Italic text uses the regular variant. If the font is not on the SD card, the built-in font is used (with native italic support).
 
 ### Converting Fonts
 
-To create `.epdfont` files from TTF/OTF fonts, use the `fontconvert.py` script included in the firmware source code (`scripts/fontconvert.py`).
+To make `.epdfont` files from TTF/OTF fonts, use the `fontconvert.py` script in the firmware source code (`scripts/fontconvert.py`).
 
 #### Requirements
 
 - Python 3.12+
-- [uv](https://docs.astral.sh/uv/) package manager (dependencies are handled automatically via inline script metadata)
+- [uv](https://docs.astral.sh/uv/) package manager (dependencies are handled through inline script metadata)
 
 #### Basic Usage
 
@@ -266,17 +267,17 @@ uv run scripts/fontconvert.py my-font -r MyFont-Regular.ttf --2bit -o /tmp/fonts
 
 #### Options
 
-- **-r, --regular** - Path to regular style font (required for binary mode)
+- **-r, --regular** - Path to regular style font (necessary for binary mode)
 - **-b, --bold** - Path to bold style font
 - **-i, --italic** - Path to italic style font
 - **-o, --output** - Output directory (default: current directory)
 - **-s, --size-opt** - Font size in points (default: 16)
-- **--2bit** - Generate 2-bit grayscale (smoother but larger)
-- **--all-sizes** - Generate all reader sizes (14, 16, 18pt)
-- **--header** - Output C header instead of binary .epdfont
+- **--2bit** - Make 2-bit grayscale (smoother but larger)
+- **--all-sizes** - Make all reader sizes (14, 16, 18pt)
+- **--header** - Output C header, not binary .epdfont
 - **--thai** - Include Thai script (U+0E00-0E7F)
 - **--arabic** - Include Arabic script (U+0600-06FF, Presentation Forms)
-- **--additional-intervals** - Additional Unicode intervals as min,max (can be repeated)
+- **--additional-intervals** - More Unicode intervals as min,max (you can use this more than one time)
 
 #### Examples
 
@@ -317,7 +318,7 @@ my-font-18/
 ├── ...
 ```
 
-Copy the entire folder(s) to `/config/fonts/` on your SD card.
+Copy the full folder or folders to `/config/fonts/` on your SD card.
 
 ### Recommended Font Sizes
 
@@ -328,7 +329,7 @@ Copy the entire folder(s) to `/config/fonts/` on your SD card.
 
 ### Using Custom Fonts in Themes
 
-Once you've created your font files, reference them in your theme configuration:
+After you make your font files, refer to them in your theme configuration:
 
 ```ini
 [fonts]
@@ -337,7 +338,7 @@ reader_font_medium = my-font-16
 reader_font_large = my-font-18
 ```
 
-Each font family name must match a directory name under `/config/fonts/`. You can use the same font for all sizes, or different fonts for each size.
+Each font family name must match a directory name in `/config/fonts/`. You can use the same font for all sizes, or different fonts for each size.
 
 ### Supported Characters
 
@@ -348,16 +349,16 @@ By default, the font converter includes:
 - Latin Extended-A/B - Eastern European languages
 - Latin Extended Additional - Vietnamese characters
 - General punctuation - smart quotes, dashes, ellipsis
-- Common currency symbols
+- Usual currency symbols
 - Cyrillic characters
 - Combining diacritical marks
 - Math operators and arrows
 
-The built-in fonts include Vietnamese diacritics natively, so no custom font is needed. If you prefer a different typeface, Vietnamese fonts work with standard `.epdfont` format since they use Latin script with additional diacritics.
+The built-in fonts include Vietnamese diacritics. You do not need a custom font. If you want a different typeface, Vietnamese fonts operate with standard `.epdfont` format. They use Latin script with more diacritics.
 
 ### Thai Fonts
 
-The built-in fonts include Thai script natively, so no custom font is needed. If you prefer a different typeface, Thai fonts can be generated using the `--thai` flag:
+The built-in fonts include Thai script. You do not need a custom font. If you want a different typeface, you can make Thai fonts with the `--thai` flag:
 
 ```bash
 # Thai font with Thai script support
@@ -366,7 +367,7 @@ uv run scripts/fontconvert.py noto-sans-thai -r NotoSansThai-Regular.ttf --2bit 
 
 ### Arabic Fonts
 
-The built-in fonts include Arabic script natively, so no custom font is needed. Arabic text in books is automatically shaped (contextual letter forms, Lam-Alef ligatures) and rendered right-to-left. Arabic support is available in reader mode for book text only (not in the UI). If you prefer a different typeface, Arabic fonts can be generated using the `--arabic` flag:
+The built-in fonts include Arabic script. You do not need a custom font. Arabic text in books is shaped (contextual letter forms, Lam-Alef ligatures) and shown right-to-left. Arabic support is available in reader mode for book text only (not in the UI). If you want a different typeface, you can make Arabic fonts with the `--arabic` flag:
 
 ```bash
 # Arabic font with Arabic script support
@@ -375,31 +376,73 @@ uv run scripts/fontconvert.py noto-sans-arabic -r NotoSansArabic-Regular.ttf -b 
 
 ### CJK Fonts
 
-The ESP32-C3 has limited RAM (~380KB), so CJK fonts require external `.bin` format which streams glyphs from SD card. CJK fonts are supported for book text (reading view) only — UI elements (home screen, status bar, book title overlay) use built-in fonts without CJK glyphs. Pre-converted CJK fonts are available in the `docs/examples/fonts/` directory. To convert your own CJK fonts, use `scripts/gen_cjk_theme.sh` (auto-downloads the converter binary) — see the [Fonts Guide: CJK section](fonts.md#cjk-fonts-chinesejapanesekorean) for details.
+The ESP32-C3 has limited RAM (approximately 380KB). CJK fonts need the external `.bin` format, which streams glyphs from the SD card. CJK fonts are supported for book text (reading view) only. UI elements (home screen, status bar, book title overlay) use built-in fonts with no CJK glyphs. Pre-converted CJK fonts are in the `docs/examples/fonts/` directory.
+
+To convert your CJK fonts, use `scripts/gen_cjk_theme.sh` (downloads the converter binary). See the [Fonts Guide: CJK section](fonts.md#cjk-fonts-chinesejapanesekorean) for more data.
 
 ### Fallback Behavior
 
-If a custom font file is missing, corrupted, or exceeds size limits:
+If a custom font file is missing, damaged, or above size limits:
 
-- The device automatically falls back to built-in fonts
+- The device uses built-in fonts
 - Console shows which font failed and why
 
 **Size limits:**
-- `.epdfont` files: max 512KB bitmap data
-- `.bin` external fonts: max 32MB file size, max 64x64 pixel glyphs
+- `.epdfont` files: maximum 512KB bitmap data
+- `.bin` external fonts: maximum 32MB file size, maximum 64x64 pixel glyphs
 
 Built-in fonts are always available:
 - **Reader** - Reader font (3 sizes) with Latin, Cyrillic, Vietnamese, Thai, Greek, and Arabic coverage
 - **UI** - UI font with Latin, Cyrillic, Vietnamese, Thai, Greek, and Arabic coverage
 - **Small** - Small text
 
-> **Note:** Custom font loading is optional. The device works perfectly with built-in fonts if no custom fonts are configured.
+> **Note:** Custom font load is optional. The device operates fully with built-in fonts if no custom fonts are set.
+
+---
+
+## Custom Sleep Screens
+
+Run these commands from the repository root. Install the script dependencies first:
+
+```bash
+npm --prefix scripts install
+```
+
+Set `--bits` to `2` or `8` for firmware-compatible output. The script defaults to 4-bit BMP, which the firmware rejects.
+
+```bash
+make sleep-screen INPUT=photo.jpg OUTPUT=sleep.bmp ARGS='--bits 8'
+make sleep-screen INPUT=photo.jpg OUTPUT=sleep.bmp ARGS='--dither --bits 8'
+```
+
+Conversion options:
+
+- `--orientation portrait|landscape`: Output orientation. Default: `portrait`.
+- `--bits 2|4|8`: Script output depth. Use `2` or `8` for the reader.
+- `--dither`: Apply Floyd–Steinberg dithering.
+- `--fit contain|cover|stretch`: Resize method. Default: `contain`.
+
+To use the script directly:
+
+```bash
+node scripts/create-sleep-screen.mjs photo.jpg sleep.bmp --dither --bits 8
+```
+
+See [sleep screen setup](user_guide.md#37-sleep-screen) for SD locations, image selection, and device settings.
+
+## Firmware Updates
+
+See the [firmware update guide](user_guide.md#firmware-update) and [update compatibility](device-support-matrix.md#firmware-update-compatibility).
+
+### Emergency Recovery
+
+Do not remove power or the SD card during recovery. See [firmware recovery](troubleshooting.md#firmware-recovery) for prerequisites and instructions.
 
 ---
 
 ## SD Card Structure
 
-Here's the complete SD card structure for customization:
+This is the full SD card structure for customization:
 
 ```
 /
@@ -415,8 +458,10 @@ Here's the complete SD card structure for customization:
 │       │   └── bold.epdfont       # optional
 │       └── my-ui-font/
 │           └── regular.epdfont
-├── sleep.bmp              # Custom sleep image (optional)
-└── sleep/                 # Multiple sleep images (optional)
+├── firmware.bin            # Firmware update file
+├── force_update.bin        # Emergency auto-flash on boot
+├── sleep.bmp                # Custom sleep image (optional)
+└── sleep/                   # Multiple sleep images (optional)
     ├── image1.bmp
     └── image2.bmp
 ```
@@ -425,7 +470,7 @@ Here's the complete SD card structure for customization:
 
 ## Example Files
 
-The repository includes example theme and font files in [`docs/examples/`](examples/):
+The repository includes example theme files and font files in [`docs/examples/`](examples/):
 
 **Themes:**
 - **`light-noto-serif.theme`** - Light theme with Noto Serif reader fonts (Latin script)
@@ -454,8 +499,8 @@ The repository includes example theme and font files in [`docs/examples/`](examp
 
 To use a theme:
 1. Copy the `.theme` file to `/config/themes/` on your SD card
-2. Copy the corresponding font folders to `/config/fonts/` on your SD card
-3. Select the theme in **Settings > Reader > Theme**
+2. Copy the related font folders to `/config/fonts/` on your SD card
+3. Select the theme in **Settings > Screen > Theme**
 
 ### Font Attribution
 

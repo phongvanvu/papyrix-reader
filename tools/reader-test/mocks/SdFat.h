@@ -70,13 +70,15 @@ class FsFile : public Print {
     return true;
   }
 
-  void close() {
+  bool close() {
+    bool result = true;
     if (fp_) {
-      fclose(fp_);
+      result = fclose(fp_) == 0;
       fp_ = nullptr;
     }
     isOpen_ = false;
     fileSize_ = 0;
+    return result;
   }
 
   int read() {
@@ -108,6 +110,11 @@ class FsFile : public Print {
     return w;
   }
 
+  // Overload matching SdFat's char* signature (used by Fb2 section file generation).
+  size_t write(const char* buf, size_t len) {
+    return write(reinterpret_cast<const uint8_t*>(buf), len);
+  }
+
   bool seek(size_t pos) {
     if (!fp_) return false;
     return fseek(fp_, static_cast<long>(pos), SEEK_SET) == 0;
@@ -137,6 +144,8 @@ class FsFile : public Print {
     size_t pos = ftell(fp_);
     return static_cast<int>(fileSize_ - pos);
   }
+
+  bool sync() { return fp_ && fflush(fp_) == 0; }
 
   bool isOpen() const { return isOpen_; }
   operator bool() const { return isOpen_; }

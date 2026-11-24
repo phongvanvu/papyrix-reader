@@ -1,17 +1,28 @@
 #include "Fb2Parser.h"
 
+#include <BuildArena.h>
+#include <EncodingDetector.h>
 #include <ExpatEncodingHandler.h>
 #include <GfxRenderer.h>
 #include <Hyphenation.h>
 #include <Logging.h>
 #include <Page.h>
 #include <ParsedText.h>
+#include <ParserScratch.h>
 #include <SDCardManager.h>
 #include <Utf8.h>
+#include <core/PerfLog.h>
+#include <esp_heap_caps.h>
+
+#ifdef ARDUINO
+#include <esp_task_wdt.h>
+#endif
 
 #define TAG "FB2_PARSE"
 
 #include <cstring>
+#include <memory>
+#include <new>
 #include <utility>
 
 namespace {
@@ -23,6 +34,45 @@ const char* stripNamespace(const char* name) {
   const char* local = strrchr(name, ':');
   return local ? local + 1 : name;
 }
+
+const char* PARAGRAPH_TAGS[] = {"v", "text-author"};
+constexpr int NUM_PARAGRAPH_TAGS = sizeof(PARAGRAPH_TAGS) / sizeof(PARAGRAPH_TAGS[0]);
+
+const char* BLOCK_TAGS[] = {"poem", "stanza", "cite", "epigraph", "annotation"};
+constexpr int NUM_BLOCK_TAGS = sizeof(BLOCK_TAGS) / sizeof(BLOCK_TAGS[0]);
+
+bool matches(const char* tag, const char* tags[], int count) {
+  for (int i = 0; i < count; i++) {
+    if (strcmp(tag, tags[i]) == 0) return true;
+  }
+  return false;
+}
+
+class ScratchReporter {
+ public:
+  ScratchReporter(const char* tag, BuildArena& arena, uint32_t started)
+      : tag_(tag),
+        arena_(arena),
+        started_(started),
+        freeBefore_(heap_caps_get_free_size(MALLOC_CAP_8BIT)),
+        largestBefore_(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)) {}
+
+  ~ScratchReporter() {
+    LOG_DBG(tag_,
+            "Scratch high=%zu/%zu failed=%zu fallbacks=%u scope_failures=%u "
+            "heap=%zu->%zu largest=%zu->%zu elapsed=%lu ms",
+            arena_.highWater(), arena_.capacity(), arena_.failedAllocSize(), arena_.fallbackCount(),
+            arena_.scopeFailureCount(), freeBefore_, heap_caps_get_free_size(MALLOC_CAP_8BIT), largestBefore_,
+            heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), static_cast<unsigned long>(millis() - started_));
+  }
+
+ private:
+  const char* tag_;
+  BuildArena& arena_;
+  uint32_t started_;
+  size_t freeBefore_;
+  size_t largestBefore_;
+};
 }  // namespace
 
 Fb2Parser::Fb2Parser(std::string filepath, GfxRenderer& renderer, const RenderConfig& config,
@@ -34,6 +84,9 @@ Fb2Parser::~Fb2Parser() {
     XML_ParserFree(xmlParser_);
     xmlParser_ = nullptr;
   }
+  if (resumeFile_) {
+    resumeFile_.close();
+  }
 }
 
 void Fb2Parser::reset() {
@@ -41,8 +94,13 @@ void Fb2Parser::reset() {
     XML_ParserFree(xmlParser_);
     xmlParser_ = nullptr;
   }
+  if (resumeFile_) {
+    resumeFile_.close();
+  }
+  bomSkip_ = 0;
   hasMore_ = true;
   isRtl_ = false;
+  buildScratch_ = nullptr;
   stopRequested_ = false;
   depth_ = 0;
   skipUntilDepth_ = INT_MAX;
@@ -61,19 +119,24 @@ void Fb2Parser::reset() {
   currentPageNextY_ = 0;
   pagesCreated_ = 0;
   hitMaxPages_ = false;
+  pendingSpacing_ = 0;
   fileSize_ = 0;
+  bytesConsumed_ = 0;
   anchorMap_.clear();
 }
 
-bool Fb2Parser::parsePages(const std::function<void(std::unique_ptr<Page>)>& onPageComplete, uint16_t maxPages,
+bool Fb2Parser::parsePages(const std::function<void(std::unique_ptr<Page>)>& onPageComplete, uint32_t maxPages,
                            const AbortCallback& shouldAbort) {
-  FsFile file;
-  if (!SdMan.openFileForRead("FB2", filepath_, file)) {
-    LOG_ERR(TAG, "Failed to open file: %s", filepath_.c_str());
-    return false;
-  }
+  const uint32_t scratchStarted = millis();
+  ParserScratch scratchBuffer(renderer_.getFrameBuffer(), renderer_.getBufferSize());
+  BuildArena scratch(scratchBuffer.data(), scratchBuffer.capacity());
+  ScratchReporter scratchReporter(TAG, scratch, scratchStarted);
+  buildScratch_ = &scratch;
+  struct ClearScratch {
+    BuildArena*& slot;
+    ~ClearScratch() { slot = nullptr; }
+  } clearScratch{buildScratch_};
 
-  fileSize_ = file.size();
   onPageComplete_ = onPageComplete;
   maxPages_ = maxPages;
   pagesCreated_ = 0;
@@ -83,61 +146,132 @@ bool Fb2Parser::parsePages(const std::function<void(std::unique_ptr<Page>)>& onP
 
   Hyphenation::setLanguage(language_);
 
-  // Single buffer reused for RTL peek and parsing (saves 4KB stack)
-  uint8_t buffer[READ_CHUNK_SIZE + 1];
-
-  // RTL detection on first chunk
-  size_t peekBytes = file.read(buffer, READ_CHUNK_SIZE);
-  if (peekBytes > 0) {
-    buffer[peekBytes] = '\0';
-    isRtl_ = ScriptDetector::containsArabic(reinterpret_cast<const char*>(buffer));
+  // Keep the 4 KB read buffer off the stack: the foreground "page not cached"
+  // render runs this whole parse -> layout -> font-render chain on the 8 KB
+  // loopTask stack, where an on-stack buffer this size overflows it (Issue #137).
+  auto inputScope = scratch.scope();
+  std::unique_ptr<uint8_t[]> ownedBuffer;
+  uint8_t* buffer = scratch.allocArray<uint8_t>(READ_CHUNK_SIZE + 1);
+  if (!buffer) {
+    inputScope.release();
+    scratch.noteFallback(READ_CHUNK_SIZE + 1);
+    ownedBuffer.reset(new (std::nothrow) uint8_t[READ_CHUNK_SIZE + 1]);
+    buffer = ownedBuffer.get();
   }
-  file.seekSet(0);
-
-  // Create Expat parser
-  xmlParser_ = XML_ParserCreate(nullptr);
-  if (!xmlParser_) {
-    LOG_ERR(TAG, "Failed to create XML parser");
-    file.close();
+  if (!buffer) {
+    LOG_ERR(TAG, "Failed to allocate read buffer");
     return false;
   }
 
-  XML_SetUserData(xmlParser_, this);
-  XML_SetUnknownEncodingHandler(xmlParser_, expatUnknownEncodingHandler, nullptr);
-  XML_SetElementHandler(xmlParser_, startElement, endElement);
-  XML_SetCharacterDataHandler(xmlParser_, characterData);
+  // RESUME PATH: parser suspended from previous maxPages stop
+  if (xmlParser_ && resumeFile_) {
+    LOG_DBG(TAG, "Resuming parse from previous position");
 
-  startNewPage();
-  uint16_t abortCheckCounter = 0;
+    if (pendingSpacing_ > 0) {
+      currentPageNextY_ += pendingSpacing_;
+      pendingSpacing_ = 0;
+    }
+    if (currentTextBlock_) {
+      if (currentTextBlock_->isEmpty()) {
+        currentTextBlock_.reset();
+      } else {
+        makePages();
+        if (stopRequested_) return true;
+      }
+    }
 
-  while (file.available() > 0) {
-    if (shouldAbort_ && (++abortCheckCounter % 10 == 0) && shouldAbort_()) {
-      LOG_INF(TAG, "Aborted by external request");
+    auto status = XML_ResumeParser(xmlParser_);
+    if (status == XML_STATUS_ERROR) {
+      LOG_ERR(TAG, "Resume parse error: %s", XML_ErrorString(XML_GetErrorCode(xmlParser_)));
+      bytesConsumed_ = static_cast<uint32_t>(XML_GetCurrentByteIndex(xmlParser_)) + static_cast<uint32_t>(bomSkip_);
       XML_ParserFree(xmlParser_);
       xmlParser_ = nullptr;
-      file.close();
+      resumeFile_.close();
+      return false;
+    }
+    if (status == XML_STATUS_SUSPENDED || stopRequested_) {
+      bytesConsumed_ = static_cast<uint32_t>(XML_GetCurrentByteIndex(xmlParser_)) + static_cast<uint32_t>(bomSkip_);
+      hasMore_ = true;
+      return true;
+    }
+  } else {
+    // INIT PATH: open file, detect encoding, create parser
+    if (resumeFile_) resumeFile_.close();
+
+    if (!SdMan.openFileForRead("FB2", filepath_, resumeFile_)) {
+      LOG_ERR(TAG, "Failed to open file: %s", filepath_.c_str());
+      return false;
+    }
+
+    fileSize_ = resumeFile_.size();
+
+    size_t peekBytes = resumeFile_.read(buffer, READ_CHUNK_SIZE);
+    const char* explicitEncoding = nullptr;
+    bomSkip_ = 0;
+    if (peekBytes > 0) {
+      buffer[peekBytes] = '\0';
+      if (detectEncoding(buffer, peekBytes, bomSkip_) == Encoding::Utf8) {
+        explicitEncoding = "UTF-8";
+      }
+    }
+    resumeFile_.seekSet(bomSkip_);
+
+    xmlParser_ = XML_ParserCreate(explicitEncoding);
+    if (!xmlParser_) {
+      LOG_ERR(TAG, "Failed to create XML parser");
+      resumeFile_.close();
+      return false;
+    }
+
+    XML_SetUserData(xmlParser_, this);
+    XML_SetUnknownEncodingHandler(xmlParser_, expatUnknownEncodingHandler, nullptr);
+    XML_SetElementHandler(xmlParser_, startElement, endElement);
+    XML_SetCharacterDataHandler(xmlParser_, characterData);
+
+    startNewPage();
+  }
+
+  uint16_t abortCheckCounter = 0;
+
+  while (resumeFile_.available() > 0) {
+    if (++abortCheckCounter % 10 == 0) {
+#ifdef ARDUINO
+      if (esp_task_wdt_status(nullptr) == ESP_OK) esp_task_wdt_reset();
+#endif
+    }
+    if (shouldAbort_ && (abortCheckCounter % 10 == 0) && shouldAbort_()) {
+      LOG_INF(TAG, "Aborted by external request");
+      bytesConsumed_ = static_cast<uint32_t>(XML_GetCurrentByteIndex(xmlParser_)) + static_cast<uint32_t>(bomSkip_);
+      XML_ParserFree(xmlParser_);
+      xmlParser_ = nullptr;
+      resumeFile_.close();
       hasMore_ = true;
       return false;
     }
 
-    size_t bytesRead = file.read(buffer, READ_CHUNK_SIZE);
+    size_t bytesRead = resumeFile_.read(buffer, READ_CHUNK_SIZE);
     if (bytesRead == 0) break;
 
-    int done = (file.available() == 0) ? 1 : 0;
-    if (XML_Parse(xmlParser_, reinterpret_cast<const char*>(buffer), static_cast<int>(bytesRead), done) ==
-        XML_STATUS_ERROR) {
+    int done = (resumeFile_.available() == 0) ? 1 : 0;
+    auto status = XML_Parse(xmlParser_, reinterpret_cast<const char*>(buffer), static_cast<int>(bytesRead), done);
+    if (status == XML_STATUS_ERROR) {
       LOG_ERR(TAG, "Parse error at line %lu: %s", XML_GetCurrentLineNumber(xmlParser_),
               XML_ErrorString(XML_GetErrorCode(xmlParser_)));
+      bytesConsumed_ = static_cast<uint32_t>(XML_GetCurrentByteIndex(xmlParser_)) + static_cast<uint32_t>(bomSkip_);
       XML_ParserFree(xmlParser_);
       xmlParser_ = nullptr;
-      file.close();
+      resumeFile_.close();
       return false;
     }
 
+    if (status == XML_STATUS_SUSPENDED) {
+      bytesConsumed_ = static_cast<uint32_t>(XML_GetCurrentByteIndex(xmlParser_)) + static_cast<uint32_t>(bomSkip_);
+      hasMore_ = true;
+      return true;
+    }
+
     if (stopRequested_) {
-      XML_ParserFree(xmlParser_);
-      xmlParser_ = nullptr;
-      file.close();
+      bytesConsumed_ = static_cast<uint32_t>(XML_GetCurrentByteIndex(xmlParser_)) + static_cast<uint32_t>(bomSkip_);
       hasMore_ = true;
       return true;
     }
@@ -155,14 +289,15 @@ bool Fb2Parser::parsePages(const std::function<void(std::unique_ptr<Page>)>& onP
     pagesCreated_++;
   }
 
+  bytesConsumed_ = static_cast<uint32_t>(XML_GetCurrentByteIndex(xmlParser_)) + static_cast<uint32_t>(bomSkip_);
   XML_ParserFree(xmlParser_);
   xmlParser_ = nullptr;
-  file.close();
+  resumeFile_.close();
   currentTextBlock_.reset();
   currentPage_.reset();
   hasMore_ = false;
 
-  LOG_INF(TAG, "Parsed %d pages from %s", pagesCreated_, filepath_.c_str());
+  LOG_INF(TAG, "Parsed %u pages from %s", pagesCreated_, filepath_.c_str());
   return true;
 }
 
@@ -211,18 +346,17 @@ void XMLCALL Fb2Parser::startElement(void* userData, const XML_Char* name, const
       if (self->currentPage_ && !self->currentPage_->elements.empty()) {
         self->onPageComplete_(std::move(self->currentPage_));
         self->pagesCreated_++;
-        if (self->maxPages_ > 0 && self->pagesCreated_ >= self->maxPages_) {
-          self->hitMaxPages_ = true;
-          self->stopRequested_ = true;
-          self->depth_++;
-          return;
-        }
       }
       self->startNewPage();
     }
     self->firstSection_ = false;
     // Record anchor for TOC navigation: section_N → page where this section starts
     self->anchorMap_.emplace_back("section_" + std::to_string(self->sectionCounter_ - 1), self->pagesCreated_);
+    if (self->maxPages_ > 0 && self->pagesCreated_ >= self->maxPages_ && !self->stopRequested_) {
+      self->hitMaxPages_ = true;
+      self->stopRequested_ = true;
+      XML_StopParser(self->xmlParser_, XML_TRUE);
+    }
   } else if (strcmp(localName, "title") == 0) {
     self->inTitle_ = true;
     self->boldUntilDepth_ = std::min(self->boldUntilDepth_, self->depth_);
@@ -248,8 +382,13 @@ void XMLCALL Fb2Parser::startElement(void* userData, const XML_Char* name, const
       self->startNewTextBlock(style);
     }
   } else if (strcmp(localName, "emphasis") == 0) {
+    self->flushPartWordBuffer();
+    self->italicUntilDepth_ = std::min(self->italicUntilDepth_, self->depth_);
+  } else if (strcmp(localName, "code") == 0) {
+    self->flushPartWordBuffer();
     self->italicUntilDepth_ = std::min(self->italicUntilDepth_, self->depth_);
   } else if (strcmp(localName, "strong") == 0) {
+    self->flushPartWordBuffer();
     self->boldUntilDepth_ = std::min(self->boldUntilDepth_, self->depth_);
   } else if (strcmp(localName, "empty-line") == 0) {
     self->flushPartWordBuffer();
@@ -259,6 +398,17 @@ void XMLCALL Fb2Parser::startElement(void* userData, const XML_Char* name, const
     self->addVerticalSpacing(1);
   } else if (strcmp(localName, "image") == 0) {
     // Skip images in v1
+  } else if (matches(localName, PARAGRAPH_TAGS, NUM_PARAGRAPH_TAGS)) {
+    self->inParagraph_ = true;
+    if (!self->currentTextBlock_) {
+      self->startNewTextBlock(TextBlock::LEFT_ALIGN);
+    }
+  } else if (matches(localName, BLOCK_TAGS, NUM_BLOCK_TAGS)) {
+    self->flushPartWordBuffer();
+    if (self->currentTextBlock_ && !self->currentTextBlock_->isEmpty()) {
+      self->makePages();
+    }
+    self->addVerticalSpacing(1);
   }
 
   self->depth_++;
@@ -268,9 +418,12 @@ void XMLCALL Fb2Parser::endElement(void* userData, const XML_Char* name) {
   auto* self = static_cast<Fb2Parser*>(userData);
   const char* localName = stripNamespace(name);
 
+  if (strcmp(localName, "emphasis") == 0 || strcmp(localName, "code") == 0 || strcmp(localName, "strong") == 0) {
+    self->flushPartWordBuffer();
+  }
+
   self->depth_--;
 
-  // Check bold/italic depth AFTER decrementing (depth_ now matches startElement's value)
   if (self->depth_ <= self->boldUntilDepth_) {
     self->boldUntilDepth_ = INT_MAX;
   }
@@ -315,6 +468,18 @@ void XMLCALL Fb2Parser::endElement(void* userData, const XML_Char* name) {
     if (self->currentTextBlock_ && !self->currentTextBlock_->isEmpty()) {
       self->makePages();
     }
+  } else if (matches(localName, PARAGRAPH_TAGS, NUM_PARAGRAPH_TAGS)) {
+    self->inParagraph_ = false;
+    self->flushPartWordBuffer();
+    if (self->currentTextBlock_ && !self->currentTextBlock_->isEmpty()) {
+      self->makePages();
+    }
+  } else if (matches(localName, BLOCK_TAGS, NUM_BLOCK_TAGS)) {
+    self->flushPartWordBuffer();
+    if (self->currentTextBlock_ && !self->currentTextBlock_->isEmpty()) {
+      self->makePages();
+    }
+    self->addVerticalSpacing(1);
   }
 }
 
@@ -348,11 +513,18 @@ void Fb2Parser::flushPartWordBuffer() {
 
   partWordBuffer_[partWordBufferIndex_] = '\0';
   partWordBufferIndex_ = static_cast<int>(utf8NormalizeNfc(partWordBuffer_, partWordBufferIndex_));
+
+  if (!isRtl_ && ScriptDetector::classify(partWordBuffer_) == ScriptDetector::Script::ARABIC) {
+    isRtl_ = true;
+    currentTextBlock_->setRtl(true);
+  }
+
   currentTextBlock_->addWord(partWordBuffer_, getCurrentFontFamily());
   partWordBufferIndex_ = 0;
 }
 
 void Fb2Parser::startNewTextBlock(TextBlock::BLOCK_STYLE style) {
+  if (stopRequested_) return;
   if (currentTextBlock_) {
     if (currentTextBlock_->isEmpty()) {
       currentTextBlock_->setStyle(style);
@@ -375,6 +547,7 @@ void Fb2Parser::makePages() {
   const int lineHeight = static_cast<int>(renderer_.getLineHeight(config_.fontId) * config_.lineCompression);
   bool continueProcessing = true;
 
+  const uint32_t layoutStarted = perfMsNow();
   currentTextBlock_->layoutAndExtractLines(
       renderer_, config_.fontId, config_.viewportWidth,
       [this, &continueProcessing](const std::shared_ptr<TextBlock>& line) {
@@ -384,9 +557,10 @@ void Fb2Parser::makePages() {
           continueProcessing = false;
         }
       },
-      true, [&continueProcessing]() -> bool { return !continueProcessing; });
+      true, [this, &continueProcessing]() -> bool { return !continueProcessing || (shouldAbort_ && shouldAbort_()); },
+      buildScratch_);
+  readerPerfLog("fb2-layout", layoutStarted);
 
-  // Paragraph spacing (same pattern as PlainTextParser/ChapterHtmlSlimParser)
   if (!hitMaxPages_) {
     switch (config_.spacingLevel) {
       case 1:
@@ -397,8 +571,16 @@ void Fb2Parser::makePages() {
         break;
     }
     currentTextBlock_.reset();
+  } else if (currentTextBlock_->isEmpty()) {
+    switch (config_.spacingLevel) {
+      case 1:
+        pendingSpacing_ = lineHeight / 4;
+        break;
+      case 3:
+        pendingSpacing_ = lineHeight;
+        break;
+    }
   }
-  // else: currentTextBlock_ still has unconsumed words — preserve for next batch
 }
 
 void Fb2Parser::addLineToPage(std::shared_ptr<TextBlock> line) {
@@ -416,6 +598,9 @@ void Fb2Parser::addLineToPage(std::shared_ptr<TextBlock> line) {
     if (maxPages_ > 0 && pagesCreated_ >= maxPages_) {
       hitMaxPages_ = true;
       stopRequested_ = true;
+      XML_ParsingStatus status;
+      XML_GetParsingStatus(xmlParser_, &status);
+      if (status.parsing != XML_SUSPENDED) XML_StopParser(xmlParser_, XML_TRUE);
     }
   }
 

@@ -1,14 +1,16 @@
 /**
  * Fb2.cpp
  *
- * FictionBook 2.0 XML e-book handler implementation for Papyrix Reader
+ * FictionBook 2.0 XML e-book handler implementation for PapyriX Reader
  */
 
 #include "Fb2.h"
 
 #include <CoverHelpers.h>
+#include <EncodingDetector.h>
 #include <ExpatEncodingHandler.h>
 #include <FsHelpers.h>
+#include <ImageConverter.h>
 #include <Logging.h>
 
 #include "Base64Decoder.h"
@@ -20,8 +22,11 @@
 #include <cstring>
 
 namespace {
-constexpr uint8_t kMetaCacheVersion = 4;
+constexpr uint8_t kMetaCacheVersion = 6;
 constexpr char kMetaCacheFile[] = "/meta.bin";
+constexpr char kSectionFilePrefix[] = "/section_";
+constexpr char kSectionFileSuffix[] = ".fb2";
+constexpr char kSectionCacheMarker[] = "/.section_cache_v2";
 }  // namespace
 
 std::string Fb2::metaCachePath() const { return cachePath + kMetaCacheFile; }
@@ -64,9 +69,12 @@ bool Fb2::load() {
   }
 
   // Try loading from metadata cache first
-  if (loadMetaCache()) {
+  if (loadMetaCache() && !sectionOffsets_.empty()) {
     loaded = true;
     LOG_INF(TAG, "Loaded from cache: %s (title: '%s', author: '%s')", filepath.c_str(), title.c_str(), author.c_str());
+    if (!generateSectionFiles()) {
+      LOG_ERR(TAG, "Failed to generate section files (cache path)");
+    }
     return true;
   }
 
@@ -79,13 +87,27 @@ bool Fb2::load() {
   fileSize = file.size();
   file.close();
 
+  // Clear author before re-parsing — unlike title/language (cleared by their start
+  // tags), author uses += accumulation and would duplicate if already set from cache
+  author.clear();
+
   // Stream-parse in chunks (file may exceed available RAM)
   if (!parseXmlStream()) {
     LOG_ERR(TAG, "Failed to parse XML");
     return false;
   }
 
+  if (!scanSectionOffsets()) {
+    LOG_ERR(TAG, "Failed to scan section offsets");
+  }
+
+  filterNestedSections();
+
   saveMetaCache();
+
+  if (!generateSectionFiles()) {
+    LOG_ERR(TAG, "Failed to generate section files");
+  }
 
   // Free TOC strings, rebuild as compact LUT from cache
   std::vector<TocItem>().swap(tocItems_);
@@ -94,7 +116,40 @@ bool Fb2::load() {
   }
 
   loaded = true;
-  LOG_INF(TAG, "Loaded FB2: %s (title: '%s', author: '%s')", filepath.c_str(), title.c_str(), author.c_str());
+  LOG_INF(TAG, "Loaded FB2: %s (title: '%s', author: '%s', sections: %u)", filepath.c_str(), title.c_str(),
+          author.c_str(), static_cast<unsigned int>(sectionOffsets_.size()));
+  return true;
+}
+
+bool Fb2::loadMetadataOnly() {
+  LOG_INF(TAG, "Loading metadata only: %s", filepath.c_str());
+
+  if (!SdMan.exists(filepath.c_str())) {
+    LOG_ERR(TAG, "File does not exist");
+    return false;
+  }
+
+  if (loadMetaCache()) {
+    return true;
+  }
+
+  FsFile file;
+  if (!SdMan.openFileForRead("FB2", filepath, file)) {
+    LOG_ERR(TAG, "Failed to open file");
+    return false;
+  }
+  fileSize = file.size();
+  file.close();
+
+  metadataOnly_ = true;
+  bool ok = parseXmlStream();
+  metadataOnly_ = false;
+
+  if (!ok) {
+    return false;
+  }
+
+  saveMetaCache();
   return true;
 }
 
@@ -218,6 +273,10 @@ void XMLCALL Fb2::endElement(void* userData, const XML_Char* name) {
 
   if (strcmp(tag, "title-info") == 0) {
     self->inTitleInfo = false;
+    if (self->metadataOnly_) {
+      XML_StopParser(self->xmlParser_, XML_FALSE);
+      return;
+    }
   }
 
   if (strcmp(tag, "book-title") == 0) {
@@ -321,7 +380,22 @@ bool Fb2::parseXmlStream() {
     return false;
   }
 
-  xmlParser_ = XML_ParserCreate(nullptr);
+  constexpr size_t kChunkSize = 4096;
+  uint8_t buffer[kChunkSize];
+
+  // Peek first chunk for encoding detection. If bytes are actually UTF-8,
+  // force Expat to UTF-8 even when the declaration says CP1251/KOI8-R
+  // (mis-declared files). Genuine single-byte encodings fall through to the
+  // expatUnknownEncodingHandler path below.
+  const size_t peekBytes = file.read(buffer, kChunkSize);
+  const char* explicitEncoding = nullptr;
+  size_t bomSkip = 0;
+  if (peekBytes > 0 && detectEncoding(buffer, peekBytes, bomSkip) == Encoding::Utf8) {
+    explicitEncoding = "UTF-8";
+  }
+  file.seek(bomSkip);
+
+  xmlParser_ = XML_ParserCreate(explicitEncoding);
   if (!xmlParser_) {
     LOG_ERR(TAG, "Failed to create XML parser");
     file.close();
@@ -333,8 +407,6 @@ bool Fb2::parseXmlStream() {
   XML_SetElementHandler(xmlParser_, startElement, endElement);
   XML_SetCharacterDataHandler(xmlParser_, characterData);
 
-  constexpr size_t kChunkSize = 4096;
-  uint8_t buffer[kChunkSize];
   bool success = true;
 
   while (file.available() > 0) {
@@ -344,6 +416,9 @@ bool Fb2::parseXmlStream() {
     const int done = (file.available() == 0) ? 1 : 0;
     if (XML_Parse(xmlParser_, reinterpret_cast<const char*>(buffer), static_cast<int>(bytesRead), done) ==
         XML_STATUS_ERROR) {
+      if (metadataOnly_ && XML_GetErrorCode(xmlParser_) == XML_ERROR_ABORTED) {
+        break;
+      }
       LOG_ERR(TAG, "XML parse error: %s", XML_ErrorString(XML_GetErrorCode(xmlParser_)));
       success = false;
       break;
@@ -359,6 +434,399 @@ bool Fb2::parseXmlStream() {
   XML_ParserFree(xmlParser_);
   xmlParser_ = nullptr;
   return success;
+}
+
+bool Fb2::scanSectionOffsets() {
+  LOG_INF(TAG, "Scanning section offsets");
+
+  FsFile file;
+  if (!SdMan.openFileForRead("FB2", filepath, file)) {
+    return false;
+  }
+
+  constexpr size_t kChunkSize = 4096;
+  uint8_t buffer[kChunkSize];
+
+  const size_t peekBytes = file.read(buffer, kChunkSize);
+  const char* explicitEncoding = nullptr;
+  size_t bomSkip = 0;
+  if (peekBytes > 0 && detectEncoding(buffer, peekBytes, bomSkip) == Encoding::Utf8) {
+    explicitEncoding = "UTF-8";
+  }
+  file.seek(bomSkip);
+
+  struct SectionScanCtx {
+    std::vector<SectionOffset>* offsets;
+    int depth = 0;
+    int skipUntilDepth = INT_MAX;
+    bool inBody = false;
+    int bodyCount = 0;
+    XML_Parser parser = nullptr;
+    std::vector<int> sectionStack;  // Tracks open <section> → section index
+  };
+
+  SectionScanCtx ctx;
+  ctx.offsets = &sectionOffsets_;
+  sectionOffsets_.clear();
+
+  XML_Parser parser = XML_ParserCreate(explicitEncoding);
+  if (!parser) {
+    LOG_ERR(TAG, "Failed to create section scanner parser");
+    file.close();
+    return false;
+  }
+  ctx.parser = parser;
+
+  auto scanStart = [](void* userData, const XML_Char* name, const XML_Char** atts) {
+    (void)atts;
+    auto* c = static_cast<SectionScanCtx*>(userData);
+    c->depth++;
+    if (c->depth >= 100) return;
+    if (c->skipUntilDepth < c->depth) return;
+
+    const char* tag = strrchr(name, ':');
+    if (tag)
+      tag++;
+    else
+      tag = name;
+
+    if (strcmp(tag, "binary") == 0) {
+      c->skipUntilDepth = c->depth - 1;
+      return;
+    }
+    if (strcmp(tag, "body") == 0) {
+      c->bodyCount++;
+      c->inBody = (c->bodyCount == 1);
+      return;
+    }
+    if (strcmp(tag, "section") == 0 && c->inBody) {
+      int64_t byteIdx = XML_GetCurrentByteIndex(c->parser);
+      if (byteIdx >= 0) {
+        SectionOffset off;
+        off.startOffset = static_cast<uint32_t>(byteIdx);
+        c->offsets->push_back(off);
+        c->sectionStack.push_back(static_cast<int>(c->offsets->size()) - 1);
+      }
+    }
+  };
+
+  auto scanEnd = [](void* userData, const XML_Char* name) {
+    auto* c = static_cast<SectionScanCtx*>(userData);
+    const char* tag = strrchr(name, ':');
+    if (tag)
+      tag++;
+    else
+      tag = name;
+
+    if (strcmp(tag, "binary") == 0) {
+      c->skipUntilDepth = INT_MAX;
+    }
+    if (strcmp(tag, "body") == 0) {
+      c->inBody = false;
+    }
+    if (strcmp(tag, "section") == 0 && c->inBody && !c->sectionStack.empty()) {
+      int sectionIdx = c->sectionStack.back();
+      c->sectionStack.pop_back();
+      int64_t byteIdx = XML_GetCurrentByteIndex(c->parser);
+      if (byteIdx >= 0) {
+        // Include the full </name> closing tag (XML_GetCurrentByteIndex points to '<')
+        uint32_t endOffset = static_cast<uint32_t>(byteIdx) + static_cast<uint32_t>(strlen(name)) + 3;
+        (*c->offsets)[sectionIdx].endOffset = endOffset;
+      }
+    }
+    c->depth--;
+  };
+
+  XML_SetUserData(parser, &ctx);
+  XML_SetUnknownEncodingHandler(parser, expatUnknownEncodingHandler, nullptr);
+  XML_SetElementHandler(parser, scanStart, scanEnd);
+
+  bool success = true;
+  while (file.available() > 0) {
+    const size_t bytesRead = file.read(buffer, kChunkSize);
+    if (bytesRead == 0) break;
+    const int done = (file.available() == 0) ? 1 : 0;
+    if (XML_Parse(parser, reinterpret_cast<const char*>(buffer), static_cast<int>(bytesRead), done) ==
+        XML_STATUS_ERROR) {
+      success = false;
+      break;
+    }
+  }
+
+  file.close();
+  XML_ParserFree(parser);
+
+  if (success) {
+    LOG_INF(TAG, "Scanned %u section offsets", static_cast<unsigned int>(sectionOffsets_.size()));
+  }
+  return success;
+}
+
+void Fb2::filterNestedSections() {
+  if (sectionOffsets_.size() <= 1) return;
+
+  const size_t n = sectionOffsets_.size();
+
+  std::vector<bool> isParent(n, false);
+  for (size_t i = 0; i < n; i++) {
+    for (size_t j = 0; j < n; j++) {
+      if (i != j && sectionOffsets_[i].startOffset <= sectionOffsets_[j].startOffset &&
+          sectionOffsets_[i].endOffset >= sectionOffsets_[j].endOffset &&
+          (sectionOffsets_[i].startOffset != sectionOffsets_[j].startOffset ||
+           sectionOffsets_[i].endOffset != sectionOffsets_[j].endOffset)) {
+        isParent[i] = true;
+        break;
+      }
+    }
+  }
+
+  size_t parentCount = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (isParent[i]) parentCount++;
+  }
+  if (parentCount == 0) return;
+
+  // Build remap: old index → new index for leaves
+  std::vector<int> remap(n, -1);
+  int newIndex = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (!isParent[i]) {
+      remap[i] = newIndex++;
+    }
+  }
+
+  // Parent sections → first child leaf
+  for (size_t i = 0; i < n; i++) {
+    if (!isParent[i]) continue;
+    for (size_t j = i + 1; j < n; j++) {
+      if (!isParent[j] && sectionOffsets_[j].startOffset >= sectionOffsets_[i].startOffset &&
+          sectionOffsets_[j].endOffset <= sectionOffsets_[i].endOffset) {
+        remap[i] = remap[j];
+        break;
+      }
+    }
+  }
+
+  for (auto& toc : tocItems_) {
+    if (toc.sectionIndex >= 0 && toc.sectionIndex < static_cast<int>(n)) {
+      toc.sectionIndex = remap[toc.sectionIndex];
+    }
+  }
+
+  std::vector<SectionOffset> filtered;
+  filtered.reserve(n - parentCount);
+  for (size_t i = 0; i < n; i++) {
+    if (!isParent[i]) {
+      filtered.push_back(sectionOffsets_[i]);
+    }
+  }
+  sectionOffsets_ = std::move(filtered);
+
+  LOG_INF(TAG, "Filtered %u parent sections, %u leaf sections remain", static_cast<unsigned int>(parentCount),
+          static_cast<unsigned int>(sectionOffsets_.size()));
+}
+
+bool Fb2::generateSectionFiles() {
+  if (sectionOffsets_.empty()) {
+    LOG_INF(TAG, "No sections to generate");
+    return true;
+  }
+
+  setupCacheDir();
+
+  // Drop stale section files when the cache marker is missing.
+  const std::string markerPath = cachePath + kSectionCacheMarker;
+  if (!SdMan.exists(markerPath.c_str())) {
+    for (size_t i = 0; i < sectionOffsets_.size(); i++) {
+      const std::string oldPath = sectionFilePath(static_cast<int>(i));
+      if (SdMan.exists(oldPath.c_str())) {
+        SdMan.remove(oldPath.c_str());
+      }
+    }
+  }
+
+  std::string xmlDecl = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+  FsFile declFile;
+  if (SdMan.openFileForRead("FB2", filepath, declFile)) {
+    char declBuf[256];
+    size_t declRead = declFile.read(declBuf, sizeof(declBuf));
+    for (size_t j = 0; j + 1 < declRead; j++) {
+      if (declBuf[j] == '?' && declBuf[j + 1] == '>') {
+        xmlDecl.assign(declBuf, j + 2);
+        xmlDecl += "\n";
+        break;
+      }
+    }
+    declFile.close();
+  }
+
+  const std::string wrapperStart =
+      "<FictionBook xmlns=\"http://www.gribuser.ru/xml/fictionbook/2.0\" "
+      "xmlns:l=\"http://www.w3.org/1999/xlink\">\n"
+      "  <body>\n";
+  const std::string wrapperEnd = "  </body>\n</FictionBook>\n";
+
+  // Stored offsets are hints; the actual <section / </section> tag bytes are
+  // authoritative — tolerant of small offset drift (e.g. BOM-stripped expat indices).
+  // We track <section> nesting depth across reads so an inner close tag does not
+  // truncate the outer section's copy.
+  constexpr size_t kStartBackoff = 16;
+  constexpr size_t kAnchorWindowSize = 128;
+  constexpr char kStartTag[] = "<section";
+  constexpr size_t kStartTagLen = sizeof(kStartTag) - 1;
+  constexpr char kEndTag[] = "</section>";
+  constexpr size_t kEndTagLen = sizeof(kEndTag) - 1;
+  constexpr size_t kCopyBufSize = 4096;
+  constexpr uint32_t kCopyOverhead = 1024;
+
+  bool allOk = true;
+  for (size_t i = 0; i < sectionOffsets_.size(); i++) {
+    const std::string outPath = sectionFilePath(static_cast<int>(i));
+
+    // Skip if already exists
+    if (SdMan.exists(outPath.c_str())) {
+      continue;
+    }
+
+    FsFile outFile;
+    if (!SdMan.openFileForWrite("FB2", outPath, outFile)) {
+      LOG_ERR(TAG, "Failed to create section file: %s", outPath.c_str());
+      allOk = false;
+      continue;
+    }
+
+    outFile.write(xmlDecl.c_str(), xmlDecl.size());
+    outFile.write(wrapperStart.c_str(), wrapperStart.size());
+
+    bool sectionWritten = false;
+    FsFile inFile;
+    if (SdMan.openFileForRead("FB2", filepath, inFile)) {
+      const uint32_t hintStart = sectionOffsets_[i].startOffset;
+      const uint32_t hintEnd = sectionOffsets_[i].endOffset;
+
+      // Anchor the start: scan a small window around the hint for "<section".
+      const uint32_t windowStart = (hintStart > kStartBackoff) ? (hintStart - kStartBackoff) : 0;
+      uint32_t actualStart = 0;
+      bool startAnchored = false;
+      if (inFile.seek(windowStart)) {
+        uint8_t windowBuf[kAnchorWindowSize];
+        const size_t winRead = inFile.read(windowBuf, kAnchorWindowSize);
+        for (size_t j = 0; j + kStartTagLen <= winRead; j++) {
+          if (memcmp(windowBuf + j, kStartTag, kStartTagLen) == 0) {
+            actualStart = windowStart + static_cast<uint32_t>(j);
+            startAnchored = true;
+            break;
+          }
+        }
+      }
+
+      if (!startAnchored) {
+        LOG_ERR(TAG, "section %u: <section start tag not found near offset %u", static_cast<unsigned int>(i),
+                static_cast<unsigned int>(windowStart));
+      } else if (!inFile.seek(actualStart)) {
+        LOG_ERR(TAG, "section %u: seek to %u failed", static_cast<unsigned int>(i),
+                static_cast<unsigned int>(actualStart));
+      } else {
+        // Cap the copy so a corrupt input cannot run away.
+        const uint32_t span = (hintEnd > actualStart) ? (hintEnd - actualStart) : 0;
+        const uint32_t copyCap = span + kCopyOverhead;
+
+        uint8_t copyBuf[kCopyBufSize + kEndTagLen];
+        uint32_t consumed = 0;
+        size_t carry = 0;
+        bool foundClose = false;
+        int depth = 0;
+
+        while (consumed < copyCap) {
+          size_t maxRead = copyCap - consumed;
+          if (maxRead > kCopyBufSize) maxRead = kCopyBufSize;
+          const size_t n = inFile.read(copyBuf + carry, maxRead);
+          if (n == 0) break;
+          consumed += static_cast<uint32_t>(n);
+          const size_t bufLen = carry + n;
+
+          size_t closeAt = SIZE_MAX;
+          size_t j = 0;
+          while (j + kStartTagLen <= bufLen) {
+            if (j + kEndTagLen <= bufLen && memcmp(copyBuf + j, kEndTag, kEndTagLen) == 0) {
+              depth--;
+              if (depth <= 0) {
+                closeAt = j;
+                break;
+              }
+              j += kEndTagLen;
+            } else if (memcmp(copyBuf + j, kStartTag, kStartTagLen) == 0) {
+              depth++;
+              j += kStartTagLen;
+            } else {
+              j++;
+            }
+          }
+
+          if (closeAt != SIZE_MAX) {
+            outFile.write(copyBuf, closeAt + kEndTagLen);
+            foundClose = true;
+            break;
+          }
+
+          // Carry last (kEndTagLen-1) bytes — a tag may straddle a read boundary.
+          if (bufLen > kEndTagLen - 1) {
+            const size_t writeLen = bufLen - (kEndTagLen - 1);
+            outFile.write(copyBuf, writeLen);
+            carry = kEndTagLen - 1;
+            memmove(copyBuf, copyBuf + writeLen, carry);
+          } else {
+            carry = bufLen;
+          }
+        }
+
+        if (foundClose) {
+          sectionWritten = true;
+        } else {
+          LOG_ERR(TAG, "section %u: </section> close tag not found within %u byte cap", static_cast<unsigned int>(i),
+                  static_cast<unsigned int>(copyCap));
+        }
+      }
+      inFile.close();
+    }
+
+    if (!sectionWritten) {
+      outFile.close();
+      SdMan.remove(outPath.c_str());
+      allOk = false;
+      continue;
+    }
+
+    outFile.write(wrapperEnd.c_str(), wrapperEnd.size());
+    outFile.close();
+  }
+
+  if (allOk) {
+    FsFile marker;
+    if (SdMan.openFileForWrite("FB2", markerPath, marker)) {
+      marker.close();
+    }
+  }
+
+  LOG_INF(TAG, "Generated %u section files (allOk=%d)", static_cast<unsigned int>(sectionOffsets_.size()),
+          allOk ? 1 : 0);
+  return allOk;
+}
+
+std::string Fb2::sectionFilePath(int sectionIndex) const {
+  return cachePath + kSectionFilePrefix + std::to_string(sectionIndex) + kSectionFileSuffix;
+}
+
+std::string Fb2::getSectionPath(int sectionIndex) const {
+  if (sectionIndex < 0 || sectionIndex >= static_cast<int>(sectionOffsets_.size())) {
+    return filepath;  // Fallback to original file
+  }
+  return sectionFilePath(sectionIndex);
+}
+
+int Fb2::getSectionForTocEntry(int tocIndex) const {
+  TocItem item = getTocItem(static_cast<uint16_t>(tocIndex));
+  return item.sectionIndex;
 }
 
 void Fb2::postProcessMetadata() {
@@ -420,7 +888,7 @@ void Fb2::setupCacheDir() const {
 
 std::string Fb2::getCoverBmpPath() const { return cachePath + "/cover.bmp"; }
 
-std::string Fb2::findCoverImage() const {
+std::string Fb2::findCoverImage(const std::function<bool()>& shouldAbort) const {
   // Extract directory path
   size_t lastSlash = filepath.find_last_of('/');
   std::string dirPath = (lastSlash == std::string::npos) ? "/" : filepath.substr(0, lastSlash);
@@ -428,11 +896,11 @@ std::string Fb2::findCoverImage() const {
     dirPath = "/";
   }
 
-  return CoverHelpers::findCoverImage(dirPath, title);
+  return CoverHelpers::findCoverImage(dirPath, title, shouldAbort);
 }
 
-bool Fb2::extractEmbeddedCover(const std::string& outputPath) const {
-  if (coverRef.empty() || coverBinaryOffset_ < 0) return false;
+bool Fb2::extractEmbeddedCover(const std::string& outputPath, const std::function<bool()>& shouldAbort) const {
+  if (CoverHelpers::isAbortRequested(shouldAbort) || coverRef.empty() || coverBinaryOffset_ < 0) return false;
 
   FsFile fb2File;
   if (!SdMan.openFileForRead("FB2", filepath, fb2File)) {
@@ -453,6 +921,10 @@ bool Fb2::extractEmbeddedCover(const std::string& outputPath) const {
   int scanLimit = 512;
 
   while (!foundTagEnd && scanLimit > 0 && fb2File.available() > 0) {
+    if (CoverHelpers::isAbortRequested(shouldAbort)) {
+      fb2File.close();
+      return false;
+    }
     size_t toRead = static_cast<size_t>(scanLimit) < kBufSize ? static_cast<size_t>(scanLimit) : kBufSize;
     size_t n = fb2File.read(buf, toRead);
     if (n == 0) break;
@@ -488,6 +960,7 @@ bool Fb2::extractEmbeddedCover(const std::string& outputPath) const {
   auto writeCallback = [&outFile](const uint8_t* data, size_t sz) { return outFile.write(data, sz) == sz; };
 
   while (!done && fb2File.available() > 0) {
+    if (CoverHelpers::isAbortRequested(shouldAbort)) break;
     size_t n = fb2File.read(buf, kBufSize);
     if (n == 0) break;
 
@@ -508,7 +981,7 @@ bool Fb2::extractEmbeddedCover(const std::string& outputPath) const {
     if (decoder.failed()) break;
   }
 
-  if (done && !decoder.failed()) {
+  if (done && !decoder.failed() && !CoverHelpers::isAbortRequested(shouldAbort)) {
     success = decoder.finish(writeCallback);
   }
 
@@ -523,102 +996,65 @@ bool Fb2::extractEmbeddedCover(const std::string& outputPath) const {
   return success;
 }
 
-bool Fb2::generateCoverBmp(bool use1BitDithering) const {
-  const auto coverBmpPath = getCoverBmpPath();
-  const auto failedMarkerPath = cachePath + "/.cover.failed";
+home_thumbnail::Result Fb2::prepareCoverSource(std::string& sourcePath, bool& temporary,
+                                               const std::function<bool()>& shouldAbort) const {
+  temporary = false;
+  sourcePath = findCoverImage(shouldAbort);
+  if (CoverHelpers::isAbortRequested(shouldAbort)) return home_thumbnail::Result::Cancelled;
+  if (!sourcePath.empty()) return home_thumbnail::Result::Ready;
 
-  // Already generated
-  if (SdMan.exists(coverBmpPath.c_str())) {
-    return true;
-  }
-
-  // Previously failed, don't retry
-  if (SdMan.exists(failedMarkerPath.c_str())) {
-    return false;
-  }
-
-  // Find a cover image (external file in same directory)
-  std::string coverImagePath = findCoverImage();
-
-  // Try extracting embedded cover if no external image found
-  std::string tmpCoverPath;
-  if (coverImagePath.empty() && !coverRef.empty()) {
-    std::string ext = ".jpg";
-    if (coverContentType == "image/png") {
-      ext = ".png";
-    } else if (coverContentType == "image/bmp") {
-      ext = ".bmp";
-    }
-    tmpCoverPath = cachePath + "/.tmp_cover" + ext;
-    setupCacheDir();
-    if (extractEmbeddedCover(tmpCoverPath)) {
-      coverImagePath = tmpCoverPath;
-    }
-  }
-
-  if (coverImagePath.empty()) {
-    LOG_INF(TAG, "No cover image found");
-    FsFile marker;
-    if (SdMan.openFileForWrite("FB2", failedMarkerPath, marker)) {
-      marker.close();
-    }
-    return false;
-  }
-
-  // Setup cache directory
   setupCacheDir();
+  if (coverRef.empty()) return home_thumbnail::Result::Unavailable;
 
-  // Convert to BMP using shared helper
-  const bool success = CoverHelpers::convertImageToBmp(coverImagePath, coverBmpPath, "FB2", use1BitDithering);
-
-  // Clean up temp file
-  if (!tmpCoverPath.empty()) {
-    SdMan.remove(tmpCoverPath.c_str());
+  sourcePath = cachePath + "/.cover-source.tmp";
+  SdMan.remove(sourcePath.c_str());
+  if (!extractEmbeddedCover(sourcePath, shouldAbort)) {
+    if (CoverHelpers::isAbortRequested(shouldAbort)) return home_thumbnail::Result::Cancelled;
+    return home_thumbnail::Result::Unavailable;
+  }
+  if (ImageConverterFactory::detectFormat(sourcePath) == ImageFormat::Unknown) {
+    SdMan.remove(sourcePath.c_str());
+    return home_thumbnail::Result::Unavailable;
   }
 
-  if (!success) {
-    // Create failure marker
-    FsFile marker;
-    if (SdMan.openFileForWrite("FB2", failedMarkerPath, marker)) {
-      marker.close();
-    }
-  }
-  return success;
+  temporary = true;
+  return home_thumbnail::Result::Ready;
 }
 
-std::string Fb2::getThumbBmpPath() const { return cachePath + "/thumb.bmp"; }
-
-bool Fb2::generateThumbBmp() const {
-  const auto thumbPath = getThumbBmpPath();
-  const auto failedMarkerPath = cachePath + "/.thumb.failed";
-
-  if (SdMan.exists(thumbPath.c_str())) {
+bool Fb2::generateCoverBmp(const bool use1BitDithering, const std::function<bool()>& shouldAbort) const {
+  const std::string coverBmpPath = getCoverBmpPath();
+  const std::string failedMarkerPath = cachePath + "/.cover.failed";
+  if (home_thumbnail::validateCover(coverBmpPath)) {
+    SdMan.remove(failedMarkerPath.c_str());
     return true;
   }
+  if (SdMan.exists(coverBmpPath.c_str())) SdMan.remove(coverBmpPath.c_str());
+  if (SdMan.exists(failedMarkerPath.c_str())) return false;
 
-  // Previously failed, don't retry
-  if (SdMan.exists(failedMarkerPath.c_str())) {
-    return false;
-  }
-
-  if (!SdMan.exists(getCoverBmpPath().c_str()) && !generateCoverBmp(true)) {
-    // Create failure marker
-    FsFile marker;
-    if (SdMan.openFileForWrite("FB2", failedMarkerPath, marker)) {
-      marker.close();
+  std::string sourcePath;
+  bool temporary = false;
+  const auto sourceResult = prepareCoverSource(sourcePath, temporary, shouldAbort);
+  if (sourceResult != home_thumbnail::Result::Ready) {
+    if (sourceResult == home_thumbnail::Result::Unavailable) {
+      FsFile marker;
+      if (SdMan.openFileForWrite("FB2", failedMarkerPath, marker)) marker.close();
     }
     return false;
   }
 
-  setupCacheDir();
+  const bool converted =
+      CoverHelpers::convertImageToBmp(sourcePath, coverBmpPath, "FB2", use1BitDithering, shouldAbort);
+  if (temporary) SdMan.remove(sourcePath.c_str());
 
-  const bool success = CoverHelpers::generateThumbFromCover(getCoverBmpPath(), thumbPath, "FB2");
-  if (!success) {
-    // Create failure marker
+  const bool cancelled = CoverHelpers::isAbortRequested(shouldAbort);
+  const bool success = converted && !cancelled && home_thumbnail::validateCover(coverBmpPath);
+  if (cancelled) {
+    SdMan.remove(coverBmpPath.c_str());
+  } else if (!success) {
     FsFile marker;
-    if (SdMan.openFileForWrite("FB2", failedMarkerPath, marker)) {
-      marker.close();
-    }
+    if (SdMan.openFileForWrite("FB2", failedMarkerPath, marker)) marker.close();
+  } else {
+    SdMan.remove(failedMarkerPath.c_str());
   }
   return success;
 }
@@ -687,6 +1123,22 @@ bool Fb2::loadMetaCache() {
     }
   }
 
+  // Load section offsets (v5+)
+  uint16_t sectionOffsetCount;
+  if (serialization::readPodChecked(file, sectionOffsetCount)) {
+    sectionOffsets_.clear();
+    sectionOffsets_.reserve(sectionOffsetCount);
+    for (uint16_t i = 0; i < sectionOffsetCount; i++) {
+      SectionOffset off;
+      if (!serialization::readPodChecked(file, off.startOffset) ||
+          !serialization::readPodChecked(file, off.endOffset)) {
+        sectionOffsets_.clear();
+        break;
+      }
+      sectionOffsets_.push_back(off);
+    }
+  }
+
   file.close();
   return true;
 }
@@ -723,8 +1175,17 @@ bool Fb2::saveMetaCache() const {
     serialization::writePod(file, idx);
   }
 
+  // Save section offsets (v5+)
+  const uint16_t sectionOffsetCount = static_cast<uint16_t>(sectionOffsets_.size());
+  serialization::writePod(file, sectionOffsetCount);
+  for (const auto& off : sectionOffsets_) {
+    serialization::writePod(file, off.startOffset);
+    serialization::writePod(file, off.endOffset);
+  }
+
+  file.sync();
   file.close();
-  LOG_INF(TAG, "Saved meta cache (%u TOC items)", tocItemCount);
+  LOG_INF(TAG, "Saved meta cache (%u TOC items, %u sections)", tocItemCount, sectionOffsetCount);
   return true;
 }
 

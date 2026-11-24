@@ -1,541 +1,164 @@
 # Architecture
 
-This document describes the internal architecture and subsystems of Papyrix.
+## Layers
 
-## Overview
+PapyriX supports ESP32-C3 and ESP32-S3 targets. The reader and UI share content providers and rendering code. Board profiles select hardware backends and display controllers.
 
-Papyrix is organized around a **state machine** architecture with **singleton managers** and **content providers** for multi-format ebook support. The system is optimized for the ESP32-C3's ~380KB RAM constraint.
-
+```text
+States and views
+    |
+Content providers and page cache
+    |
+Text layout, fonts, and image conversion
+    |
+Display, input, storage, and network interfaces
+    |
+BoardSupport and controller drivers
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         Application                                         │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  StateMachine (10 States)  │  Managers (Font, Theme, Input)                 │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  ContentHandle                                                              │
-│  (EPUB, XTC, TXT, Markdown, FB2, HTML)               │  PageCache           │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  GfxRenderer  │  EpdFont  │  ThaiShaper  │  ArabicShaper  │  ScriptDetector │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  EInkDisplay  │  Storage  │  Input  │  Network                              │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                    ESP32-C3 Hardware                                        │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
----
 
 ## State Machine
 
-Papyrix uses a finite state machine (FSM) with pre-allocated state instances. This avoids heap allocation during state transitions, preventing memory fragmentation.
+`src/core/StateMachine` manages screen transitions. Each state implements `enter()`, `update()`, `exit()`, and `render()`. States own their data. View functions render that data without owning screen state. `StateTransition::to(StateId)` requests a transition.
 
-### States
+`NetworkState` stops input processing when it selects the next state. It clears queued input before the next state starts. It keeps the WiFi connection active for an app or `CalibreSync`.
 
-- **Startup** — Initial boot, system initialization
-- **Home** — Main hub with book card and navigation
-- **FileList** — File browser for book selection
-- **Reader** — Unified reader for all formats
-- **Settings** — User preferences and device settings
-- **Network** — WiFi network selection and connection
-- **CalibreSync** — Calibre wireless device sync
-- **AppLauncher** — Mini-apps, WiFi transfer, and Calibre sync
-- **Error** — Error display and recovery
-- **Sleep** — Deep sleep with custom screens
+UI mode provides library management, settings, and network functions. Reader mode provides book rendering with lower memory use. The device restarts when it changes boot modes. Persistent state records the book and reading position.
 
-### State Lifecycle
+Reader mode allocates `ReaderState` after it checks the book path and the largest free heap block. UI mode does not reserve this memory. If allocation fails, the device starts UI mode and shows an out-of-memory error.
 
-```cpp
-class State {
-  virtual void enter(const StateTransition& transition);
-  virtual StateTransition update();
-  virtual void exit();
-  virtual void render(GfxRenderer& gfx);
-  virtual StateId id() const;
-};
-```
+The reader records the resume target after a successful page render. If the settings save fails, it retries after the next successful render. It adds the book to recent books after the save succeeds. A pending open uses a separate path. If the reader restarts before it saves the resume target, the next boot returns to the UI. The previous resume target remains available.
 
-States use `StateTransition` to navigate between screens:
-- `StateTransition::to(StateId)` - Navigate to another state
-- `StateTransition::stay(StateId)` - Remain in current state
+Cancelling full-book indexing restarts the device in UI mode. It keeps the return destination and does not replace saved reading progress before the first page renders.
 
-### Dual-Boot System
+## Hardware
 
-To maximize available RAM in reader mode, Papyrix implements a dual-boot system:
+`lib/BoardSupport` owns board profiles and hardware selection. The C3 image selects X3 or X4. Each S3 image uses one fixed profile: X4 Pro, X4 Classic, Sticky, or Murphy M4. Display probing selects the controller independently of board selection. Classic first reads the factory panel identity, then probes when needed. An unresolved Classic identity blocks display initialization but permits headless SD recovery.
 
-- **UI Mode**: Full feature set with all 10 states, theme switching, multiple font sizes
-- **Reader Mode**: Minimal reader with only Reader/Sleep/Error states, single font size
+Rendering checks panel grayscale support before it writes grayscale planes. Classic preserves the factory battery calibration. Sticky supports SSD1677 and SSD2677 panels. Its probe uses FreeInk identity reads and BUSY polarity. It rejects unstable observations. An unresolved Sticky panel does not receive display commands.
 
-The boot mode is stored in RTC memory and persists across ESP restarts. When launching a book from UI mode, the device restarts into Reader mode for maximum memory efficiency.
+Sticky uses SPI SD. Touch uses one I2C controller. The gauge and RTC share the other I2C controller. The gauge keeps its factory configuration.
 
----
+M4 selects SSD1677 without a display probe. Its four-bit SDMMC transport uses all six data/clock/command pins. FT6336U-compatible touch and RX8010 share one persistent native I2C1 bus. Each device uses its own clock rate. The display stops touch acquisition before it changes shared reset GPIO7. Both subsystems load one hardware-batch selection at boot.
 
-## Content System
+M4 support is implemented, not device-tested. See the [M4 specifications](murphy-m4-specifications.md).
 
-### ContentHandle
+Hardware backends provide battery, RTC, power, front-light, and touch services. Unsupported services remain unavailable to the UI. The build excludes hardware code for other targets. See the [device support matrix](device-support-matrix.md).
 
-`ContentHandle` is a tagged union that manages one content provider at a time, supporting:
+### Button Input
 
-- **EPUB** — `EpubProvider` — `.epub`
-- **FB2** — `Fb2Provider` — `.fb2`
-- **XTC** — `XtcProvider` — `.xtc`, `.xtch`
-- **TXT** — `TxtProvider` — `.txt`, `.text`
-- **Markdown** — `MarkdownProvider` — `.md`, `.markdown`
+`InputManager` samples physical buttons in a `BackgroundTask` above the main-loop priority. The task uses a 10 ms idle interval and a 5 ms interval while changes are pending. The debounce interval remains 20 ms. The background task continues to capture input during rendering. If the task cannot start, the main loop samples buttons and limits its sleep to 10 ms.
 
-The unified interface provides:
-- `open(path, cacheDir)` - Auto-detect format and open
-- `pageCount()`, `spineCount()` - Navigation info
-- `getTocEntry()` - Table of contents access
-- `generateThumbnail()` - Cover image generation
+A fixed queue stores up to 32 state changes with their timestamps. On overflow, the queue discards the oldest change and retains the newest state. The main loop consumes one change per update and remains the sole producer of button events. Pending changes suppress hold events until input processing reaches the current state. 
 
-### PageCache
+Input suppression keeps completed taps that precede the wait and cancels incomplete page gestures. A page button held when suppression ends needs a release and a new press before it can navigate again. Suppression does not remove other button events.
 
-Unified page caching system for all content types:
+ADC button, battery, and USB-supply reads share one mutex. On X4, a possible ADC button press requires two more samples. The median of the three samples rejects one isolated outlier. Idle reads do not require these extra samples. Zero remains a valid Right or Down reading.
 
-- **Partial caching**: Caches N pages at a time to save RAM
-- **Extend-on-demand**: Automatically extends cache when near end
-- **Background caching**: FreeRTOS task for pre-rendering pages
-- **Serialization**: Writes cached pages to SD card for instant reload
+Startup checks sample directly before the task starts. Shutdown stops the task before GPIO configuration changes.
 
-### Progress Manager
+GT911 touch input remains on the main loop. M4 touch acquisition uses a separate `BackgroundTask`. The main loop classifies its bounded, timestamped samples and remains the event producer.
 
-Saves and restores reading position per book:
-- Spine index (EPUB chapter)
-- Section page (page within chapter)
-- Flat page (XTC absolute page)
+### Clock Power Modes
 
-Cache location: `/.papyrix/<format>_<hash>/progress.bin`
+Normal mode keeps normal input sampling and uses the existing CPU idle policy. Power saving mode enters deep sleep after 15 seconds without interaction. The timeout also applies to Clock settings. Held input, queued input, and active operations defer sleep.
 
----
+`ClockStandby` owns one checked RTC record. The record contains settings, appearance, the last frame, the next UTC sync deadline, and board, panel, and firmware identity. A valid timer wake runs before normal UI startup. It does not mount SD or LittleFS, initialize input tasks, or write settings on an ordinary minute update. A due synchronization can mount SD for saved credentials. Automatic connection attempts share a 15-second budget; NTP has a 10-second budget.
 
-## Memory Management
+The timer path reconstructs the previous frame in the existing framebuffer. SSD1677, SSD2677, and UC8279 Pro/Classic restore their reference image. SSD1677 loads temperature and the waveform before its first differential update after reset. This preparation does not drive the panel. See commands `0x1A` and `0x22` in the [SSD1677 specification](https://cursedhardware.github.io/epd-driver-ic/SSD1677.pdf).
 
-The ESP32-C3 has ~380KB usable RAM with ~100-150KB available after system overhead. Papyrix employs several strategies:
+UC8279 Pro/Classic restores the old image in DTM1 with the 120-gate offset before differential refresh. This RAM write does not activate the panel. Normal startup and recovery after an error keep the full-refresh guard.
 
-### Allocation Strategies
+UC8253 restores both reference planes from the previous Clock frame before differential refresh. This RAM write keeps the X3 row order and polarity and does not activate the panel. Normal startup and recovery after an error keep the full-refresh guard. UC8279 X3 and UC8179 Pro/Classic keep their full-refresh startup guards. No extra C3 framebuffer is required.
 
-- **Pre-allocated states**: All 10 states allocated at startup, not during transitions
-- **Fixed-size buffers**: Path (256), Text (512), Decompress (8192) in global Core struct
-- **Tagged unions**: ContentHandle uses one provider at a time
-- **Chunked buffers**: GfxRenderer splits display buffer into 8KB chunks for non-contiguous allocation
+The timer wakes at the next minute boundary from current RTC-backed UTC time. Clock checks the displayed minute again after it stops services. If the minute changes during shutdown, Clock cancels standby and returns to its controls. It draws the current time and uses the normal 15-second timeout before it tries standby again. On X3, Clock keeps GPIO13 HIGH through sleep and timer startup. It does not switch off this shared power control as normal shutdown does.
 
-### WiFi Memory
+A short Power press unlocks Clock controls without Booting or Home. Ordinary sleep and Clock standby preserve the pull configuration of the profile's Power pin. Touch and the front light stay off during standby. A normal reset or invalid record uses normal startup. A fatal wake error clears automatic resume and opens time setup or Error. Display initialization allows one reset and retry; a failed panel requires explicit user recovery.
 
-The ESP32 WiFi stack allocates ~100KB and fragments heap memory. After using WiFi features, the device automatically restarts to reclaim memory before entering Reader mode.
+S3 sleep configures the Power pin's RTC pull before it enables EXT1 wake. Digital GPIO pulls do not control the S3 RTC input. The SDK holds the RTC pull through deep sleep without keeping the RTC peripheral domain on. A wake-setup error prevents sleep. Ordinary sleep restarts after teardown; Clock standby returns the error.
 
-### Caching
+## Content
 
-- **Compressed thumbnails**: 2-4KB vs 48KB uncompressed
-- **Glyph lookup cache**: 64-entry direct-mapped cache per font (codepoint → glyph)
-- **Glyph bitmap cache**: 128-entry LRU cache per streaming font (glyph → bitmap)
-- **Word width cache**: 512-entry FNV-1a hash cache in GfxRenderer
-- **SD card caching**: All parsed content cached to SD card
+`src/content/` provides format-specific content handles. The handles expose metadata, navigation, and reading progress. EPUB, FB2, HTML, Markdown, and TXT require text layout. XTC and XTCH contain pre-rendered pages.
 
----
+`lib/PageCache` stores rendered page records on the SD card. The reader loads the requested page instead of repeating its layout. Cache extension runs in bounded chunks. Device-specific cache roots separate incompatible page geometry. See [file formats](file-formats.md).
 
-## Font System
+## Rendering
 
-### Pipeline
+`GfxRenderer` renders text, bitmaps, and UI elements into the active framebuffer. The `EInkDisplay` library sends that data to the selected controller. The controller driver owns waveform selection, RAM synchronization, and sleep.
 
-```
-Storage → EpdFontLoader → FontManager → GfxRenderer → Display
-```
+The reader reuses the framebuffer for grayscale masks. It does not require a full-page backup for antialiasing. See the [rendering pipeline](rendering-pipeline.md) for memory and cache ownership. See the [S3 reader platform](s3-platform.md) for optional PSRAM buffers and fallback paths.
 
-1. **Storage**: Fonts loaded from flash (builtin) or SD card (custom)
-2. **EpdFontLoader**: Parses `.epdfont` binary format, provides glyph lookup
-3. **FontManager**: Manages font lifecycle, handles loading/unloading
-4. **GfxRenderer**: Renders text using font glyphs
-5. **Display**: Final output to e-paper
+## Fonts and Text
 
-### Memory
+`FontManager` selects built-in or external fonts. Built-in bitmaps remain in Flash. Streaming fonts load metadata and cache glyph bitmaps from the SD card. A missing external font uses a built-in fallback.
 
-- **Builtin fonts**: Flash (DROM), ~20 bytes RAM per wrapper
-- **Custom fonts (streaming)**: ~25KB RAM per font (metadata + LRU cache)
+The text layout code applies font metrics, line spacing, alignment, and hyphenation. CSS parsing supplies supported EPUB style properties. `ScriptDetector` identifies script-specific layout requirements. `ThaiShaper` groups Thai marks. `ArabicShaper` selects contextual forms and Lam-Alef ligatures. External CJK fonts provide one-bit glyph data.
 
-### Streaming Font System
+See [fonts](fonts.md), [customization](customization.md), and [localization](localization.md) for configuration and format limits.
 
-Custom fonts use `StreamingEpdFont` for memory efficiency:
+## Images
 
-- **Metadata in RAM**: Glyph table (~10-15KB) and unicode intervals (~2KB)
-- **Bitmaps on SD**: Streamed on-demand, not stored in RAM
-- **LRU cache**: 128-entry cache for recently-used glyph bitmaps
-- **Hash table**: O(1) cache lookup with linear probing
+Image converters decode supported images and scale them to the viewport. The cache stores converted images on SD. Size and allocation limits bound parser memory use. The HTML preprocessing path removes embedded image data URIs before XML parsing. See [image rendering](images.md).
 
-Memory comparison for a typical 50KB font:
-- **EpdFont (full load)**: ~70KB (intervals + glyphs + bitmap)
-- **StreamingEpdFont**: ~25KB (intervals + glyphs + cache)
+## UI
 
-### Fallback Behavior
+`src/ui/Elements.h` provides buttons, menus, keyboards, and shared geometry. `src/ui/views/` contains state-specific view functions. States dispatch physical-button and touch actions. Touch hit testing uses the same logical geometry as rendering.
 
-The font system guarantees users can always read:
+### Mini-apps
 
-1. **Font load failure** → Returns builtin font ID (FontManager.cpp)
-2. **Streaming bitmap failure** → Skips character gracefully (GfxRenderer.cpp)
-3. **Glyph not found** → Falls back to '?' character
+`lib/MiniApps` provides the shared app host. It has no firmware dependencies and does not allocate memory. `src/apps/MiniApp.h` binds its typed callbacks to `Core` and `Event`.
 
-Defensive checks in StreamingEpdFont:
-- Bounds check on glyph index (corrupted font protection)
-- Validates file handle before SD reads
-- Rejects glyphs >4KB (corrupted data protection)
-- Returns nullptr on partial SD read (SD card errors)
+The host manages app and menu state, redraw requests, and checked exits. All registered apps use this interface. The app descriptor remains valid while the app runs. Add an app through `src/apps/AppRegistry.cpp`.
 
-### `.epdfont` Format
+App IDs follow the registry order. `appIdForMenuItem()` in `src/ui/views/AppLauncherViews.h` sets the menu order separately. Update this mapping when you add an app. `AppMenuView::rowPitch()` limits rows to the space above the footer. Rendering and touch input use this pitch with `rowY()`. Separator gaps do not accept input.
 
-Binary format with sections:
+Apps return a `Frame` with the refresh mode and panel power-off policy. Return `Refresh::None` when the app already refreshes the panel. The launcher uses the existing renderer and a CPU performance lock.
 
-```
-Header → Metrics → Unicode Intervals → Glyphs → Bitmap
-```
+The launcher restores active CPU speed before app event handling. An exit action can write files before the host returns.
 
-- **Header**: Magic, version, font metadata
-- **Metrics**: Line height, ascender, descender
-- **Unicode Intervals**: Ranges of supported codepoints
-- **Glyphs**: Per-character metrics and bitmap offsets
-- **Bitmap**: 1-bit or 2-bit packed glyph data
+`MiniAppInput` maps physical button presses and touch footer actions. Apps keep their special input rules. Touch is optional. The 2048 app also accepts swipes inside its game board.
 
-### Key Files
+`prepareExit` checks an exit before cleanup. `Blocked` retains the exit destination for retry or discard. `OpenMenu` opens editable settings and cancels that destination. A pending exit prevents idle sleep.
 
-- `lib/EpdFont/EpdFontLoader.cpp` — Format parsing, full and streaming load modes
-- `lib/EpdFont/StreamingEpdFont.cpp` — Memory-efficient streaming font with LRU cache
-- `src/FontManager.h/cpp` — Font lifecycle management, fallback handling
-- `lib/GfxRenderer/` — Text rendering with streaming font integration
-- `scripts/convert-fonts.mjs` — TTF/OTF to `.epdfont` conversion
+`CheckedFile.h` checks temporary writes, sync, and close before publication. It retains the previous file through a backup rename. Clock, 2048, Go, Lights Out, and Sokoban keep their own file formats, validation, and load rules.
 
-### CJK Support
+Clock keeps board-specific standby and recovery in the firmware. After hardware recovery invalidates an app context, `Host::abandon` clears host state without calling the app exit callback.
 
-CJK fonts use binary search for glyph lookup: O(log n) complexity. Text can break at any character boundary (no word-based line breaking).
+`lib/GoGame` provides the 9 by 9 Tromp–Taylor rules and a bounded Monte Carlo opponent. `GoStore` keeps the full position history on the SD card. `GoApp` runs the opponent through `lib/AsyncTask`. The task reads an immutable position. Only the main thread commits a move.
 
-## CSS Parser
+`LightsOut` stores the 5 by 5 board in 25 bits. It generates solvable boards through legal toggles. `LightsOutApp` saves the board, cursor, and move count on exit or sleep through `LightsOutStore`.
 
-### Pipeline
+`Sokoban` provides 12 Papwick levels in constant storage. It bounds boards to 12 by 12 cells and eight boxes. The view draws a cat on a square-cell grid. A fixed circular buffer retains 128 undo moves. `SokobanStore` saves the current position, counters, and undo history on exit or sleep. Loading checks the level-pack version and position. It reverses the active history before it accepts a record.
 
-```
-EPUB Load → ContentOpfParser → CssParser → ChapterHtmlSlimParser → Page
-```
+## Background Work
 
-1. **ContentOpfParser**: Discovers CSS files in EPUB manifest (media-type contains "css")
-2. **CssParser**: Parses CSS files, builds style map keyed by selector
-3. **ChapterHtmlSlimParser**: Queries CSS for each element, applies styles during page layout
+`lib/AsyncTask` provides cooperative cancellation and scoped mutex handling. Background tasks stop themselves. Do not force-delete a task. Stop the cache task before the main thread accesses its parser or page cache. Do not hold a mutex during file I/O or other blocking work.
 
-### Supported Properties
+`BackgroundTask::getState()` reports `COMPLETE` after the worker publishes its exit generation, including after a stop timeout. Call `stop()` before reuse to finish the lifecycle transition.
 
-- **text-align** (left, right, center, justify) — Block alignment
-- **font-style** (normal, italic) — Italic text
-- **font-weight** (normal, bold, 700+) — Bold text
-- **text-indent** (px, em) — First-line indent
-- **margin-top/bottom** (em, %) — Extra line spacing
-- **direction** (ltr, rtl) — Text direction (RTL for Arabic)
+## Network
 
-### Supported Selectors
+Wi-Fi starts on demand. The web server provides file management and upload functions. Calibre provides wireless book transfer. RTC and NTP services maintain system time where available.
 
-- **Tag selectors**: `p`, `div`, `span`
-- **Class selectors**: `.classname`
-- **Tag.class selectors**: `p.classname`
-- **Comma-separated**: `h1, h2, h3`
-- **Inline styles**: `style="text-align: center"`
+Firmware updates validate a PapyriX board tag before flash erase when one is present. The combined X3/X4 image is one compatibility class. Pro, Classic, Sticky, and M4 use separate tags. Images without a PapyriX tag can pass the MCU, integrity, and slot-size checks. The tag check helps prevent accidental wrong-board updates. It does not authenticate firmware.
 
-### Key Files
+`lib/Ipp` is the IPP print server core. It parses the IPP wire protocol (RFC 8010/8011). It decodes Apple raster and PWG raster streams row by row. It scales each page onto the 1-bit panel framebuffer with box downsample and Floyd-Steinberg dither. The core has no Arduino types.
 
-- `lib/Epub/Epub/css/CssStyle.h` — Style enums and struct
-- `lib/Epub/Epub/css/CssParser.h/cpp` — CSS file parsing
-- `lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp` — Style application during HTML parsing
+`IppTransport` is the port point between the firmware WiFi client and the host test harness. `src/apps/PrinterApp.cpp` owns the WiFi session, the mDNS advertisement, and the printout queue on the SD card. `lib/FsHelpers` keeps the bounded newest-64 printout queue sorted in natural order.
 
-## Text Layout
+`lib/Localsend` is the LocalSend receive core. The app saves received files to `/received`.
 
-### Line Breaking Algorithm
+See the [web server guide](webserver.md), the [Calibre guide](calibre.md), the [printer guide](printer.md), and the [LocalSend guide](localsend.md).
 
-Papyrix uses the **Knuth-Plass algorithm** for optimal line breaking, the same algorithm used by TeX. This produces higher-quality justified text than greedy algorithms.
+## Desktop Parser Tool
 
-**Hyphenation**: The Liang algorithm (also from TeX) finds valid hyphenation points within words. Language is auto-detected from EPUB metadata (`<dc:language>`) and falls back to English. Supported languages: German, English, Spanish, French, Italian, Russian, Ukrainian. Binary trie patterns are sourced from [typst/hypher](https://github.com/typst/hypher).
-
-```
-Words → calculateWordWidths() → computeLineBreaks() → extractLine() → TextBlock
-```
-
-### How It Works
-
-1. **Forward Dynamic Programming**: Evaluates all possible line break points
-2. **Badness**: Measures line looseness using cubic ratio: `((target - actual) / target)³ × 100`
-3. **Demerits**: Cost function `(1 + badness)²` penalizes loose lines
-4. **Line Penalty**: Constant `+50` per line favors fewer total lines
-5. **Last Line**: Zero demerits (allowed to be loose, as in book typography)
-
-### Cost Function
-
-```
-badness = ((pageWidth - lineWidth) / pageWidth)³ × 100
-demerits = (1 + badness)² + LINE_PENALTY
-```
-
-Lines exceeding page width get infinite penalty. Oversized words that can't fit are forced onto their own line with a fixed penalty.
-
-### Key Files
-
-- `lib/Epub/Epub/ParsedText.cpp` — Line breaking implementation
-- `lib/Epub/Epub/ParsedText.h` — ParsedText class definition
-
-### Reference
-
-- Knuth, D. E., & Plass, M. F. (1981). *Breaking paragraphs into lines.* Software: Practice and Experience, 11(11), 1119-1184. [DOI:10.1002/spe.4380111102](https://doi.org/10.1002/spe.4380111102)
-
----
-
-## Multi-Script Support
-
-Papyrix supports multiple writing systems through script detection and specialized rendering.
-
-### ScriptDetector
-
-Classifies text by Unicode codepoint ranges:
-
-- **LATIN** — Latin, Cyrillic, Greek — Word-based line breaking
-- **CJK** — Chinese, Japanese, Korean (U+4E00–U+9FFF, etc.) — Character-based line breaking
-- **THAI** — Thai script (U+0E00–U+0E7F) — Word segmentation
-- **ARABIC** — Arabic script (U+0600–U+06FF, etc.) — Shaping and RTL layout
-- **OTHER** — Symbols, digits, punctuation — Contextual line breaking
-
-### Thai Text Rendering
-
-Thai script requires special handling due to:
-- **Vowel marks** above/below consonants
-- **Tone marks** stacking above vowels
-- **No spaces** between words
-
-The ThaiShaper library provides:
-- **ThaiCluster**: Groups consonants with marks into grapheme clusters
-- **ThaiWordBreak**: Dictionary-based word segmentation for line breaking
-- **Mark positioning**: Proper vertical ordering of diacritics
-
-### Arabic Text Rendering
-
-Arabic script is supported natively in the built-in fonts and requires special handling in reader mode for book text:
-- **Contextual shaping**: Letters change form based on position (initial, medial, final, isolated)
-- **Lam-Alef ligatures**: Automatic ligature formation for Lam + Alef combinations
-- **RTL layout**: Words are rendered right-to-left with right-aligned lines
-- **CSS direction**: `direction: rtl` in EPUB stylesheets triggers RTL paragraph layout
-
-The ArabicShaper library converts logical-order UTF-8 text to visual-order shaped codepoints for left-to-right rendering by the font system.
-
-### CJK Rendering
-
-CJK text uses ExternalFont for large character set support:
-- **LRU cache**: 256-entry cache (~52KB) for glyph bitmaps
-- **Binary search**: O(log n) glyph lookup in large fonts
-- **Character-level breaking**: No word boundaries needed
-
----
-
-## Rendering Pipeline
-
-### Flow
-
-```
-Content → ContentParser → Page → GfxRenderer → EInkDisplay
-```
-
-1. **ContentParser**: Converts format-specific content to `Page` objects
-2. **Page**: Contains `PageLine` (text) and `PageImage` elements
-3. **GfxRenderer**: Renders pages using fonts and themes
-4. **EInkDisplay**: Final output with refresh mode control
-
-### GfxRenderer Features
-
-- **Render modes**: BW (1-bit), Grayscale LSB, Grayscale MSB
-- **Orientation**: Portrait, Landscape CW/CCW, Inverted
-- **Word caching**: 512-entry hash cache for repeated word widths
-- **Row buffers**: Pre-allocated to avoid per-line allocation
-
-### Refresh Modes
-
-- **Full** — Complete redraw, clears ghosting (no ghosting)
-- **Partial** — Fast page turns (some ghosting)
-- **Fast** — Animation, menus (more ghosting)
-
-The "Pages Per Refresh" setting controls how often full refresh occurs (1/5/10/15/30 pages).
-
----
-
-## Image Rendering
-
-EPUB images (JPEG/PNG/BMP) are converted to BMP and cached to SD card. Data URIs are stripped before parsing to prevent OOM. See [images.md](images.md) for details.
-
----
-
-## UI System
-
-Papyrix uses a view-based UI architecture with reusable elements and state-driven rendering.
-
-### Directory Structure
-
-```
-src/ui/
-├── Elements.h/cpp          # Reusable UI components
-├── Views.h                 # Unified header for all views
-└── views/                  # Screen-specific views
-    ├── HomeView.h/cpp      # Home screen with book card
-    ├── ReaderViews.h/cpp   # Reader UI (TOC, status bar)
-    ├── SettingsViews.h/cpp # Settings screens
-    ├── NetworkViews.h/cpp  # WiFi configuration
-    ├── AppLauncherViews.h/cpp # App launcher menu
-    ├── CalibreViews.h/cpp  # Calibre sync UI
-    ├── UtilityViews.h/cpp  # Common elements
-    └── BootSleepViews.h/cpp# Boot splash, sleep screen
-```
-
-### UI Elements
-
-The `ui::` namespace provides reusable rendering components:
-
-- **`ButtonBar`** — 4-button hint bar at screen bottom
-- **`title()`** — Centered bold heading
-- **`menuItem()`** — Selectable menu entry
-- **`toggle()`** — On/Off setting row
-- **`enumValue()`** — Setting with value display
-- **`keyboard()`** — On-screen keyboard (10x10 grid)
-- **`battery()`** — Battery icon with percentage
-- **`bookCard()`** — Cover + title + author
-- **`fileEntry()`** — File name with directory indicator
-- **`chapterItem()`** — TOC entry with depth indentation
-- **`wifiEntry()`** — Network + signal + lock icon
-- **`dialog()`** — Yes/No confirmation
-- **`readerStatusBar()`** — Battery, title, page numbers (chapter page count available only after caching)
-
-### ButtonBar Pattern
-
-Views use `ButtonBar` to define which buttons are active and their labels:
-
-```cpp
-ui::ButtonBar buttons("Back", "Select", "", "");  // 2 active buttons
-ui::buttonBar(renderer, theme, buttons);
-```
-
-### View Pattern
-
-Views are stateless rendering functions. States own the data and call views:
-
-```cpp
-// State owns data
-class HomeState : public State {
-    BookMetadata currentBook_;
-    int selectedIndex_;
-
-    void render(GfxRenderer& gfx) override {
-        HomeView::render(gfx, theme, currentBook_, selectedIndex_);
-    }
-};
-```
-
----
-
-## Desktop Testing (reader-test)
-
-`tools/reader-test/` is a desktop tool that runs the full content parsing pipeline (EPUB/FB2/HTML/TXT/Markdown) without hardware. It uses the same built-in fonts and viewport dimensions as the device to produce identical page boundaries.
-
-### Device Emulation
-
-- **Real font metrics**: Uses `reader_2b`, `reader_bold_2b`, `reader_italic_2b` built-in fonts with per-glyph `advanceX` lookup (not fixed-width approximation)
-- **Device viewport**: 464x765 pixels (480 - 2*(3+5) x 800 - 9 - (3+23)) with status bar, 464x788 without
-- **Batched caching**: `--batch 5` emulates the device's batched page cache generation with suspend/resume cycles
-- **Status bar toggle**: `--no-statusbar` removes the 23px bottom margin, matching the device viewport when status bar is hidden
-- **Font ID**: `READER_FONT_ID = 1818981670`, same as device
-
-### Architecture
-
-```
-tools/reader-test/
-├── main.cpp              # CLI entry, font registration, content dispatch
-├── CMakeLists.txt        # Build config (links real EpdFont, Utf8, parsers)
-└── mocks/
-    ├── GfxRenderer.h     # Real text metrics, no-op drawing
-    ├── EInkDisplay.h     # Stub display (buffer only)
-    ├── SDCardManager.h   # Maps SD calls to filesystem
-    └── platform_stubs.cpp # Arduino/FreeRTOS stubs
-```
-
-The mock `GfxRenderer` provides real text measurement (`getTextWidth`, `getSpaceWidth`, `getLineHeight`, `getFontAscenderSize`, `breakWordWithHyphenation`) using the font map, while all drawing methods are no-ops.
-
-### Usage
+`tools/reader-test` runs the content parser with built-in font metrics. Its default viewport matches the X4 portrait reader. Use batched parsing to exercise cache suspend and resume:
 
 ```bash
-# Parse book with device-matching batch mode
-reader-test --dump --batch 5 book.epub /tmp/cache
-
-# Parse with status bar hidden (larger viewport)
-reader-test --dump --no-statusbar book.epub /tmp/cache
-
-# Dump text from device cache (copied from SD card)
-reader-test --cache-dump /path/to/.papyrix/epub_<hash>/
-
-# Compare to find text differences (missing/duplicated text)
-diff <(reader-test --dump --batch 5 book.epub /tmp/cache 2>/dev/null) \
-     <(reader-test --cache-dump /path/to/device-cache/ 2>/dev/null)
+make reader-test
+tools/reader-test/build/reader-test --dump --batch 5 book.epub /tmp/cache
+tools/reader-test/build/reader-test --dump --no-statusbar book.epub /tmp/cache-no-statusbar
+tools/reader-test/build/reader-test --cache-dump /path/to/device-cache/
 ```
 
-### Verifying Parser Fixes
-
-To verify fixes to the parsing/caching pipeline:
-
-1. Build reader-test **without** the fix, run with `--batch 5`, save output
-2. Apply the fix, rebuild, run again
-3. Diff the outputs — recovered text confirms the fix works
-
-The `--batch 5` flag is critical for reproducing suspend/resume bugs that only trigger at batch boundaries during page cache generation.
-
----
-
-## Key Files
-
-### Core (`/src/core/`)
-
-- **`Core.h`** — Global state, drivers, buffers
-- **`StateMachine.h`** — FSM implementation
-- **`Types.h`** — Enums and constants
-- **`BootMode.h`** — Dual-boot system
-- **`PapyrixSettings.h`** — User preferences
-
-### States (`/src/states/`)
-
-- **`State.h`** — Base state interface
-- **`ReaderState.h`** — Unified reader (largest state)
-- **`HomeState.h`** — Main hub with async cover loading
-- **`SettingsState.h`** — Preferences UI
-
-### Content (`/src/content/`)
-
-- **`ContentHandle.h`** — Tagged union for providers
-- **`EpubProvider.h`** — EPUB format support
-- **`Fb2Provider.h`** — FB2 (FictionBook 2.0) format support
-- **`XtcProvider.h`** — XTC/XTCH format support
-- **`TxtProvider.h`** — Plain text support
-- **`MarkdownProvider.h`** — Markdown format support
-- **`ProgressManager.h`** — Reading position persistence
-- **`ReaderNavigation.h`** — Page/chapter traversal
-
-### UI (`/src/ui/`)
-
-- **`Elements.h`** — Reusable UI components (ButtonBar, keyboard, etc.)
-- **`Views.h`** — Unified header for all view types
-- **`views/HomeView.h`** — Home screen rendering
-- **`views/ReaderViews.h`** — Reader UI (TOC, status bar)
-- **`views/SettingsViews.h`** — Settings screen rendering
-
-### Libraries (`/lib/`)
-
-- **`Epub/`** — EPUB parsing, CSS, TOC
-- **`Fb2/`** — FB2 (FictionBook 2.0) parsing, metadata extraction, TOC
-- **`Xtc/`** — XTC/XTCH native format
-- **`Txt/`** — Plain text file handling
-- **`Markdown/`** — Markdown format support
-- **`PageCache/`** — Unified page caching
-- **`GfxRenderer/`** — Graphics rendering
-- **`EpdFont/`** — Font loading (full and streaming modes) and glyph cache
-- **`ExternalFont/`** — CJK font support
-- **`ScriptDetector/`** — Script classification
-- **`ArabicShaper/`** — Arabic text shaping (contextual forms, ligatures)
-- **`ThaiShaper/`** — Thai text shaping
-- **`Hyphenation/`** — Liang-pattern hyphenation with language-specific tries (de, en, es, fr, it, ru, uk)
-- **`Utf8/`** — UTF-8 string utilities
-- **`ZipFile/`** — EPUB ZIP extraction
-- **`Group5/`** — 1-bit image compression
-- **`Calibre/`** — Calibre wireless sync protocol
-- **`ImageConverter/`** — JPEG/PNG to BMP conversion
-- **`Serialization/`** — Binary serialization utilities
+Use a separate output directory for each layout configuration. Compare the text output with a device cache dump to locate page differences.

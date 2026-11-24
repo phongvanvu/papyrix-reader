@@ -1,8 +1,10 @@
 #include "StreamingEpdFont.h"
 
 #include <Utf8.h>
+#include <esp_heap_caps.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 
 #include "EpdFontLoader.h"
@@ -52,6 +54,13 @@ bool StreamingEpdFont::load(const char* path) {
     return false;
   }
 
+#if PAPYRIX_TARGET_X4PRO || PAPYRIX_TARGET_X4CLASSIC || PAPYRIX_TARGET_STICKY || PAPYRIX_TARGET_MURPHY_M4
+  if (SLAB_SIZE <= heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) * 80 / 100) {
+    _slab = static_cast<uint8_t*>(heap_caps_malloc(SLAB_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (_slab) _capacity = CACHE_SIZE;
+  }
+#endif
+
   _isLoaded = true;
   return true;
 }
@@ -66,13 +75,17 @@ void StreamingEpdFont::unload() {
 
   // Free all cached bitmaps
   for (int i = 0; i < CACHE_SIZE; i++) {
-    delete[] _cache[i].bitmap;
+    if (!_slab) delete[] _cache[i].bitmap;
     _cache[i].bitmap = nullptr;
     _cache[i].glyphIndex = INVALID_CODEPOINT;
     _cache[i].bitmapSize = 0;
     _cache[i].lastUsed = 0;
     _hashTable[i] = HASH_EMPTY;
   }
+  heap_caps_free(_slab);
+  _slab = nullptr;
+  _slabUsed = 0;
+  _capacity = FALLBACK_CACHE_SIZE;
 
   // Clear glyph lookup cache
   for (int i = 0; i < GLYPH_CACHE_SIZE; i++) {
@@ -143,8 +156,8 @@ const EpdGlyph* StreamingEpdFont::getGlyph(uint32_t cp) {
 int StreamingEpdFont::findInBitmapCache(uint32_t glyphIndex) {
   // O(1) hash table lookup with linear probing
   int hash = hashIndex(glyphIndex);
-  for (int i = 0; i < CACHE_SIZE; i++) {
-    int idx = (hash + i) % CACHE_SIZE;
+  for (int i = 0; i < _capacity; i++) {
+    int idx = (hash + i) % _capacity;
     int16_t cacheIdx = _hashTable[idx];
     if (cacheIdx == HASH_EMPTY) {
       return -1;
@@ -163,7 +176,7 @@ int StreamingEpdFont::getLruSlot() {
   int lruIndex = 0;
   uint32_t minUsed = _cache[0].lastUsed;
 
-  for (int i = 1; i < CACHE_SIZE; i++) {
+  for (int i = 1; i < _capacity; i++) {
     // Prefer unused slots
     if (_cache[i].glyphIndex == INVALID_CODEPOINT) {
       return i;
@@ -176,6 +189,27 @@ int StreamingEpdFont::getLruSlot() {
   return lruIndex;
 }
 
+uint32_t StreamingEpdFont::advanceAccessCounter() {
+  if (++_accessCounter == 0) {
+    // Renumber live entries preserving relative order
+    uint32_t order = 1;
+    for (int pass = 0; pass < _capacity; pass++) {
+      uint32_t minVal = UINT32_MAX;
+      int minIdx = -1;
+      for (int i = 0; i < _capacity; i++) {
+        if (_cache[i].glyphIndex != INVALID_CODEPOINT && _cache[i].lastUsed >= order && _cache[i].lastUsed < minVal) {
+          minVal = _cache[i].lastUsed;
+          minIdx = i;
+        }
+      }
+      if (minIdx < 0) break;
+      _cache[minIdx].lastUsed = order++;
+    }
+    _accessCounter = order;
+  }
+  return _accessCounter;
+}
+
 bool StreamingEpdFont::loadGlyphBitmap(uint32_t glyphIndex, CachedBitmap& entry) {
   if (!_fontFile || glyphIndex >= _glyphCount) {
     return false;
@@ -184,13 +218,35 @@ bool StreamingEpdFont::loadGlyphBitmap(uint32_t glyphIndex, CachedBitmap& entry)
   const EpdGlyph& glyph = _glyphs[glyphIndex];
   const uint16_t dataLen = glyph.dataLength;
 
-  // Validate dataLength against maximum (defense against corrupted font files)
-  if (dataLen > MAX_GLYPH_BITMAP_SIZE) {
+  if (dataLen == 0 || dataLen > MAX_GLYPH_BITMAP_SIZE) {
     return false;
   }
 
-  // Reallocate bitmap buffer if needed
-  if (entry.bitmapSize < dataLen) {
+#if PAPYRIX_TARGET_X4PRO || PAPYRIX_TARGET_X4CLASSIC || PAPYRIX_TARGET_STICKY || PAPYRIX_TARGET_MURPHY_M4
+  if (_slab) {
+    if (entry.bitmap) {
+      _totalCacheAllocation -= entry.bitmapSize;
+      entry.bitmap = nullptr;
+      entry.bitmapSize = 0;
+    }
+    while (_totalCacheAllocation > SLAB_SIZE - dataLen) {
+      int oldest = -1;
+      for (int i = 0; i < _capacity; ++i) {
+        if (_cache[i].glyphIndex != INVALID_CODEPOINT && (oldest < 0 || _cache[i].lastUsed < _cache[oldest].lastUsed)) {
+          oldest = i;
+        }
+      }
+      if (oldest < 0) return false;
+      evictSlot(oldest);
+    }
+    if (SLAB_SIZE - _slabUsed < dataLen) compactSlab();
+    entry.bitmap = _slab + _slabUsed;
+    entry.bitmapSize = dataLen;
+    _slabUsed += dataLen;
+    _totalCacheAllocation += dataLen;
+  }
+#endif
+  if (!_slab && entry.bitmapSize < dataLen) {
     const uint16_t oldSize = entry.bitmapSize;
     delete[] entry.bitmap;
     entry.bitmap = new (std::nothrow) uint8_t[dataLen];
@@ -199,7 +255,6 @@ bool StreamingEpdFont::loadGlyphBitmap(uint32_t glyphIndex, CachedBitmap& entry)
       _totalCacheAllocation -= oldSize;
       return false;
     }
-    // Update allocation tracking (subtract old, add new)
     _totalCacheAllocation = _totalCacheAllocation - oldSize + dataLen;
     entry.bitmapSize = dataLen;
   }
@@ -224,13 +279,15 @@ const uint8_t* StreamingEpdFont::getGlyphBitmap(const EpdGlyph* glyph) {
     return nullptr;
   }
 
+  if (glyph->dataLength == 0) return nullptr;
+
   // Calculate glyph index from pointer arithmetic (now safe after validation)
   uint32_t glyphIndex = glyph - _glyphs;
 
   // Check bitmap cache
   int cacheIndex = findInBitmapCache(glyphIndex);
   if (cacheIndex >= 0) {
-    _cache[cacheIndex].lastUsed = ++_accessCounter;
+    _cache[cacheIndex].lastUsed = advanceAccessCounter();
     _cacheHits++;
     return _cache[cacheIndex].bitmap;
   }
@@ -240,39 +297,28 @@ const uint8_t* StreamingEpdFont::getGlyphBitmap(const EpdGlyph* glyph) {
   // Cache miss - need to load from SD
   int slot = getLruSlot();
 
-  // If replacing an existing entry, mark it as tombstone in hash table
-  if (_cache[slot].glyphIndex != INVALID_CODEPOINT) {
-    int oldHash = hashIndex(_cache[slot].glyphIndex);
-    for (int i = 0; i < CACHE_SIZE; i++) {
-      int idx = (oldHash + i) % CACHE_SIZE;
-      if (_hashTable[idx] == slot) {
-        _hashTable[idx] = HASH_TOMBSTONE;
-        _tombstoneCount++;
-        break;
-      }
-    }
-    // Update allocation tracking when evicting
-    _totalCacheAllocation -= _cache[slot].bitmapSize;
+  if (_cache[slot].glyphIndex != INVALID_CODEPOINT) evictSlot(slot);
 
-    // Rehash if too many tombstones have accumulated
-    if (_tombstoneCount >= TOMBSTONE_REHASH_THRESHOLD) {
-      rehashTable();
-    }
-  }
-
-  // Load glyph bitmap from SD
   if (!loadGlyphBitmap(glyphIndex, _cache[slot])) {
+#if PAPYRIX_TARGET_X4PRO || PAPYRIX_TARGET_X4CLASSIC || PAPYRIX_TARGET_STICKY || PAPYRIX_TARGET_MURPHY_M4
+    if (_slab && _cache[slot].bitmap) {
+      _totalCacheAllocation -= _cache[slot].bitmapSize;
+      _slabUsed -= _cache[slot].bitmapSize;
+      _cache[slot].bitmap = nullptr;
+      _cache[slot].bitmapSize = 0;
+    }
+#endif
     return nullptr;
   }
 
   _cache[slot].glyphIndex = glyphIndex;
-  _cache[slot].lastUsed = ++_accessCounter;
+  _cache[slot].lastUsed = advanceAccessCounter();
 
   // Add to hash table
   int hash = hashIndex(glyphIndex);
   bool inserted = false;
-  for (int i = 0; i < CACHE_SIZE; i++) {
-    int idx = (hash + i) % CACHE_SIZE;
+  for (int i = 0; i < _capacity; i++) {
+    int idx = (hash + i) % _capacity;
     if (_hashTable[idx] == HASH_EMPTY || _hashTable[idx] == HASH_TOMBSTONE) {
       _hashTable[idx] = slot;
       inserted = true;
@@ -285,8 +331,8 @@ const uint8_t* StreamingEpdFont::getGlyphBitmap(const EpdGlyph* glyph) {
     rehashTable();
     // Re-insert after rehash
     hash = hashIndex(glyphIndex);
-    for (int i = 0; i < CACHE_SIZE; i++) {
-      int idx = (hash + i) % CACHE_SIZE;
+    for (int i = 0; i < _capacity; i++) {
+      int idx = (hash + i) % _capacity;
       if (_hashTable[idx] == HASH_EMPTY) {
         _hashTable[idx] = slot;
         break;
@@ -297,23 +343,59 @@ const uint8_t* StreamingEpdFont::getGlyphBitmap(const EpdGlyph* glyph) {
   return _cache[slot].bitmap;
 }
 
-void StreamingEpdFont::rehashTable() {
-  // Clear the hash table
-  for (int i = 0; i < CACHE_SIZE; i++) {
-    _hashTable[i] = HASH_EMPTY;
+void StreamingEpdFont::evictSlot(int slot) {
+  const int oldHash = hashIndex(_cache[slot].glyphIndex);
+  for (int i = 0; i < _capacity; i++) {
+    const int idx = (oldHash + i) % _capacity;
+    if (_hashTable[idx] == slot) {
+      _hashTable[idx] = HASH_TOMBSTONE;
+      ++_tombstoneCount;
+      break;
+    }
   }
+  _cache[slot].glyphIndex = INVALID_CODEPOINT;
+#if PAPYRIX_TARGET_X4PRO || PAPYRIX_TARGET_X4CLASSIC || PAPYRIX_TARGET_STICKY || PAPYRIX_TARGET_MURPHY_M4
+  if (_slab) {
+    _totalCacheAllocation -= _cache[slot].bitmapSize;
+    _cache[slot].bitmap = nullptr;
+    _cache[slot].bitmapSize = 0;
+  }
+#endif
+  if (_tombstoneCount >= _capacity / 4) rehashTable();
+}
+
+void StreamingEpdFont::compactSlab() {
+#if PAPYRIX_TARGET_X4PRO || PAPYRIX_TARGET_X4CLASSIC || PAPYRIX_TARGET_STICKY || PAPYRIX_TARGET_MURPHY_M4
+  std::array<uint16_t, CACHE_SIZE> order{};
+  int count = 0;
+  for (int i = 0; i < _capacity; ++i) {
+    if (_cache[i].glyphIndex != INVALID_CODEPOINT && _cache[i].bitmapSize != 0) order[count++] = i;
+  }
+  std::sort(order.begin(), order.begin() + count,
+            [this](uint16_t a, uint16_t b) { return _cache[a].bitmap < _cache[b].bitmap; });
+  size_t offset = 0;
+  for (int n = 0; n < count; ++n) {
+    CachedBitmap& entry = _cache[order[n]];
+    memmove(_slab + offset, entry.bitmap, entry.bitmapSize);
+    entry.bitmap = _slab + offset;
+    offset += entry.bitmapSize;
+  }
+  _slabUsed = offset;
+#endif
+}
+
+void StreamingEpdFont::rehashTable() {
+  for (int i = 0; i < _capacity; i++) _hashTable[i] = HASH_EMPTY;
   _tombstoneCount = 0;
 
-  // Re-insert all valid cache entries
-  for (int slot = 0; slot < CACHE_SIZE; slot++) {
-    if (_cache[slot].glyphIndex != INVALID_CODEPOINT) {
-      int hash = hashIndex(_cache[slot].glyphIndex);
-      for (int i = 0; i < CACHE_SIZE; i++) {
-        int idx = (hash + i) % CACHE_SIZE;
-        if (_hashTable[idx] == HASH_EMPTY) {
-          _hashTable[idx] = slot;
-          break;
-        }
+  for (int slot = 0; slot < _capacity; slot++) {
+    if (_cache[slot].glyphIndex == INVALID_CODEPOINT) continue;
+    const int hash = hashIndex(_cache[slot].glyphIndex);
+    for (int i = 0; i < _capacity; i++) {
+      const int idx = (hash + i) % _capacity;
+      if (_hashTable[idx] == HASH_EMPTY) {
+        _hashTable[idx] = slot;
+        break;
       }
     }
   }
@@ -363,17 +445,15 @@ void StreamingEpdFont::getTextDimensions(const char* string, int* w, int* h) con
   *h = maxY - minY;
 }
 
-bool StreamingEpdFont::hasPrintableChars(const char* string) const {
-  int w = 0, h = 0;
-  getTextDimensions(string, &w, &h);
-  return w > 0 || h > 0;
-}
-
 size_t StreamingEpdFont::getMemoryUsage() const {
   size_t usage = sizeof(StreamingEpdFont);
   usage += _glyphsSize;
   usage += _intervalsSize;
+#if PAPYRIX_TARGET_X4PRO || PAPYRIX_TARGET_X4CLASSIC || PAPYRIX_TARGET_STICKY || PAPYRIX_TARGET_MURPHY_M4
+  usage += _slab ? SLAB_SIZE : _totalCacheAllocation;
+#else
   usage += _totalCacheAllocation;
+#endif
   return usage;
 }
 

@@ -16,6 +16,11 @@ static void writePod(FsFile& file, const T& value) {
 }
 
 template <typename T>
+[[nodiscard]] static bool writePodChecked(FsFile& file, const T& value) {
+  return file.write(reinterpret_cast<const uint8_t*>(&value), sizeof(T)) == sizeof(T);
+}
+
+template <typename T>
 static void readPod(std::istream& is, T& value) {
   is.read(reinterpret_cast<char*>(&value), sizeof(T));
 }
@@ -40,6 +45,13 @@ static void writeString(FsFile& file, const std::string& s) {
   const uint32_t len = s.size();
   writePod(file, len);
   file.write(reinterpret_cast<const uint8_t*>(s.data()), len);
+}
+
+[[nodiscard]] static bool writeStringChecked(FsFile& file, const std::string& s) {
+  if (s.size() > UINT32_MAX) return false;
+  const uint32_t len = static_cast<uint32_t>(s.size());
+  return writePodChecked(file, len) &&
+         file.write(reinterpret_cast<const uint8_t*>(s.data()), len) == static_cast<size_t>(len);
 }
 
 [[nodiscard]] static bool readString(std::istream& is, std::string& s) {
@@ -90,11 +102,14 @@ static void writeString(FsFile& file, const std::string& s) {
 }
 
 template <typename T>
-static void readPodValidated(FsFile& file, T& value, T maxValue) {
-  T temp;
-  file.read(reinterpret_cast<uint8_t*>(&temp), sizeof(T));
+static bool readPodValidated(FsFile& file, T& value, T maxValue) {
+  T temp{};
+  if (!readPodChecked(file, temp)) {
+    return false;
+  }
   if (temp < maxValue) {
     value = temp;
   }
+  return true;
 }
 }  // namespace serialization

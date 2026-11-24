@@ -1,24 +1,83 @@
 #pragma once
 
 #include <GfxRenderer.h>
+#include <I18n.h>
 #include <Theme.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 
+#include "../../core/PapyrixSettings.h"
+#include "../../core/SleepImages.h"
 #include "../Elements.h"
 
 namespace ui {
+struct SettingsListHit {
+  static constexpr int LIST_START_Y = 60;
+  static constexpr int LIST_BOTTOM_MARGIN = 70;
+  enum class Type : uint8_t { None, Row, Back, Open, Previous, Next };
+  Type type = Type::None;
+  int index = -1;
+};
+
+struct SettingsListLayout {
+  static constexpr int GROUP_GAP = 8;
+  int rowCount;
+  int groupStarts[3] = {};
+
+  bool startsGroup(int row) const {
+    for (const int start : groupStarts) {
+      if (start > 0 && row == start) return true;
+    }
+    return false;
+  }
+
+  int rowY(int row, int rowHeight) const {
+    int y = SettingsListHit::LIST_START_Y + row * rowHeight;
+    for (const int start : groupStarts) {
+      if (start > 0 && row >= start) y += GROUP_GAP;
+    }
+    return y;
+  }
+
+  int rowHeight(const Theme& theme, int screenHeight) const {
+    if (rowCount <= 0) return 0;
+    const int gaps = rowY(rowCount - 1, 0) - SettingsListHit::LIST_START_Y;
+    const int available = screenHeight - SettingsListHit::LIST_START_Y - SettingsListHit::LIST_BOTTOM_MARGIN - gaps;
+    return std::max(1, std::min(theme.itemHeight + theme.itemSpacing, available / rowCount));
+  }
+
+  SettingsListHit hitTest(touch::Point point, int16_t screenWidth, int16_t screenHeight, int rowHeight,
+                          bool frontLrbc = false) const {
+    const int action = touch::semanticButtonBarIndex(point, screenWidth, screenHeight, frontLrbc);
+    if (action >= 0) {
+      constexpr SettingsListHit::Type actions[] = {SettingsListHit::Type::Back, SettingsListHit::Type::Open,
+                                                   SettingsListHit::Type::Previous, SettingsListHit::Type::Next};
+      return {actions[action], -1};
+    }
+    const touch::Rect list{
+        0, SettingsListHit::LIST_START_Y, screenWidth,
+        static_cast<int16_t>(screenHeight - SettingsListHit::LIST_START_Y - SettingsListHit::LIST_BOTTOM_MARGIN)};
+    if (!list.contains(point) || rowHeight <= 0) return {};
+    for (int row = 0; row < rowCount; ++row) {
+      const int y = rowY(row, rowHeight);
+      if (point.y >= y && point.y < y + rowHeight) return {SettingsListHit::Type::Row, row};
+    }
+    return {};
+  }
+};
 
 // ============================================================================
 // SettingsMenuView - Main settings category selection
 // ============================================================================
 
 struct SettingsMenuView {
-  static constexpr const char* const ITEMS[] = {"Trình đọc", "Thiết bị", "Dọn dẹp", "Thông tin hệ thống"};
-  static constexpr int ITEM_COUNT = 4;
+  enum class Item : int8_t { Reader, Screen, Device, Cleanup, FirmwareUpdate, SystemInfo, Count };
+  static constexpr int ITEM_COUNT = static_cast<int>(Item::Count);
 
-  ButtonBar buttons{"Back", "Open", "", ""};
+  ButtonBar buttons;
   int8_t selected = 0;
   bool needsRender = true;
 
@@ -31,6 +90,8 @@ struct SettingsMenuView {
     selected = (selected + 1) % ITEM_COUNT;
     needsRender = true;
   }
+
+  Item selectedItem() const { return static_cast<Item>(selected); }
 };
 
 void render(const GfxRenderer& r, const Theme& t, const SettingsMenuView& v);
@@ -40,10 +101,10 @@ void render(const GfxRenderer& r, const Theme& t, const SettingsMenuView& v);
 // ============================================================================
 
 struct CleanupMenuView {
-  static constexpr const char* const ITEMS[] = {"Clear Book Cache", "Clear Device Storage", "Factory Reset"};
-  static constexpr int ITEM_COUNT = 3;
+  enum class Item : int8_t { ClearBookCache, ClearRecent, EmptyTrash, ClearDeviceStorage, FactoryReset, Count };
+  static constexpr int ITEM_COUNT = static_cast<int>(Item::Count);
 
-  ButtonBar buttons{"Back", "Run", "", ""};
+  ButtonBar buttons;
   int8_t selected = 0;
   bool needsRender = true;
 
@@ -56,6 +117,8 @@ struct CleanupMenuView {
     selected = (selected + 1) % ITEM_COUNT;
     needsRender = true;
   }
+
+  Item selectedItem() const { return static_cast<Item>(selected); }
 };
 
 void render(const GfxRenderer& r, const Theme& t, const CleanupMenuView& v);
@@ -68,30 +131,41 @@ struct SystemInfoView {
   static constexpr int MAX_VALUE_LEN = 32;
 
   struct InfoField {
-    char label[24];
+    char label[40];
     char value[MAX_VALUE_LEN];
   };
 
-  static constexpr int MAX_FIELDS = 8;
-  ButtonBar buttons{"Back", "", "", ""};
-  InfoField fields[MAX_FIELDS] = {};
-  uint8_t fieldCount = 0;
+  enum class Field : uint8_t {
+    Version,
+    Uptime,
+    Battery,
+    Chip,
+    Cpu,
+    FreeMemory,
+    InternalDisk,
+    SdCard,
+    Count,
+  };
+
+  static constexpr size_t FIELD_COUNT = static_cast<size_t>(Field::Count);
+  ButtonBar buttons;
+  InfoField fields[FIELD_COUNT] = {};
   bool needsRender = true;
 
   void clear() {
-    fieldCount = 0;
+    memset(fields, 0, sizeof(fields));
     needsRender = true;
   }
 
-  void addField(const char* label, const char* value) {
-    if (fieldCount < MAX_FIELDS) {
-      strncpy(fields[fieldCount].label, label, sizeof(InfoField::label) - 1);
-      fields[fieldCount].label[sizeof(InfoField::label) - 1] = '\0';
-      strncpy(fields[fieldCount].value, value, MAX_VALUE_LEN - 1);
-      fields[fieldCount].value[MAX_VALUE_LEN - 1] = '\0';
-      fieldCount++;
-      needsRender = true;
-    }
+  bool setField(Field field, const char* label, const char* value) {
+    const size_t index = static_cast<size_t>(field);
+    if (index >= FIELD_COUNT) return false;
+    strncpy(fields[index].label, label, sizeof(InfoField::label) - 1);
+    fields[index].label[sizeof(InfoField::label) - 1] = '\0';
+    strncpy(fields[index].value, value, MAX_VALUE_LEN - 1);
+    fields[index].value[MAX_VALUE_LEN - 1] = '\0';
+    needsRender = true;
+    return true;
   }
 };
 
@@ -102,8 +176,7 @@ void render(const GfxRenderer& r, const Theme& t, const SystemInfoView& v);
 // ============================================================================
 
 struct ReaderSettingsView {
-  // Setting types
-  enum class SettingType : uint8_t { Toggle, Enum, ThemeSelect };
+  enum class SettingType : uint8_t { Toggle, Enum };
 
   struct SettingDef {
     const char* label;
@@ -112,50 +185,40 @@ struct ReaderSettingsView {
     uint8_t enumCount;
   };
 
-  // Static setting definitions
-  static constexpr const char* const FONT_SIZE_VALUES[] = {"XSmall", "Small", "Normal", "Large"};
-  static constexpr const char* const TEXT_LAYOUT_VALUES[] = {"Compact", "Standard", "Large"};
-  static constexpr const char* const LINE_SPACING_VALUES[] = {"Compact", "Normal", "Relaxed", "Large"};
-  static constexpr const char* const ALIGNMENT_VALUES[] = {"Justified", "Left", "Center", "Right"};
-  static constexpr const char* const STATUS_BAR_VALUES[] = {"None", "Title", "Chapter"};
-  static constexpr const char* const ORIENTATION_VALUES[] = {"Portrait", "Landscape CW", "Inverted", "Landscape CCW"};
-
   static constexpr int SETTING_COUNT = 10;
-  static constexpr int MAX_THEMES = 16;
-  static const SettingDef DEFS[SETTING_COUNT];
+  static SettingDef DEFS[SETTING_COUNT];
+  static void initDefs();
 
-  ButtonBar buttons{"Back", "", "<", ">"};
+  ButtonBar buttons{"", "", "<", ">"};
 
-  // Theme selection state (loaded from ThemeManager)
-  char themeNames[MAX_THEMES][32] = {};
-  int themeCount = 0;
-  int currentThemeIndex = 0;
-
-  // Current values (indices for enums, bool for toggles)
   uint8_t values[SETTING_COUNT] = {0};
   int8_t selected = 0;
+  int8_t visibleCount = SETTING_COUNT - 1;
   bool needsRender = true;
 
+  int settingIndex(int row) const {
+    static constexpr uint8_t order[] = {0, 1, 2, 3, 4, 5, 6, 7, 9, 8};
+    return order[row + (visibleCount < SETTING_COUNT && row >= 7 ? 1 : 0)];
+  }
+  SettingsListLayout layout() const { return {visibleCount, {5, 7}}; }
+
   void moveUp() {
-    selected = (selected == 0) ? SETTING_COUNT - 1 : selected - 1;
+    selected = (selected == 0) ? visibleCount - 1 : selected - 1;
     needsRender = true;
   }
 
   void moveDown() {
-    selected = (selected + 1) % SETTING_COUNT;
+    selected = (selected + 1) % visibleCount;
     needsRender = true;
   }
 
   void cycleValue(int delta) {
-    const auto& def = DEFS[selected];
+    const int index = settingIndex(selected);
+    const auto& def = DEFS[index];
     if (def.type == SettingType::Toggle) {
-      values[selected] = values[selected] ? 0 : 1;
-    } else if (def.type == SettingType::ThemeSelect) {
-      if (themeCount > 0) {
-        currentThemeIndex = (currentThemeIndex + themeCount + delta) % themeCount;
-      }
+      values[index] = values[index] ? 0 : 1;
     } else {
-      values[selected] = static_cast<uint8_t>((values[selected] + def.enumCount + delta) % def.enumCount);
+      values[index] = static_cast<uint8_t>((values[index] + def.enumCount + delta) % def.enumCount);
     }
     needsRender = true;
   }
@@ -163,78 +226,154 @@ struct ReaderSettingsView {
   const char* getCurrentValueStr(int index) const {
     const auto& def = DEFS[index];
     if (def.type == SettingType::Toggle) {
-      return values[index] ? "ON" : "OFF";
+      return values[index] ? tr(ON) : tr(OFF);
     }
-    if (def.type == SettingType::ThemeSelect) {
-      if (themeCount > 0 && currentThemeIndex < themeCount) {
-        return themeNames[currentThemeIndex];
-      }
-      return "light";
-    }
-    // Bounds check to prevent array out-of-bounds access from corrupted settings
     if (def.enumCount == 0 || values[index] >= def.enumCount) {
       return def.enumCount > 0 ? def.enumValues[0] : "???";
     }
     return def.enumValues[values[index]];
   }
-
-  const char* getCurrentThemeName() const {
-    if (themeCount > 0 && currentThemeIndex < themeCount) {
-      return themeNames[currentThemeIndex];
-    }
-    return "light";
-  }
 };
 
 void render(const GfxRenderer& r, const Theme& t, const ReaderSettingsView& v);
+
+struct ScreenSettingsView {
+  using SettingDef = ReaderSettingsView::SettingDef;
+  using SettingType = ReaderSettingsView::SettingType;
+  static constexpr int SETTING_COUNT = 11;
+  static constexpr int SLEEP_IMAGE_SETTING = 10;
+  static constexpr int MAX_THEMES = 16;
+  static SettingDef DEFS[SETTING_COUNT];
+  static void initDefs();
+
+  ButtonBar buttons{"", "", "<", ">"};
+  char themeNames[MAX_THEMES][32] = {};
+  int themeCount = 0;
+  int currentThemeIndex = 0;
+  uint8_t values[SETTING_COUNT] = {0};
+  int8_t selected = 0;
+  bool frontLightAvailable = false;
+  const char* sleepImage = "";
+  bool needsRender = true;
+
+  int visibleCount() const {
+    return SETTING_COUNT - (frontLightAvailable ? 0 : 4) - (values[9] == papyrix::Settings::SleepCustom ? 0 : 1);
+  }
+  int settingIndex(int row) const {
+    static constexpr uint8_t order[] = {0, 5, 6, 1, 2, 3, 4, 7, 8, 9, 10};
+    return order[row + (!frontLightAvailable && row >= 3 ? 4 : 0)];
+  }
+  bool sleepImageSelected() const { return settingIndex(selected) == SLEEP_IMAGE_SETTING; }
+  SettingsListLayout layout() const {
+    return {visibleCount(), {3, frontLightAvailable ? 7 : 5, frontLightAvailable ? 9 : 0}};
+  }
+  bool lightSelected() const {
+    const int index = settingIndex(selected);
+    return index == 1 || index == 2;
+  }
+  uint8_t adjustedLightValue(int delta) const {
+    return static_cast<uint8_t>(std::clamp(values[settingIndex(selected)] + delta * 5, 0, 100));
+  }
+  void moveUp() {
+    selected = (selected == 0) ? visibleCount() - 1 : selected - 1;
+    needsRender = true;
+  }
+  void moveDown() {
+    selected = (selected + 1) % visibleCount();
+    needsRender = true;
+  }
+  void cycleValue(int delta) {
+    const int index = settingIndex(selected);
+    if (index == 0) {
+      if (themeCount > 0) currentThemeIndex = (currentThemeIndex + themeCount + delta) % themeCount;
+    } else if (!lightSelected() && !sleepImageSelected()) {
+      const auto& def = DEFS[index];
+      if (def.type == SettingType::Toggle) {
+        values[index] = values[index] ? 0 : 1;
+      } else {
+        values[index] = static_cast<uint8_t>((values[index] + def.enumCount + delta) % def.enumCount);
+      }
+    }
+    needsRender = true;
+  }
+  const char* getCurrentThemeName() const {
+    return themeCount > 0 && currentThemeIndex < themeCount ? themeNames[currentThemeIndex] : "light";
+  }
+  const char* getCurrentValueStr(int index) const {
+    if (index == 0) return getCurrentThemeName();
+    if (index == SLEEP_IMAGE_SETTING) return sleepImage[0] ? sleepImage : tr(RANDOM);
+    const auto& def = DEFS[index];
+    if (def.type == SettingType::Toggle) return values[index] ? tr(ON) : tr(OFF);
+    if (def.enumCount == 0 || values[index] >= def.enumCount) {
+      return def.enumCount > 0 ? def.enumValues[0] : "???";
+    }
+    return def.enumValues[values[index]];
+  }
+};
+
+void render(const GfxRenderer& r, const Theme& t, const ScreenSettingsView& v);
+
+struct SleepImageView {
+  papyrix::sleep_images::Page page;
+  size_t selected = 0;
+  const char* savedName = "";
+
+  int rowHeight(const Theme& theme, int screenHeight) const {
+    const int available = screenHeight - SettingsListHit::LIST_START_Y - SettingsListHit::LIST_BOTTOM_MARGIN - 24;
+    return std::max(1, std::min(theme.itemHeight + theme.itemSpacing,
+                                available / static_cast<int>(papyrix::sleep_images::PAGE_SIZE)));
+  }
+};
+
+void render(const GfxRenderer& r, const Theme& t, const SleepImageView& v);
 
 // ============================================================================
 // DeviceSettingsView - Device configuration
 // ============================================================================
 
 struct DeviceSettingsView {
-  static constexpr const char* const SLEEP_TIMEOUT_VALUES[] = {"5 min", "10 min", "15 min", "30 min", "Never"};
-  static constexpr const char* const SLEEP_SCREEN_VALUES[] = {"Dark", "Light", "Custom", "Cover"};
-  static constexpr const char* const STARTUP_VALUES[] = {"Last Document", "Home"};
-  static constexpr const char* const SHORT_PWR_VALUES[] = {"Ignore", "Sleep", "Page Turn"};
-  static constexpr const char* const PAGES_REFRESH_VALUES[] = {"1", "5", "10", "15", "30"};
-  static constexpr const char* const TOGGLE_VALUES[] = {"OFF", "ON"};
-  static constexpr const char* const FRONT_BUTTON_VALUES[] = {"B/C/L/R", "L/R/B/C"};
-  static constexpr const char* const SIDE_BUTTON_VALUES[] = {"Prev/Next", "Next/Prev"};
-
   struct SettingDef {
     const char* label;
     const char* const* values;
     uint8_t valueCount;
   };
 
+  static constexpr int BATCH_SETTING = 7;
   static constexpr int SETTING_COUNT = 8;
-  static const SettingDef DEFS[SETTING_COUNT];
+  static SettingDef DEFS[SETTING_COUNT];
+  static void initDefs();
 
-  ButtonBar buttons{"Back", "", "<", ">"};
+  ButtonBar buttons{"", "", "<", ">"};
   uint8_t values[SETTING_COUNT] = {0};
   int8_t selected = 0;
+  int8_t visibleCount = SETTING_COUNT;
   bool needsRender = true;
+  int settingIndex(int row) const {
+    static constexpr int8_t order[] = {-1, 0, 1, 2, BATCH_SETTING, 3, 4, 5, 6};
+    return order[row + (visibleCount == SETTING_COUNT && row >= 4 ? 1 : 0)];
+  }
+  SettingsListLayout layout() const { return {visibleCount, {1, visibleCount == SETTING_COUNT ? 4 : 5}}; }
 
   void moveUp() {
-    selected = (selected == 0) ? SETTING_COUNT - 1 : selected - 1;
+    selected = (selected == 0) ? visibleCount - 1 : selected - 1;
     needsRender = true;
   }
 
   void moveDown() {
-    selected = (selected + 1) % SETTING_COUNT;
+    selected = (selected + 1) % visibleCount;
     needsRender = true;
   }
 
   void cycleValue(int delta) {
-    const auto& def = DEFS[selected];
-    values[selected] = static_cast<uint8_t>((values[selected] + def.valueCount + delta) % def.valueCount);
+    const int index = settingIndex(selected);
+    if (index < 0 || index >= SETTING_COUNT) return;
+    const auto& def = DEFS[index];
+    values[index] = static_cast<uint8_t>((values[index] + def.valueCount + delta) % def.valueCount);
     needsRender = true;
   }
 
   const char* getCurrentValueStr(int index) const {
     const auto& def = DEFS[index];
-    // Bounds check to prevent array out-of-bounds access from corrupted settings
     if (def.valueCount == 0 || values[index] >= def.valueCount) {
       return def.valueCount > 0 ? def.values[0] : "???";
     }
@@ -248,12 +387,28 @@ void render(const GfxRenderer& r, const Theme& t, const DeviceSettingsView& v);
 // ConfirmDialogView - Yes/No confirmation dialog (matches old ConfirmActionActivity)
 // ============================================================================
 
-struct ConfirmDialogView {
-  static constexpr int MAX_TITLE_LEN = 32;
-  static constexpr int MAX_LINE_LEN = 48;
+inline touch::DialogLayout confirmDialogLayout(int16_t pageWidth, int16_t pageHeight, int16_t lineHeight,
+                                               int messageLines) {
+  const int16_t top = (pageHeight - lineHeight * 3) / 2;
+  const int16_t buttonY = top + (messageLines + 1 < 3 ? 3 : messageLines + 1) * lineHeight;
+  constexpr int16_t buttonWidth = 80;
+  constexpr int16_t buttonHeight = 36;
+  constexpr int16_t buttonSpacing = 20;
+  const int16_t startX = (pageWidth - (buttonWidth * 2 + buttonSpacing)) / 2;
+  return {{0, 0, pageWidth, pageHeight},
+          {{startX, buttonY, buttonWidth, buttonHeight},
+           {static_cast<int16_t>(startX + buttonWidth + buttonSpacing), buttonY, buttonWidth, buttonHeight}}};
+}
 
-  ButtonBar buttons{"Back", "Confirm", "<<", ">>"};
-  char title[MAX_TITLE_LEN] = "Confirm?";
+struct ConfirmDialogView {
+  enum class Hit : uint8_t { None, Yes, No, Back, Select };
+  static constexpr int MAX_TITLE_LEN = 48;
+  static constexpr int MAX_LINE_LEN = 80;
+  static constexpr int MAX_TITLE_LINES = 2;
+  static constexpr int MAX_MESSAGE_LINES = 2;
+
+  ButtonBar buttons;
+  char title[MAX_TITLE_LEN] = "";
   char line1[MAX_LINE_LEN] = "";
   char line2[MAX_LINE_LEN] = "";
   int8_t selection = 1;  // 0 = Yes, 1 = No (default No for safety)
@@ -280,8 +435,37 @@ struct ConfirmDialogView {
   }
 
   bool isYesSelected() const { return selection == 0; }
+
+  Hit hitTest(touch::Point point, const touch::DialogLayout& layout, bool frontLrbc = false) const {
+    const int choice = touch::dialogChoiceAt(point, layout);
+    if (choice == 0) return Hit::Yes;
+    if (choice == 1) return Hit::No;
+    const int action = touch::semanticButtonBarIndex(point, layout.bounds.width, layout.bounds.height, frontLrbc);
+    if (action == 0) return Hit::Back;
+    if (action == 1) return Hit::Select;
+    return Hit::None;
+  }
 };
 
 void render(const GfxRenderer& r, const Theme& t, const ConfirmDialogView& v);
+touch::DialogLayout confirmDialogBounds(const GfxRenderer& r, const Theme& t, const ConfirmDialogView& v);
+
+// ============================================================================
+// FirmwareUpdateView - Firmware update from SD card
+// ============================================================================
+
+struct FirmwareUpdateView {
+  static constexpr int MAX_STATUS_LINES = 2;
+
+  enum class State : uint8_t { Idle, Validating, Flashing, Complete, Error };
+
+  ButtonBar buttons;
+  State state = State::Idle;
+  char statusLine[128] = "";
+  int progressPercent = 0;
+  bool needsRender = true;
+};
+
+void render(const GfxRenderer& r, const Theme& t, const FirmwareUpdateView& v);
 
 }  // namespace ui

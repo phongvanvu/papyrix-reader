@@ -1,10 +1,10 @@
 #pragma once
 
-#include <SDCardManager.h>
 #include <WebServer.h>
 
 #include <memory>
-#include <vector>
+
+#include "UploadState.h"
 
 namespace papyrix {
 
@@ -21,21 +21,6 @@ class PapyrixWebServer {
   uint16_t getPort() const { return port_; }
 
  private:
-  struct UploadState {
-    FsFile file;
-    String fileName;
-    String path = "/";
-    size_t size = 0;
-    bool success = false;
-    String error = "";
-
-    static constexpr size_t BUFFER_SIZE = 4096;
-    std::vector<uint8_t> buffer;
-    size_t bufferPos = 0;
-  };
-
-  bool flushUploadBuffer();
-
   std::unique_ptr<WebServer> server_;
   bool running_ = false;
   bool apMode_ = false;
@@ -53,6 +38,18 @@ class PapyrixWebServer {
   void handleDelete();
   void handleDownload();
   void handleRename();
+
+  // Locale file management
+  void handleLocaleStatus();
+  void handleLocaleUpload();
+  void handleLocaleUploadPost();
+  void handleLocaleDelete();
+
+  // Firmware file management
+  void handleFirmwareStatus();
+  void handleFirmwareUpload();
+  void handleFirmwareUploadPost();
+  void handleFirmwareDelete();
 };
 
 }  // namespace papyrix

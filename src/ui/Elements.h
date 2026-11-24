@@ -5,6 +5,9 @@
 
 #include <cstdint>
 
+#include "TouchLayout.h"
+#include "WrappedText.h"
+
 namespace ui {
 
 // Button bar configuration - tracks which buttons are active
@@ -30,14 +33,16 @@ void menuItem(const GfxRenderer& r, const Theme& t, int y, const char* text, boo
 void toggle(const GfxRenderer& r, const Theme& t, int y, const char* label, bool value, bool selected);
 
 // Enum value - Setting with current value display
-void enumValue(const GfxRenderer& r, const Theme& t, int y, const char* label, const char* value, bool selected);
+void enumValue(const GfxRenderer& r, const Theme& t, int y, const char* label, const char* value, bool selected,
+               int height);
 
 // Set front button layout for hint remapping (0=BCLR, 1=LRBC)
 void setFrontButtonLayout(uint8_t layout);
 
-// Button bar - 4-button hints at bottom (wraps drawButtonHints)
+// Button bar - 4-button hints at bottom
 void buttonBar(const GfxRenderer& r, const Theme& t, const char* b1, const char* b2, const char* b3, const char* b4);
 void buttonBar(const GfxRenderer& r, const Theme& t, const ButtonBar& buttons);
+touch::Rect buttonBarButtonBounds(const GfxRenderer& r, int index);
 
 // Progress bar - Shows current/total progress
 void progress(const GfxRenderer& r, const Theme& t, int y, int current, int total);
@@ -50,9 +55,13 @@ int textWrapped(const GfxRenderer& r, const Theme& t, int y, const char* str, in
 
 // Image - Bitmap display at position
 void image(const GfxRenderer& r, int x, int y, const uint8_t* data, int w, int h);
+void localsendLogo(const GfxRenderer& r, const Theme& t, int cx, int cy);
+void printerLogo(const GfxRenderer& r, const Theme& t, int cx, int cy);
+void inkBitmap(const GfxRenderer& r, const uint8_t* data, int size, int x, int y, bool ink);
 
 // Dialog - Yes/No confirmation dialog
 void dialog(const GfxRenderer& r, const Theme& t, const char* title, const char* msg, int selected);
+touch::DialogLayout confirmationDialogBounds(const GfxRenderer& r, const Theme& t, const char* msg);
 
 // Keyboard - 10x10 grid keyboard with control row
 struct KeyboardState {
@@ -86,8 +95,9 @@ struct KeyboardState {
 void keyboard(const GfxRenderer& r, const Theme& t, int y, const KeyboardState& state);
 char getKeyboardChar(const KeyboardState& state);
 
-// Battery indicator - Icon + percentage
-void battery(const GfxRenderer& r, const Theme& t, int x, int y, int percent);
+// Battery indicator. Charging adds a small bolt inside the body.
+void batteryIcon(const GfxRenderer& r, const Theme& t, int x, int y, int percent, bool charging = false);
+void battery(const GfxRenderer& r, const Theme& t, int x, int y, int percent, bool charging = false);
 
 // Status bar - Page numbers and progress percentage
 void statusBar(const GfxRenderer& r, const Theme& t, int page, int total, int percent);
@@ -107,9 +117,6 @@ void chapterItem(const GfxRenderer& r, const Theme& t, int fontId, int y, const 
 
 // Wifi entry - Network name + signal strength + lock icon
 void wifiEntry(const GfxRenderer& r, const Theme& t, int y, const char* ssid, int signal, bool locked, bool selected);
-
-// Centered text - Horizontally centered text
-void centeredText(const GfxRenderer& r, const Theme& t, int y, const char* str);
 
 // Centered message - Bold centered message (for loading/error screens)
 void centeredMessage(const GfxRenderer& r, const Theme& t, int fontId, const char* message);

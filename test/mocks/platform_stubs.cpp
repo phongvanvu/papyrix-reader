@@ -6,12 +6,47 @@
 
 #include "LittleFS.h"
 #include "WString.h"
+#include "Wire.h"
 
 // Global mock instances
 MockSerial Serial;
 MockSPI SPI;
 MockESP ESP;
 MockLittleFS LittleFS;
+TwoWire Wire;
+TwoWire Wire1;
+TestGpioEvent testGpioEvents[TEST_GPIO_EVENT_CAPACITY]{};
+size_t testGpioEventCount = 0;
+std::atomic<bool> testManualMillisEnabled{false};
+std::atomic<unsigned long> testManualMillisValue{0};
+
+void testRecordGpioEvent(TestGpioEventType type, int pin, int value) {
+  if (testGpioEventCount >= TEST_GPIO_EVENT_CAPACITY) return;
+  testGpioEvents[testGpioEventCount++] = {type, pin, value};
+}
+
+void testResetGpioEvents() {
+  testGpioEventCount = 0;
+  testResetDelayStats();
+}
+
+int gpio_hold_dis(int pin) {
+  testRecordGpioEvent(TestGpioEventType::HoldDisable, pin, 0);
+  return 0;
+}
+
+int gpio_hold_en(int pin) {
+  testRecordGpioEvent(TestGpioEventType::HoldEnable, pin, 0);
+  return 0;
+}
+
+int gpio_sleep_sel_dis(int pin) {
+  testRecordGpioEvent(TestGpioEventType::SleepSelectDisable, pin, 0);
+  return 0;
+}
+
+void gpio_deep_sleep_hold_en() { testRecordGpioEvent(TestGpioEventType::DeepSleepHold, -1, 0); }
+void gpio_deep_sleep_hold_dis() { testRecordGpioEvent(TestGpioEventType::DeepSleepHoldDisable, -1, 0); }
 
 void MockSerial::printf(const char* fmt, ...) {
   va_list args;
@@ -51,6 +86,7 @@ void MockSerial::print(const String& s) {
 }
 
 unsigned long millis() {
+  if (testManualMillisEnabled) return testManualMillisValue;
   using namespace std::chrono;
   static const auto start = steady_clock::now();
   return static_cast<unsigned long>(duration_cast<milliseconds>(steady_clock::now() - start).count());

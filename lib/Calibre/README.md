@@ -1,34 +1,20 @@
 # Calibre Wireless Library
 
-Memory-efficient implementation of Calibre's Smart Device App protocol for syncing ebooks with Calibre desktop application on ESP32 microcontrollers.
+Implementation of Calibre's Smart Device App protocol for syncing ebooks with Calibre desktop on ESP32 microcontrollers.
 
 ## Overview
 
-This library enables wireless book synchronization between Papyrix e-reader devices and Calibre (https://calibre-ebook.com/). It implements the "Smart Device" protocol that Calibre uses to communicate with compatible devices over WiFi.
+This library enables wireless book synchronization between PapyriX e-reader devices and Calibre (https://calibre-ebook.com/). It implements the "Smart Device" protocol that Calibre uses to communicate with compatible devices over WiFi.
 
 **Features:**
 - UDP broadcast discovery (device broadcasts "hello" to find Calibre)
 - TCP connection with length-prefixed JSON protocol
-- Streaming file reception (minimal RAM usage)
+- Streaming file reception
 - Progress callbacks for UI updates
 - Password authentication support
 - Book deletion support
 
 ## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Public API (calibre_wireless.h)          │
-├─────────────────────────────────────────────────────────────┤
-│  calibre_common.h/c  │  Shared utilities, logging, helpers  │
-├──────────────────────┼──────────────────────────────────────┤
-│  calibre_network.c   │  UDP discovery, TCP connection       │
-├──────────────────────┼──────────────────────────────────────┤
-│  calibre_protocol.c  │  Message handlers, book transfer     │
-├──────────────────────┼──────────────────────────────────────┤
-│  calibre_storage.h   │  Storage abstraction (SdFat impl)    │
-└──────────────────────┴──────────────────────────────────────┘
-```
 
 ### Files
 
@@ -51,10 +37,10 @@ All messages use a length-prefixed JSON format:
 [LENGTH][JSON]
 ```
 
-- **LENGTH**: ASCII decimal number (e.g., "42")
-- **JSON**: JSON array `[opcode, payload]` where opcode is an integer
+- **LENGTH**: ASCII decimal byte count of the serialized UTF-8 JSON, excluding the prefix.
+- **JSON**: JSON array `[opcode, payload]` where opcode is an integer. Spaces count toward the byte count.
 
-Example: `15[9, {"canSync": true}]`
+Example: `22[9, {"canSync": true}]`
 
 ### Opcodes
 
@@ -118,7 +104,7 @@ Device                              Calibre Server
 
 **Discovery mechanism:** The device broadcasts "hello" on UDP ports every 500ms (max 20 times). Calibre listens on these ports and responds with its TCP port information. The device then connects to Calibre as a TCP client.
 
-**Note on SET_LIBRARY_INFO:** This message includes `fieldMetadata` containing all library field definitions, which can be a large payload. The device should handle messages up to ~100KB for this.
+`SET_LIBRARY_INFO` includes `fieldMetadata` with the library field definitions.
 
 ### Book Transfer
 
@@ -129,7 +115,7 @@ Server: SEND_BOOK {lpath, length, title, authors, uuid, calibre_id}
 Device: OK {willAccept: true}
 Server: [raw binary data - <length> bytes]
 Device: (accumulates until size reached)
-Device: BOOK_DONE {}
+Device: (does not send BOOK_DONE)
 ```
 
 ### Device Capabilities (GET_INITIALIZATION_INFO response)
@@ -142,7 +128,7 @@ Device: BOOK_DONE {}
 
 ```json
 {
-  "appName": "Papyrix Reader",
+  "appName": "PapyriX Reader",
   "acceptedExtensions": ["epub", "txt", "md", "xtc", "xtch"],
   "cacheUsesLpaths": true,
   "canAcceptLibraryInfo": true,
@@ -154,8 +140,8 @@ Device: BOOK_DONE {}
   "canUseCachedMetadata": true,
   "ccVersionNumber": 128,
   "coverHeight": 240,
-  "deviceKind": "Papyrix E-Ink Reader",
-  "deviceName": "My Papyrix",
+  "deviceKind": "PapyriX E-Ink Reader",
+  "deviceName": "My PapyriX",
   "extensionPathLengths": {},
   "maxBookContentPacketLen": 4096,
   "passwordHash": "",
@@ -171,9 +157,9 @@ Device: BOOK_DONE {}
 {
   "device_info": {
     "device_store_uuid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-    "device_name": "Papyrix Reader"
+    "device_name": "PapyriX Reader"
   },
-  "device_version": "Papyrix 1.0",
+  "device_version": "PapyriX 1.0",
   "version": "1.0"
 }
 ```
@@ -191,7 +177,7 @@ Device: BOOK_DONE {}
 
 ### Path Validation
 
-All incoming paths are validated before use:
+The library validates incoming paths before use:
 - No absolute paths (must not start with `/`)
 - No path traversal (must not contain `..`)
 - Extension whitelist: Uses extensions from device config (set via `calibre_device_config_add_ext()`)
@@ -206,9 +192,9 @@ The same extensions configured for Calibre handshake are used for security valid
 
 ### Resource Management
 
-- All sockets have timeouts (no blocking forever)
-- Partial files are cleaned up on error
-- `freeaddrinfo()` is always called after DNS resolution
+- Socket operations use timeouts.
+- The library attempts to remove partial files after a receive error.
+- The library frees address information after DNS resolution.
 
 ## API Reference
 
@@ -256,6 +242,8 @@ bool calibre_is_connected(const calibre_conn_t* conn);
 // Process incoming messages (call regularly)
 calibre_err_t calibre_process(calibre_conn_t* conn, uint32_t timeout_ms);
 ```
+
+`timeout_ms` controls the initial TCP readiness wait, not the total call duration. Zero polls readiness without waiting, but message reception can then wait for `CALIBRE_RECV_TIMEOUT_MS` (30,000 ms). Discovery, connection, and message handlers can also do work during the call.
 
 ### Configuration
 
@@ -329,7 +317,7 @@ calibre_deinit();
 
 Use the included simulators to test without hardware. Both simulators implement the real Calibre 8.x protocol flow.
 
-**Device Simulator** - Simulates a Papyrix device connecting to real Calibre:
+**Device Simulator** - Simulates a PapyriX device connecting to real Calibre:
 ```bash
 # Auto-discover Calibre on local network
 node scripts/device-simulator.mjs
@@ -355,7 +343,7 @@ Both simulators follow the real protocol flow:
 
 ### Security Tests
 
-The library should reject:
+The library rejects:
 
 ```bash
 # Path traversal attack
